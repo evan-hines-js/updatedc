@@ -80,10 +80,12 @@ Remember that ingress-nginx requires `--enable-ssl-passthrough` on the controlle
 
 ## TLS material
 
-The gateway mounts two Secrets:
+The gateway mounts three logical material sets (the first two use the same Secret by default):
 
-- **`gateway-tls`** — its own server certificate and key, plus `ca.crt`, the CA that connecting
-  agents are verified against.
+- **`gateway-tls`** — its own server certificate and key.
+- **client trust** — `gateway.clientCaSecretKey` from `gateway.clientCaSecretName`; when the name is
+  empty, this defaults to `ca.crt` from `gateway-tls`. A separate operator-owned Secret is the
+  rollover path because cert-manager must not rewrite an old+new overlap bundle.
 - **`fleet-ca`** — the fleet CA *including its private key*, so `/enroll` can sign a node's CSR
   into a client certificate the mTLS listener accepts. This widens the gateway's blast radius;
   scope that CA to the fleet and nothing else.
@@ -106,8 +108,32 @@ To root the fleet CA in an existing chain instead, point the chart at your own i
 --set certManager.bootstrapIssuer.kind=ClusterIssuer
 ```
 
-Or supply both Secrets yourself from an existing PKI and leave `certManager.enabled` off. The
-gateway's pod stays in `ContainerCreating` until they exist.
+Or supply the server-identity and issuing-CA Secrets yourself from an existing PKI and leave
+`certManager.enabled` off. Supply a separate client-trust Secret as well when `gateway-tls` does not
+contain its `ca.crt`; the gateway pod stays in `ContainerCreating` until every configured key exists.
+
+### Fleet CA rollover
+
+The gateway reloads its server identity, client trust bundle, and issuing CA every minute. It swaps
+them only as one coherent generation after proving that a leaf from the candidate issuer is accepted
+by the candidate verifier. A partially projected Secret update therefore leaves the previous working
+generation live. `ca.crt` may contain multiple PEM certificates, which provides the rollover overlap.
+
+A fleet-root key change is necessarily staged because each agent also pins that CA file locally:
+
+1. Create an operator-owned Secret containing the old+new PEM bundle (for example, key `ca.crt` in
+   Secret `fleet-client-trust`), set `gateway.clientCaSecretName: fleet-client-trust`, and append the
+   new root to every agent's configured `ca` file. Retain the old root in both places.
+2. Wait for that configuration to reach the fleet and for every gateway replica to reload it.
+3. Replace `fleet-ca` with the new certificate and key, then issue the gateway certificate from the
+   new CA. During this phase the old+new bundle accepts both existing 90-day leaves and new leaves.
+4. After every old node leaf, shared bootstrap certificate, and gateway certificate has expired or
+   been renewed, remove the old root from agents and the operator-owned client-trust Secret.
+
+Changing the issuer before step 1 is rejected by the gateway's coherence check, but no in-band
+protocol can repair an agent whose local trust anchor was removed too early. The chart-created CA
+therefore renews with `privateKey.rotationPolicy: Never`; a root-key replacement is an explicit
+operator rollover using the sequence above.
 
 ## TUF signing keys
 

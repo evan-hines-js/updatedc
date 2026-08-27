@@ -1,8 +1,9 @@
 # RBAC must grant the internet-facing gateway CREATE and UPDATE on UpdateAgent, but those verbs are
 # broader than the enrollment transaction it implements. This policy makes the application-level
-# contract an API-server boundary: CREATE can only produce a fresh enrolled identity in this
-# release's repository, and UPDATE can only complete one operator-reserved identity without changing
-# routing, rollout controls, labels, backend topology, or metadata.
+# contract an API-server boundary: CREATE is admitted only when this repository explicitly selects
+# open enrollment and can only produce a fresh enrolled identity in this release's repository;
+# UPDATE can only complete one operator-reserved identity without changing routing, rollout
+# controls, labels, backend topology, or metadata.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -59,6 +60,9 @@ spec:
         and P-256 public-key encodings
     - expression: object.spec.repositoryRef.name == {{ .Values.repository | quote }}
       message: updatec's gateway may write agents only in its configured repository
+    - expression: >-
+        request.operation != 'CREATE' || params.spec.enrollment.mode == 'open'
+      message: gateway-created inventory is disabled unless the repository enrollment mode is open
     - expression: >-
         request.operation != 'CREATE' || object.spec.labels == params.spec.enrollment.labels
       message: >-

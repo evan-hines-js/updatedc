@@ -164,16 +164,23 @@ gateway:
     passthrough: true
     acknowledgeTlsTermination: false
     annotations: {}
-  # Secret holding the gateway's own server certificate (tls.crt/tls.key) and the CA agents are
-  # verified against (ca.crt). Created for you when `certManager.enabled` is set.
+  # Secret holding the gateway's own server certificate (tls.crt/tls.key). Created for you when
+  # `certManager.enabled` is set.
   tlsSecretName: gateway-tls
+  # Public roots accepted for client mTLS. Empty projects `clientCaSecretKey` from tlsSecretName,
+  # which is the cert-manager-created fleet CA in the ordinary case. For a fleet-root rollover,
+  # point this at an operator-owned Secret containing the staged old+new PEM bundle; cert-manager
+  # must not overwrite that overlap.
+  clientCaSecretName: ""
+  clientCaSecretKey: ca.crt
   # Secret holding the fleet CA *with its private key*, so /enroll can sign a node's CSR into a
   # client certificate the mTLS listener accepts. This widens the gateway's blast radius; scope the
   # CA to the fleet and nothing else.
   issuingCaSecretName: fleet-ca
   # The CN the shared bootstrap certificate must carry to call /enroll. Every holder has the same
-  # authority; reserved inventory limits claimable names but does not bind one holder to one name.
-  # Use a manual identity with an operator-pinned public key for that stronger binding.
+  # authority. `UpdateRepository.spec.enrollment.mode: reservedOnly` limits it to pre-reserved
+  # names, but does not bind one holder to one name. Use a manual identity with an operator-pinned
+  # public key for that stronger binding.
   enrollmentClientCN: updated-agent
 
   # Pin the gateway's Secret read to the repository's `spec.s3.credentialsSecretRef`, which it
@@ -207,7 +214,10 @@ certManager:
     create: true
     commonName: updated-fleet-ca
     duration: 87600h
-    privateKey: {algorithm: ECDSA, size: 256}
+    # Renewal keeps the same trust-anchor key. Replacing the fleet root is an explicit staged
+    # rollover because agents outside Kubernetes must receive the overlap bundle before a new key
+    # can safely issue gateway or node certificates.
+    privateKey: {algorithm: ECDSA, size: 256, rotationPolicy: Never}
   gatewayCertificate:
     create: true
     duration: 8760h

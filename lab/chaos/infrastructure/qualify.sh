@@ -92,15 +92,26 @@ spec:
   containers:
     - name: writer
       image: $image
-      command: [sh, -c, 'while :; do date +%s > /state/heartbeat; sleep 1; done']
-      volumeMounts: [{name: state, mountPath: /state}]
-  volumes: [{name: state, persistentVolumeClaim: {claimName: io-state}}]
+      command: [sh, -c, 'while :; do date +%s > /var/lib/updated/heartbeat; sleep 1; done']
+      # Match the soak pod's nested-mount topology: toda needs a writable parent in which to move
+      # the PVC while its FUSE mount is active. If cleanup loses the nested mount, restarting the
+      # container must remount the same PVC before qualification can pass.
+      livenessProbe:
+        exec: {command: [/bin/mountpoint, -q, /var/lib/updated]}
+        periodSeconds: 2
+        failureThreshold: 5
+      volumeMounts:
+        - {name: chaos-mount-workspace, mountPath: /var/lib}
+        - {name: state, mountPath: /var/lib/updated}
+  volumes:
+    - {name: chaos-mount-workspace, emptyDir: {}}
+    - {name: state, persistentVolumeClaim: {claimName: io-state}}
 YAML
 
 kubectl -n "$namespace" rollout status deployment/echo --timeout=180s
 kubectl -n "$namespace" wait --for=condition=Ready pod/probe pod/io-target --timeout=180s
 [[ $(kubectl -n "$namespace" exec probe -- wget -qO- http://echo:8080) == ok ]]
-kubectl -n "$namespace" exec io-target -- sh -c 'echo baseline > /state/probe'
+kubectl -n "$namespace" exec io-target -- sh -c 'echo baseline > /var/lib/updated/probe'
 
 cat <<YAML | kubectl apply -f -
 apiVersion: chaos-mesh.org/v1alpha1
@@ -155,15 +166,15 @@ spec:
   selector:
     namespaces: [$namespace]
     labelSelectors: {app: io-target, updated.dev/chaos-target: "true"}
-  volumePath: /state
-  path: /state/*
+  volumePath: /var/lib/updated
+  path: /var/lib/updated/*
   errno: 5
   percent: 100
 YAML
 
 io_fault_observed=false
 for _attempt in {1..60}; do
-  if ! kubectl -n "$namespace" exec io-target -- sh -c 'echo fault-probe > /state/probe' >/dev/null 2>&1; then
+  if ! kubectl -n "$namespace" exec io-target -- sh -c 'echo fault-probe > /var/lib/updated/probe' >/dev/null 2>&1; then
     io_fault_observed=true
     break
   fi
@@ -174,7 +185,9 @@ kubectl -n "$namespace" delete iochaos qualified-io-error --wait=true
 
 io_recovered=false
 for _attempt in {1..60}; do
-  if kubectl -n "$namespace" exec io-target -- sh -c 'echo recovered > /state/probe' >/dev/null 2>&1; then
+  if kubectl -n "$namespace" exec io-target -- sh -c \
+    'mountpoint -q /var/lib/updated && test "$(cat /var/lib/updated/probe)" = baseline && echo recovered > /var/lib/updated/probe' \
+    >/dev/null 2>&1; then
     io_recovered=true
     break
   fi

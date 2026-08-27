@@ -365,7 +365,6 @@ impl Harness {
         // needs PowerShell or cmd can start at all. Application data is available only through the
         // input directory, which is empty here because a conformance run has no control plane.
         updated::reconciler::apply_environment(&mut command);
-        foundation::process::arrange_parent_death_signal(&mut command);
         let mut child = foundation::process::ContainedChild::spawn(command)?;
         let stdout = updated::reconciler::capture_output(
             child
@@ -378,12 +377,12 @@ impl Harness {
                 .ok_or_else(|| io::Error::other("the hook's stderr was not captured"))?,
         );
         let deadline = Instant::now() + INVOCATION_TIMEOUT;
-        let exited = loop {
-            if let Some(status) = child.try_wait()? {
-                break Some(status);
+        let root_exited = loop {
+            if child.root_has_exited()? {
+                break true;
             }
             if Instant::now() >= deadline {
-                break None;
+                break false;
             }
             std::thread::sleep(POLL_INTERVAL);
         };
@@ -395,7 +394,7 @@ impl Harness {
             Option<io::Result<(Vec<u8>, bool)>>,
         );
         let mut collected: CollectedOutput = (None, None);
-        let left_tree = if exited.is_some() {
+        let left_tree = if root_exited {
             collected = (
                 stdout.recv_timeout(TREE_GRACE).ok(),
                 stderr.recv_timeout(TREE_GRACE).ok(),
@@ -404,11 +403,16 @@ impl Harness {
         } else {
             false
         };
-        // On every exit path, exactly as the agent does — success included.
-        child.kill_tree()?;
-        if exited.is_none() {
+        // On every exit path, exactly as the agent does — success included. A normal root exit
+        // completes through `wait`, whose one cleanup path kills the descendants just inspected
+        // before reaping. A timeout must force the still-running tree down first.
+        let exited = if root_exited {
+            Some(child.wait()?)
+        } else {
+            child.kill_tree()?;
             let _ = child.wait();
-        }
+            None
+        };
         // Whatever the readers still had; the teardown released them. Still bounded, because a
         // descendant that escaped the tree entirely holds the pipe open past the kill — waiting on
         // it unbounded here would reintroduce the exact hang the deadline above exists to end.

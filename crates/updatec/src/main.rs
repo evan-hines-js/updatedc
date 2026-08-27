@@ -79,14 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                 })?,
         };
-        // The gateway's mTLS material is a cert-manager-issued secret mounted as files. The
-        // standard cert-manager keys are tls.crt / tls.key / ca.crt.
+        // The server identity and public client-trust bundle are mounted separately. This lets an
+        // operator stage old+new roots without editing a cert-manager-owned leaf Secret.
         let tls_dir = std::env::var(updatec::env::GATEWAY_TLS_DIR)
             .unwrap_or_else(|_| "/etc/gateway-tls".into());
         let tls = updatec::gateway::GatewayTls {
             cert: std::path::Path::new(&tls_dir).join("tls.crt"),
             key: std::path::Path::new(&tls_dir).join("tls.key"),
-            client_ca: std::path::Path::new(&tls_dir).join("ca.crt"),
+            client_ca: std::env::var(updatec::env::GATEWAY_CLIENT_CA)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| "/etc/client-ca/ca.crt".into()),
             enrollment_client_cn: std::env::var(updatec::env::ENROLLMENT_CLIENT_CN)
                 .unwrap_or_else(|_| "updated-agent".into()),
         };

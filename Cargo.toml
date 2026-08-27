@@ -95,6 +95,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     # SetConsoleCtrlHandler: the launcher's stop-signal handling.
     "Win32_System_Console",
+    # A CREATE_SUSPENDED child is resumed only after job assignment; ToolHelp recovers the
+    # primary thread handle that std::process::Child deliberately does not expose.
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Services",
     "Win32_System_Threading",

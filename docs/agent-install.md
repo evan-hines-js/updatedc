@@ -142,13 +142,29 @@ secret. There are three explicit shapes.
 One certificate with the CN the gateway admits (`gateway.enrollmentClientCN`, default
 `updated-agent`) is distributed to every host, and each node self-asserts its name in
 `config.toml`. The gateway mints that name into the node's certificate and creates an `UpdateAgent`
-under it.
+under it when the repository explicitly selects open enrollment:
+
+```yaml
+spec:
+  enrollment:
+    mode: open
+    labels: {}
+```
 
 The weakness is exactly what it looks like: **any host holding that certificate can enroll under
 any name it asserts**, including one already in use by a node you care about. Use this for labs and
 for fleets where every host is already equally trusted.
 
 ### Reserved inventory (explicit approval, still shared authority)
+
+Set the repository policy to `reservedOnly`:
+
+```yaml
+spec:
+  enrollment:
+    mode: reservedOnly
+    labels: {}
+```
 
 Pre-create the `UpdateAgent` with `identity.kind: reserved` before the node boots:
 
@@ -164,11 +180,13 @@ spec:
 
 `/enroll` then *completes that specific object in place* — stamping the node's minted identity and
 pinned public key onto it under a resourceVersion-guarded replace — rather than creating a new one.
-This limits dynamic enrollment to names and labels the operator already approved. It does **not**
-make the shared bootstrap certificate a per-node credential: any holder can still claim any
-unclaimed reserved name first. Use admission policy and controlled distribution if that shared
-authority is acceptable. Use manual provisioning below when the initial key-to-name binding itself
-must be operator-pinned.
+An absent name is rejected with `403 Forbidden`; the shipped admission policy independently denies
+the gateway's Kubernetes CREATE request unless this same repository policy is `open`. Thus
+`reservedOnly` limits enrollment to names and labels the operator already approved. It does
+**not** make the shared bootstrap certificate a per-node credential: any holder can still claim
+any unclaimed reserved name first. Use controlled distribution if that shared authority is
+acceptable. Use manual provisioning below when the initial key-to-name binding itself must be
+operator-pinned.
 
 ### Fully offline provisioning
 

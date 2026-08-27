@@ -88,6 +88,14 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [/usr/local/bin/run-agent]
           ports: [{name: workload, containerPort: 8080}]
+          # IOChaos temporarily replaces this mount with its own FUSE mount. Both are valid
+          # mountpoints. If toda cleanup instead loses the nested PVC mount, the launcher can no
+          # longer read its durable authority and cannot repair the container from inside it.
+          # Recycling the pod is the one recovery path that remounts the same PVC.
+          livenessProbe:
+            exec: {command: [/usr/bin/mountpoint, -q, /var/lib/updated]}
+            periodSeconds: 5
+            failureThreshold: 4
           resources:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {cpu: "2", memory: 512Mi}

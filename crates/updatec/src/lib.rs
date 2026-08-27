@@ -948,9 +948,9 @@ pub struct UpdateRepositorySpec {
     /// `root.next.pk8`) plus targets, snapshot, and timestamp private keys. The controller never
     /// stores private keys in CRD status.
     pub signing_secret_ref: LocalSecretReference,
-    /// Trusted labels applied to dynamic registrations. Enrollment is authenticated by mutual
-    /// TLS at the gateway (a cert-manager-issued server cert + fleet client CA, mounted), so
-    /// there is no shared secret here.
+    /// Online enrollment policy and the trusted labels applied to registrations. Enrollment is
+    /// authenticated by mutual TLS at the gateway (a cert-manager-issued server cert + fleet
+    /// client CA, mounted), so there is no shared secret here.
     pub enrollment: EnrollmentSpec,
     /// Object store that holds this managed repository. The controller derives the repository's
     /// key prefix from its Kubernetes namespace and name; operators cannot select or retarget it.
@@ -979,8 +979,21 @@ fn default_state_max_shards() -> u8 {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrollmentSpec {
+    /// Whether the shared bootstrap identity may create new inventory or may only complete names
+    /// the operator already reserved. This is required rather than defaulted: choosing who may
+    /// create a fleet identity is an authorization decision, not a compatibility default.
+    pub mode: EnrollmentMode,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnrollmentMode {
+    /// A bootstrap-certificate holder may register any unused canonical node name.
+    Open,
+    /// A bootstrap-certificate holder may only complete an existing `reserved` identity.
+    ReservedOnly,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -2069,6 +2082,7 @@ mod tests {
                 name: "tuf-signing-keys".into(),
             },
             enrollment: EnrollmentSpec {
+                mode: EnrollmentMode::ReservedOnly,
                 labels: BTreeMap::new(),
             },
             s3: repository_storage(),

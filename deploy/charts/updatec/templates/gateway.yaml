@@ -64,6 +64,8 @@ spec:
               value: "0.0.0.0:8081"
             - name: UPDATED_GATEWAY_TLS_DIR
               value: /etc/gateway-tls
+            - name: UPDATED_GATEWAY_CLIENT_CA
+              value: /etc/client-ca/ca.crt
             - name: UPDATED_ISSUING_CA_DIR
               value: /etc/issuing-ca
             - name: UPDATED_ENROLLMENT_CLIENT_CN
@@ -78,10 +80,13 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            # The gateway is externally exposed, so it terminates mTLS itself. tls.crt/tls.key are
-            # its server identity; ca.crt is the CA a connecting agent is verified against.
+            # The gateway is externally exposed, so it terminates mTLS itself. This mount is only
+            # its server identity; client trust has its own rollover-capable mount below.
             - name: gateway-tls
               mountPath: /etc/gateway-tls
+              readOnly: true
+            - name: client-ca
+              mountPath: /etc/client-ca
               readOnly: true
             # The fleet CA *with its private key*, so the /enroll handler can sign a node's CSR into
             # a per-node client cert the mTLS listener accepts. Holding the CA key here widens the
@@ -98,6 +103,13 @@ spec:
           secret:
             secretName: {{ .Values.gateway.tlsSecretName }}
             defaultMode: 0440
+        - name: client-ca
+          secret:
+            secretName: {{ .Values.gateway.clientCaSecretName | default .Values.gateway.tlsSecretName }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.gateway.clientCaSecretKey }}
+                path: ca.crt
         - name: issuing-ca
           secret:
             secretName: {{ .Values.gateway.issuingCaSecretName }}

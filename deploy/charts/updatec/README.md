@@ -46,7 +46,9 @@ endpoint may also change without changing ownership.
 | `repository` | `default` | The `UpdateRepository` this control plane serves. |
 | `gateway.service.type` | `ClusterIP` | `LoadBalancer` for nodes outside the cluster. |
 | `gateway.ingress.enabled` | `false` | Requires TLS **passthrough**; see below. |
-| `gateway.tlsSecretName` | `gateway-tls` | Server cert + the CA agents are verified against. |
+| `gateway.tlsSecretName` | `gateway-tls` | Gateway server certificate and key. |
+| `gateway.clientCaSecretName` | `""` | Optional operator-owned client-trust bundle Secret; empty uses `gateway.tlsSecretName`. |
+| `gateway.clientCaSecretKey` | `ca.crt` | Key containing one or more accepted client roots. |
 | `gateway.issuingCaSecretName` | `fleet-ca` | Fleet CA *with its private key*, so `/enroll` can sign node CSRs. |
 | `gateway.enrollmentClientCN` | `updated-agent` | CN a bootstrap client must carry to call `/enroll`. |
 | `gateway.secretResourceNames` | `[]` | Pin `secrets: get` to repository credential Secrets. Empty grants no Secret access. |

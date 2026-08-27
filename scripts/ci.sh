@@ -390,6 +390,11 @@ assert volumes["chaos-mount-workspace"]["emptyDir"]["sizeLimit"] == "16Mi", volu
 mounts = {mount["name"]: mount["mountPath"] for mount in runtime["volumeMounts"]}
 assert mounts["chaos-mount-workspace"] == "/var/lib", mounts
 assert mounts["state"] == "/var/lib/updated", mounts
+assert runtime["livenessProbe"] == {
+    "exec": {"command": ["/usr/bin/mountpoint", "-q", "/var/lib/updated"]},
+    "periodSeconds": 5,
+    "failureThreshold": 4,
+}, runtime["livenessProbe"]
 
 minio = next(doc for doc in documents if doc["kind"] == "StatefulSet" and doc["metadata"]["name"] == "minio")
 minio_pod = minio["spec"]["template"]["spec"]
@@ -651,8 +656,25 @@ gateway_policies = [
 assert len(gateway_policies) == 1, gateway_policies
 gateway_policy = gateway_policies[0]
 policy_text = str(gateway_policy["spec"])
-for required in ["reserved", "enrolled", "registrationSha256", "publicKey", "repositoryRef", "metadataPreserved"]:
+for required in ["reserved", "enrolled", "registrationSha256", "publicKey", "repositoryRef", "metadataPreserved", "params.spec.enrollment.mode", "open"]:
     assert required in policy_text, required
+gateway = next(
+    doc for doc in documents
+    if doc["kind"] == "Deployment" and doc["metadata"]["name"].endswith("gateway")
+)
+gateway_pod = gateway["spec"]["template"]["spec"]
+gateway_container = next(container for container in gateway_pod["containers"] if container["name"] == "updatec")
+gateway_env = {entry["name"]: entry["value"] for entry in gateway_container["env"] if "value" in entry}
+assert gateway_env["UPDATED_GATEWAY_CLIENT_CA"] == "/etc/client-ca/ca.crt", gateway_env
+gateway_mounts = {mount["name"]: mount["mountPath"] for mount in gateway_container["volumeMounts"]}
+assert gateway_mounts["gateway-tls"] == "/etc/gateway-tls", gateway_mounts
+assert gateway_mounts["client-ca"] == "/etc/client-ca", gateway_mounts
+gateway_volumes = {volume["name"]: volume for volume in gateway_pod["volumes"]}
+assert gateway_volumes["client-ca"]["secret"] == {
+    "secretName": "gateway-tls",
+    "defaultMode": 0o440,
+    "items": [{"key": "ca.crt", "path": "ca.crt"}],
+}, gateway_volumes["client-ca"]
 for doc in documents:
     if doc["kind"] != "Role" or not doc["metadata"]["name"].endswith("gateway"):
         continue
@@ -738,7 +760,7 @@ for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
             "apiVersion": "updated.dev/v1alpha1",
             "kind": "UpdateRepository",
         }, doc
-        for required in ["reserved", "enrolled", "registrationSha256", "publicKey", "repositoryRef", "metadataPreserved", "params.spec.enrollment.labels", "ownerReferences"]:
+        for required in ["reserved", "enrolled", "registrationSha256", "publicKey", "repositoryRef", "metadataPreserved", "params.spec.enrollment.mode", "open", "params.spec.enrollment.labels", "ownerReferences"]:
             assert required in text, (required, doc)
         gateway_agent_boundary = True
       else:
@@ -824,7 +846,7 @@ assert configmap_boundary, "dynamic ConfigMap writes have no fail-closed admissi
 assert controller_slice_denied, "the controller can exercise its delegation-only EndpointSlice verb"
 assert gateway_agent_boundary, "gateway UpdateAgent writes have no fail-closed field boundary"
 assert gateway_agent_binding, "gateway UpdateAgent boundary is not pinned to its repository parameter"
-assert credential_projections == 3, credential_projections
+assert credential_projections == 4, credential_projections
 print("ok: separate identities, one-time volume ownership, owner-group-only credentials, and Secret, UpdateAgent, ConfigMap, and EndpointSlice authority explicitly bounded")
 PY
   helm template updatec deploy/charts/updatec -n updated-system \
@@ -842,11 +864,14 @@ PY
 run_semgrep() {
   section "Semgrep static analysis"
   # Review the working tree, not just Git's index. This matters locally while a refactor's new
-  # files are still untracked; `target` contains generated E2E credentials and is never source.
+  # files are still untracked; `target` and the chaos lab's ignored `.state` directory contain
+  # generated credentials and are never source. Keep `--no-git-ignore` so other ignored files do
+  # not silently disappear from a local review.
   # The policy is checked in: remote auto-configuration is mutable, requires network access, and
   # can disclose repository metadata. Metrics stay off even if a local Semgrep default changes.
   semgrep scan --config .semgrep.yml --metrics=off --disable-version-check --error \
-    --no-git-ignore --exclude target --exclude .git .
+    --no-git-ignore --exclude target --exclude .git \
+    --exclude lab/chaos/infrastructure/.state .
 }
 
 run_trivy() {

@@ -13,9 +13,9 @@ pub struct EnrollmentContext {
     pub lock_name: String,
 }
 
-/// The gateway's server TLS material, mounted from a cert-manager-issued secret. The gateway
-/// presents `cert`/`key` and admits a connection only if the client presents a certificate the
-/// fleet `client_ca` signed — that mutual TLS *is* the enrollment authentication.
+/// The gateway presents `cert`/`key` and admits a connection only if the client presents a
+/// certificate trusted by the separately mounted fleet `client_ca` bundle — that mutual TLS *is*
+/// the enrollment authentication.
 pub struct GatewayTls {
     pub cert: std::path::PathBuf,
     pub key: std::path::PathBuf,
@@ -30,6 +30,15 @@ pub struct GatewayTls {
 pub struct IssuingCaPaths {
     pub cert: std::path::PathBuf,
     pub key: std::path::PathBuf,
+}
+
+/// One coherent gateway identity generation. The listener verifier and the CA used by requests on
+/// that connection are loaded and validated together, then replaced through one [`Reloadable`].
+/// Keeping them in one snapshot prevents Secret update skew from installing a signer whose leaves
+/// the listener rejects.
+pub(crate) struct GatewayMaterials {
+    pub(crate) server_config: Arc<rustls::ServerConfig>,
+    pub(crate) issuing_ca: crate::join::IssuingCa,
 }
 
 /// How often the gateway rebuilds the configuration it was started with: its mounted certificate
@@ -113,9 +122,6 @@ pub(crate) struct DataState {
     pub(crate) authorization: Arc<AuthorizationMemo>,
     pub(crate) enrollment: EnrollmentContext,
     pub(crate) enrollment_client_cn: Arc<str>,
-    /// The fleet CA that signs per-node leaves at `/enroll`. Reloaded from its mounted files, so a
-    /// rotated CA key signs the next leaf instead of the process needing a restart.
-    pub(crate) ca: Arc<Reloadable<crate::join::IssuingCa>>,
 }
 
 /// The inputs to the gateway's one live node-identity decision. This is projected from

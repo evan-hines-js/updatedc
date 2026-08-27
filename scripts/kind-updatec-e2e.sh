@@ -1005,6 +1005,64 @@ if kubectl -n updated-system get updateagent "$BAD_AGENT_NAME" >/dev/null 2>&1; 
 fi
 echo "invalid online enrollment credentials failed closed without registering an agent"
 
+# A valid holder of the shared bootstrap certificate is still bounded by repository policy. Switch
+# to reserved-only temporarily and exercise the real TLS listener and `/enroll` handler with an
+# absent name; neither the handler nor its API-server identity may turn that name into inventory.
+kubectl -n updated-system patch updaterepository default --type=merge \
+  -p='{"spec":{"enrollment":{"mode":"reservedOnly"}}}'
+UNRESERVED_AGENT_NAME=unreserved-online
+cat <<'YAML' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: unreserved-online-enrollment, namespace: updated-system}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: agent
+      image: updatec-e2e:kind
+      command: [/bin/sh, -ec]
+      args:
+        - |
+          mkdir -p /var/lib/updated/launcher
+          cat >/tmp/config.toml <<EOF
+          [enrollment]
+          url = "https://updatec-gateway"
+          name = "unreserved-online"
+          ca = "/etc/agent-tls/ca.crt"
+          [enrollment.bootstrap]
+          client_cert = "/etc/agent-tls/tls.crt"
+          client_key = "/etc/agent-tls/tls.key"
+          EOF
+          timeout 15 updated-launcher --state-dir /var/lib/updated/launcher \
+            --config /tmp/config.toml --agent /usr/local/bin/updated-agent \
+            --ready-timeout 5 --confirm-timeout 2
+      volumeMounts:
+        - {name: state, mountPath: /var/lib/updated}
+        - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
+  volumes:
+    - {name: state, emptyDir: {}}
+    - {name: agent-tls, secret: {secretName: agent-tls}}
+YAML
+for attempt in {1..30}; do
+  UNRESERVED_PHASE="$(kubectl -n updated-system get pod unreserved-online-enrollment -o jsonpath='{.status.phase}')"
+  [[ "$UNRESERVED_PHASE" == Failed ]] && break
+  sleep 1
+done
+[[ "${UNRESERVED_PHASE:-}" == Failed ]]
+UNRESERVED_LOG="$(kubectl -n updated-system logs unreserved-online-enrollment -c agent)"
+[[ "$UNRESERVED_LOG" == *"enrollment returned HTTP 403 Forbidden"* ]] || {
+  echo "FAIL: reserved-only enrollment did not return the policy's 403 response" >&2
+  echo "$UNRESERVED_LOG" >&2
+  exit 1
+}
+if kubectl -n updated-system get updateagent "$UNRESERVED_AGENT_NAME" >/dev/null 2>&1; then
+  echo "FAIL: reserved-only enrollment created $UNRESERVED_AGENT_NAME" >&2
+  exit 1
+fi
+kubectl -n updated-system patch updaterepository default --type=merge \
+  -p='{"spec":{"enrollment":{"mode":"open"}}}'
+echo "reserved-only enrollment rejected an absent name presented with valid bootstrap credentials"
+
 cat <<'YAML' | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap

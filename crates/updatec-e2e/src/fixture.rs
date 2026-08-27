@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 
 use crate::layout::NAMESPACE;
 use updatec::{
-    DeploymentSpec, EnrollmentSpec, LabelSelector, LocalObjectReference, LocalSecretReference,
-    RegressionResponse, ReleaseRepositorySpec, RepositoryStorage, RuntimeSpec, TargetSpec,
-    UpdateGroup, UpdateGroupSet, UpdateGroupSetSpec, UpdateGroupSpec, UpdateRepository,
-    UpdateRepositorySpec,
+    DeploymentSpec, EnrollmentMode, EnrollmentSpec, LabelSelector, LocalObjectReference,
+    LocalSecretReference, RegressionResponse, ReleaseRepositorySpec, RepositoryStorage,
+    RuntimeSpec, TargetSpec, UpdateGroup, UpdateGroupSet, UpdateGroupSetSpec, UpdateGroupSpec,
+    UpdateRepository, UpdateRepositorySpec,
 };
 
 pub(crate) const REPOSITORY_NAME: &str = "default";
@@ -133,6 +133,7 @@ pub(crate) fn repository(default_deployment: DeploymentSpec) -> UpdateRepository
                 name: SIGNING_SECRET.into(),
             },
             enrollment: EnrollmentSpec {
+                mode: EnrollmentMode::Open,
                 labels: BTreeMap::new(),
             },
             s3: RepositoryStorage {

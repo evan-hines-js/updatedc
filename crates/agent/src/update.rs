@@ -1120,10 +1120,8 @@ fn prepare_lifecycle_command(
     // A wrapper commonly waits on vendor CLIs, curl, or mount helpers. Run it as a
     // contained tree (Unix process group / Windows job object) so a timeout takes the
     // whole tree down, not just the shell — leaving the foreground operation orphaned.
-    // The platform mechanism lives in `foundation::process`, not inlined here. Linux also ties
-    // the hook to this agent attempt — the workload the hook manages is the operator's init
-    // system's, or the hook's own, and deliberately has no such coupling.
-    foundation::process::arrange_parent_death_signal(&mut cmd);
+    // The platform mechanism and parent-death guarantee are one primitive in
+    // `foundation::process`, not call-site configuration.
     Ok(PreparedLifecycleCommand {
         command: cmd,
         phase: operation,
@@ -1247,11 +1245,10 @@ fn run_prepared_lifecycle_command_blocking(
     };
     let (ending, teardown) = loop {
         match child.try_wait() {
-            // A wrapper may exit successfully while a background descendant retains the captured
-            // pipes. Tear down the remainder of this disposable hook tree before joining the
-            // readers; otherwise inherited stdout/stderr can bypass the lifecycle deadline. The
-            // leader is already reaped, so this kill must not wait on it.
-            Ok(Some(status)) => break (Ending::Exited(status), child.kill_tree()),
+            // `ContainedChild::try_wait` tears down undetached descendants before it reaps and
+            // returns the root status. Keeping that invariant in the process primitive means an
+            // ordinary successful exit cannot leave a pipe-holding helper behind either.
+            Ok(Some(status)) => break (Ending::Exited(status), Ok(())),
             Ok(None) => {}
             Err(error) => break (Ending::Unwaitable(error), kill_and_reap(&mut child)),
         }
@@ -1588,7 +1585,6 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        foundation::process::arrange_parent_death_signal(&mut command);
         let prepared = PreparedLifecycleCommand {
             command,
             phase: Operation::Inspect,
@@ -1661,8 +1657,6 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        foundation::process::arrange_parent_death_signal(&mut command);
-
         let output = run_prepared_lifecycle_command(
             PreparedLifecycleCommand {
                 command,
@@ -1711,7 +1705,6 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            foundation::process::arrange_parent_death_signal(&mut command);
             let outcome = run_prepared_lifecycle_command(
                 PreparedLifecycleCommand {
                     command,

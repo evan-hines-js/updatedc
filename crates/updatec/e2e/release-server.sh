@@ -182,6 +182,7 @@ RECONCILER
   server publish-provider-set --repo "$repo" --keys "$keys" --id jenkins \
     --provider-path "$jenkins_provider_path" --provider-sha256 "$jenkins_provider_sha" \
     --provider-timeout-ms 300000
+  printf '%s\n' "$platform" >/data/platform
   touch /data/ready
 fi
 # These indexes are derived from the one release-classification function on every start. This also

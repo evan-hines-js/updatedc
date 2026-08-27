@@ -1266,13 +1266,21 @@ spec:
                 - runtime
                 type: object
               enrollment:
-                description: Trusted labels applied to dynamic registrations. Enrollment is authenticated by mutual TLS at the gateway (a cert-manager-issued server cert + fleet client CA, mounted), so there is no shared secret here.
+                description: Online enrollment policy and the trusted labels applied to registrations. Enrollment is authenticated by mutual TLS at the gateway (a cert-manager-issued server cert + fleet client CA, mounted), so there is no shared secret here.
                 properties:
                   labels:
                     additionalProperties:
                       type: string
                     default: {}
                     type: object
+                  mode:
+                    description: 'Whether the shared bootstrap identity may create new inventory or may only complete names the operator already reserved. This is required rather than defaulted: choosing who may create a fleet identity is an authorization decision, not a compatibility default.'
+                    enum:
+                    - open
+                    - reservedOnly
+                    type: string
+                required:
+                - mode
                 type: object
               s3:
                 description: Object store that holds this managed repository. The controller derives the repository's key prefix from its Kubernetes namespace and name; operators cannot select or retarget it.

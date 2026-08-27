@@ -7,6 +7,7 @@ use super::*;
 pub(crate) async fn enroll(
     State(state): State<DataState>,
     Extension(identity): Extension<ClientIdentity>,
+    Extension(materials): Extension<Arc<GatewayMaterials>>,
     body: Bytes,
 ) -> Response {
     // The listener trusts the fleet CA for both the shared bootstrap certificate and minted
@@ -15,8 +16,8 @@ pub(crate) async fn enroll(
     if !is_enrollment_identity(&identity, &state.enrollment_client_cn) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    // The node self-asserts its name in the body; an approval gate on the resulting UpdateAgent is
-    // the place to require a human to authorize that name.
+    // The node self-asserts its name in the body. The repository's enrollment mode decides below
+    // whether an absent name may become inventory or must already be operator-reserved.
     let Ok(request) =
         serde_json::from_slice::<updated_contracts::enrollment::EnrollmentRequest>(&body)
     else {
@@ -26,25 +27,9 @@ pub(crate) async fn enroll(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let name = request.name.as_str();
-    // A stable per-node identifier for idempotent re-enrollment, derived from the self-asserted name:
-    // the same node coming back on the same name is the same UpdateAgent.
-    let registration_sha256 = updated_contracts::telemetry::node_object_digest(name);
-    // Pin the CSR's public key so the throttle can later verify this node's signed telemetry, then
-    // sign the CSR into a per-node leaf (CN=<name>). The CP certifies only the CSR's public key; a
-    // malformed CSR is the caller's fault (400). `register_agent` runs `sign` only after the
-    // create/conflict check passes, so a conflicting name never mints a certificate.
-    let Ok(public_key) = crate::join::csr_public_key(&request.csr) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    match register_enrollment(
-        &state,
-        name,
-        registration_sha256,
-        public_key.to_hex(),
-        &request.csr,
-    )
-    .await
-    {
+    // The transaction derives both durable identity bindings from this name and CSR itself. Its
+    // API cannot be called with one key in the object and another key in the certificate.
+    match register_enrollment(&state, &materials.issuing_ca, name, &request.csr).await {
         Ok((bundle_download, leaf)) => bounded_enrollment_json(
             updated_contracts::enrollment::EnrollResponse {
                 leaf,
@@ -70,6 +55,7 @@ pub(crate) fn is_distinct_from_bootstrap_identity(name: &str, enrollment_client_
 pub(crate) async fn renew(
     State(state): State<DataState>,
     Extension(identity): Extension<ClientIdentity>,
+    Extension(materials): Extension<Arc<GatewayMaterials>>,
     body: Bytes,
 ) -> Response {
     // Renewal is a steady-state operation: only an already-minted per-node leaf scoped to THIS
@@ -88,14 +74,15 @@ pub(crate) async fn renew(
     let Ok(public_key) = crate::join::csr_public_key(&request.csr) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if !is_pinned_identity(
+    if !agent_authorizes_key(
         &authorized.agent,
         &state.enrollment.repository,
+        &authorized.node,
         &public_key.to_hex(),
     ) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match state.ca.get().sign_client_csr(
+    match materials.issuing_ca.sign_client_csr(
         &state.enrollment.repository,
         &authorized.node,
         &request.csr,
@@ -114,42 +101,42 @@ pub(crate) async fn renew(
     }
 }
 
-/// The single check that an existing `UpdateAgent` is a provisioned identity in the same repository
-/// presenting its pinned public key. Renewal and every certificate-authenticated data-plane route
-/// gate on this, so "is this really that node?" has one definition those paths cannot drift apart
-/// on. Enrollment idempotency adds the enrolled registration digest check at its call site.
-pub(crate) fn is_pinned_identity(
-    agent: &crate::UpdateAgent,
-    repository: &str,
-    public_key: &str,
-) -> bool {
-    agent.spec.identity.is_well_formed_for(&agent.name_any())
-        && matches!(
-            agent.spec.identity.kind,
-            crate::AgentIdentityKind::Manual | crate::AgentIdentityKind::Enrolled
-        )
-        && agent.spec.repository_ref.name == repository
-        && agent.spec.identity.public_key.as_deref() == Some(public_key)
+/// The one identity an enrollment transaction may admit and issue credentials for. Carrying the
+/// four bound values as one claim makes it impossible for admission, 409 recovery, post-lock
+/// revalidation, and certificate signing to select their own subtly different identity inputs.
+#[derive(Clone, Copy)]
+struct EnrollmentClaim<'a> {
+    name: &'a str,
+    repository: &'a str,
+    public_key: &'a str,
+    registration_sha256: &'a str,
 }
 
-/// The same rule for a route that presents no key in its body: the key comes from the connection's
-/// own leaf, which the handshake proved possession of.
-///
-/// Membership alone is not enough here. A leaf outlives the object that justified it (up to
-/// `LEAF_CERT_TTL_DAYS`), and re-provisioning a machine under its existing hostname means deleting
-/// the `UpdateAgent` and letting the replacement enroll fresh — which pins a NEW key under the SAME
-/// name. Authorizing on name plus membership would hand the replacement's secrets, bundle and
-/// telemetry slot to any surviving holder of the old leaf for the rest of its 90-day life, and
-/// there is no revocation path. Binding to the pin makes a node's identity its key, so a superseded
-/// holder loses access the instant the replacement enrolls.
-pub(crate) fn is_pinned_leaf(
-    identity: &ClientIdentity,
-    agent: &crate::UpdateAgent,
-    repository: &str,
-) -> bool {
-    identity
-        .node_public_key()
-        .is_some_and(|public_key| is_pinned_identity(agent, repository, public_key))
+impl EnrollmentClaim<'_> {
+    fn matches(self, agent: &crate::UpdateAgent) -> bool {
+        agent_authorizes_key(agent, self.repository, self.name, self.public_key)
+            && agent.spec.identity.registration_sha256.as_deref() == Some(self.registration_sha256)
+    }
+
+    fn desired(self, labels: std::collections::BTreeMap<String, String>) -> crate::UpdateAgent {
+        crate::UpdateAgent::new(
+            self.name,
+            crate::UpdateAgentSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: self.repository.into(),
+                },
+                identity: crate::AgentIdentity {
+                    kind: crate::AgentIdentityKind::Enrolled,
+                    registration_sha256: Some(self.registration_sha256.into()),
+                    public_key: Some(self.public_key.into()),
+                },
+                hold: false,
+                cordon: false,
+                labels,
+                backend_address: None,
+            },
+        )
+    }
 }
 
 pub(crate) fn at_enrollment_capacity(count: usize) -> bool {
@@ -279,52 +266,29 @@ pub(crate) async fn acquire_enrollment_lock(
 /// no alternate registration or bundle transport mode.
 pub(crate) async fn register_enrollment(
     state: &DataState,
+    issuing_ca: &crate::join::IssuingCa,
     name: &str,
-    registration_sha256: String,
-    public_key: String,
     csr: &str,
 ) -> Result<(updated_contracts::dataflow::DownloadCapability, String), Response> {
+    // A malformed CSR is the caller's fault (400), and is rejected before taking the fleet-wide
+    // admission lock. The public key pinned in the object and the CSR signed below are now one
+    // input, not independently supplied values that could drift.
+    let public_key = crate::join::csr_public_key(csr)
+        .map_err(|_| StatusCode::BAD_REQUEST.into_response())?
+        .to_hex();
+    // Enrollment gives this field exactly one meaning: the canonical digest of the validated node
+    // name. Derive it here at the only object-construction boundary.
+    let registration_sha256 = updated_contracts::telemetry::node_object_digest(name);
     let context = &state.enrollment;
+    let claim = EnrollmentClaim {
+        name,
+        repository: &context.repository,
+        public_key: &public_key,
+        registration_sha256: &registration_sha256,
+    };
     let authority = IdentityAuthority::from(context);
-    let repository = live_repository(&authority)
-        .await
-        .map_err(|status| status.into_response())?;
     let agents: Api<crate::UpdateAgent> =
         Api::namespaced(context.client.clone(), &context.namespace);
-    let desired = crate::UpdateAgent::new(
-        name,
-        crate::UpdateAgentSpec {
-            repository_ref: crate::LocalObjectReference {
-                name: context.repository.clone(),
-            },
-            identity: crate::AgentIdentity {
-                kind: crate::AgentIdentityKind::Enrolled,
-                registration_sha256: Some(registration_sha256.clone()),
-                public_key: Some(public_key),
-            },
-            hold: false,
-            cordon: false,
-            labels: repository.spec.enrollment.labels.clone(),
-            backend_address: None,
-        },
-    );
-    // Idempotent re-enrollment must be the SAME pinned identity (via the one shared predicate, so it
-    // can never drift from renewal) AND the same registration digest. Binding to the pinned key is
-    // what stops a shared-fleet-cert holder from re-enrolling an existing name with an attacker key:
-    // a different key fails this match, falls through to CONFLICT, and no `CN=<name>` leaf is minted
-    // (which would otherwise spend another node's exact input/output/report capabilities). A
-    // genuine retry reuses the node's durable key, so it still matches and stays idempotent.
-    let pinned_key = desired
-        .spec
-        .identity
-        .public_key
-        .as_deref()
-        .unwrap_or_default();
-    let matches = |existing: &crate::UpdateAgent| {
-        is_pinned_identity(existing, &context.repository, pinned_key)
-            && existing.spec.identity.registration_sha256.as_deref()
-                == Some(registration_sha256.as_str())
-    };
     // The status count used here previously was an asynchronous observation: every request in one
     // burst could read 9,999 and then create, overshooting without bound. Serialize the LIVE list
     // and create through one pre-created Lease. Existing identities and reservations do not grow
@@ -334,12 +298,28 @@ pub(crate) async fn register_enrollment(
         StatusCode::SERVICE_UNAVAILABLE.into_response()
     })?;
     let registration = timeout(ENROLLMENT_TRANSACTION_TIMEOUT, async {
+        // Read the policy only after owning the enrollment lock. An operator may switch modes or
+        // labels while a request waits; the create/completion decision must use one live
+        // repository generation rather than a pre-lock snapshot.
+        let repository = live_repository(&authority).await?;
+        let desired = claim.desired(repository.spec.enrollment.labels.clone());
+        // Idempotent re-enrollment must be the SAME pinned identity (via the one shared predicate,
+        // so it cannot drift from renewal) AND the same registration digest. A different key
+        // conflicts before any `CN=<name>` leaf can be minted; a genuine retry reuses its key.
         let existing = agents
-            .get_opt(name)
+            .get_opt(claim.name)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if let Some(existing) = existing {
-            return accept_existing_agent(&agents, name, &desired, &existing, &matches).await;
+            return accept_existing_agent(&agents, &desired, &existing, claim).await;
+        }
+        if repository.spec.enrollment.mode == crate::EnrollmentMode::ReservedOnly {
+            tracing::warn!(
+                node = %name,
+                repository = %context.repository,
+                "refusing enrollment for a name that is not reserved"
+            );
+            return Err(StatusCode::FORBIDDEN);
         }
         let live = agents
             .list(&ListParams::default())
@@ -359,7 +339,7 @@ pub(crate) async fn register_enrollment(
             );
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        create_agent_idempotent(&agents, name, &desired, &matches).await
+        create_agent_idempotent(&agents, &desired, claim).await
     })
     .await
     .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
@@ -378,16 +358,22 @@ pub(crate) async fn register_enrollment(
     // retry with its durable CSR. The retry is idempotent and no second gateway-side bundle writer
     // exists. A pre-reserved identity whose object is already published completes immediately.
     let agent = agents
-        .get(name)
+        .get(claim.name)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    // The Lease serialized admission and inventory growth, but an operator does not participate in
+    // that lock and may replace this name after it is released. Authorize the SAME live snapshot
+    // whose status pointer is about to reach the bearer-capability signer. A different repository,
+    // key, or registration is a conflict, never an invitation to hand the replacement's enrollment
+    // object to the request that was validated against its predecessor.
+    if !claim.matches(&agent) {
+        return Err(StatusCode::CONFLICT.into_response());
+    }
     let bundle_download = enrollment_download_capability(&state.content, &agent)
         .await
         .map_err(|status| status.into_response())?;
-    let leaf = state
-        .ca
-        .get()
-        .sign_client_csr(&context.repository, name, csr)
+    let leaf = issuing_ca
+        .sign_client_csr(claim.repository, claim.name, csr)
         .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
     Ok((bundle_download, leaf))
 }
@@ -404,23 +390,22 @@ pub(crate) fn bounded_enrollment_json(bytes: std::io::Result<Vec<u8>>) -> Respon
     }
 }
 
-/// Create `desired` (named `name`), treating a 409 as success iff the existing agent `matches`
+/// Create `desired`, treating a 409 as success iff the existing agent matches the claim
 /// (an idempotent re-registration); a 409 whose existing agent does not match is a real `CONFLICT`,
 /// and any other API error is `500`.
-pub(crate) async fn create_agent_idempotent(
+async fn create_agent_idempotent(
     agents: &Api<crate::UpdateAgent>,
-    name: &str,
     desired: &crate::UpdateAgent,
-    matches: impl Fn(&crate::UpdateAgent) -> bool,
+    claim: EnrollmentClaim<'_>,
 ) -> Result<(), StatusCode> {
     match agents.create(&PostParams::default(), desired).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(error)) if error.code == 409 => {
             let existing = agents
-                .get(name)
+                .get(claim.name)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            accept_existing_agent(agents, name, desired, &existing, &matches).await
+            accept_existing_agent(agents, desired, &existing, claim).await
         }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -429,14 +414,13 @@ pub(crate) async fn create_agent_idempotent(
 /// Accept an idempotent retry or atomically complete one operator-reserved identity, but never
 /// create. Keeping this separate lets the enrollment transaction inspect an existing name without
 /// a create/delete race accidentally turning that path into uncounted inventory growth.
-pub(crate) async fn accept_existing_agent(
+async fn accept_existing_agent(
     agents: &Api<crate::UpdateAgent>,
-    name: &str,
     desired: &crate::UpdateAgent,
     existing: &crate::UpdateAgent,
-    matches: &impl Fn(&crate::UpdateAgent) -> bool,
+    claim: EnrollmentClaim<'_>,
 ) -> Result<(), StatusCode> {
-    if matches(existing) {
+    if claim.matches(existing) {
         // An idempotent re-registration of the same already-enrolled node.
         return Ok(());
     }
@@ -449,16 +433,16 @@ pub(crate) async fn accept_existing_agent(
     let mut completed = existing.clone();
     completed.spec.identity = desired.spec.identity.clone();
     match agents
-        .replace(name, &PostParams::default(), &completed)
+        .replace(claim.name, &PostParams::default(), &completed)
         .await
     {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(conflict)) if conflict.code == 409 => {
             let now = agents
-                .get(name)
+                .get(claim.name)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            if matches(&now) {
+            if claim.matches(&now) {
                 Ok(())
             } else {
                 Err(StatusCode::CONFLICT)
@@ -497,7 +481,8 @@ pub(crate) fn adopts_preapproval(
     // out a second time, this predicate was a copy of that rule that nothing kept in step: relaxing
     // the shape of a `Reserved` identity in one place would have left the other still admitting the
     // old shape, and this is the predicate that decides who may claim a name over the fleet-wide
-    // bootstrap certificate. Its sibling `is_pinned_identity` already gates this way.
+    // bootstrap certificate. Steady-state authority similarly delegates field-shape validation to
+    // `agent_authorizes_key` instead of maintaining a second schema here.
     existing.spec.identity.kind == crate::AgentIdentityKind::Reserved
         && existing
             .spec

@@ -164,12 +164,11 @@ fn tls_client(config: ClientConfig) -> io::Result<reqwest::Client> {
 pub fn verify_client_chain(leaf: CertificateDer<'_>, ca: &Path) -> io::Result<()> {
     use rustls::pki_types::UnixTime;
     let roots = load_roots(ca, "enrollment CA")?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
+    let verifier = required_client_verifier(
+        roots,
         Arc::new(crypto_provider()),
-    )
-    .build()
-    .map_err(|error| invalid(&format!("building issued-certificate verifier: {error}")))?;
+        "building issued-certificate verifier",
+    )?;
     verifier
         .verify_client_cert(&leaf, &[], UnixTime::now())
         .map_err(|error| {
@@ -190,19 +189,62 @@ pub fn server_config(
     client_ca: &Path,
 ) -> io::Result<rustls::ServerConfig> {
     let provider = Arc::new(crypto_provider());
-
     let roots = load_roots(client_ca, "client CA")?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
+    let verifier = required_client_verifier(
+        roots,
         provider.clone(),
-    )
-    .build()
-    .map_err(|error| {
-        invalid(&format!(
-            "building the client-certificate verifier: {error}"
-        ))
-    })?;
+        "building the client-certificate verifier",
+    )?;
+    server_config_with_verifier(cert, key, provider, verifier)
+}
 
+/// Build the production mTLS server config and prove that `issued_client` is admitted by its
+/// verifier before returning it. The proof and the returned config share the exact verifier built
+/// from one read of `client_ca`, so a Secret rotation between two file reads cannot install an
+/// issuer/verifier pair that never existed coherently on disk.
+pub fn server_config_accepting_issued_client(
+    cert: &Path,
+    key: &Path,
+    client_ca: &Path,
+    issued_client: &CertificateDer<'_>,
+) -> io::Result<rustls::ServerConfig> {
+    use rustls::pki_types::UnixTime;
+
+    let provider = Arc::new(crypto_provider());
+    let roots = load_roots(client_ca, "client CA")?;
+    let verifier = required_client_verifier(
+        roots,
+        provider.clone(),
+        "building the client-certificate verifier",
+    )?;
+    verifier
+        .verify_client_cert(issued_client, &[], UnixTime::now())
+        .map_err(|error| {
+            invalid(&format!(
+                "the issuing CA is not trusted by the configured client CA bundle: {error}"
+            ))
+        })?;
+    server_config_with_verifier(cert, key, provider, verifier)
+}
+
+fn required_client_verifier(
+    roots: RootCertStore,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    context: &'static str,
+) -> io::Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+        rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .map_err(|error| invalid(&format!("{context}: {error}")))?;
+    Ok(verifier)
+}
+
+fn server_config_with_verifier(
+    cert: &Path,
+    key: &Path,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> io::Result<rustls::ServerConfig> {
     let certs = load_cert_chain(cert, "server certificate")?;
     let key = load_key(key, "server key")?;
 

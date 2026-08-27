@@ -134,9 +134,10 @@ rules:
     resourceNames: {{- toYaml . | nindent 6 }}
     verbs: ["get"]
   {{- end }}
-  # `/enroll` creates a self-asserted agent, and completes an operator-reserved
-  # (`identity.kind: reserved`) UpdateAgent in place — stamping the node's minted identity (pinned
-  # public key + registration) onto it via a resourceVersion-guarded replace.
+  # In an `open` repository, `/enroll` creates a self-asserted agent. In every mode it can complete
+  # an operator-reserved (`identity.kind: reserved`) UpdateAgent in place — stamping the node's
+  # minted identity (pinned public key + registration) onto it via a resourceVersion-guarded
+  # replace. The admission policy above denies CREATE unless the live repository selects `open`.
   - apiGroups: ["updated.dev"]
     resources: ["updateagents"]
     verbs: ["get", "list", "create", "update"]

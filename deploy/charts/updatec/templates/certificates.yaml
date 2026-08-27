@@ -82,8 +82,8 @@ spec:
 {{- fail (printf "certManager.agentCertificate.commonName (%s) must equal gateway.enrollmentClientCN (%s): the gateway admits a bootstrap client only by that CN, so a mismatch rejects every enrollment with a TLS-level error that names neither value." .Values.certManager.agentCertificate.commonName .Values.gateway.enrollmentClientCN) }}
 {{- end }}
 # The shared bootstrap identity a node presents to /enroll. Per-node certificates from your own PKI
-# are the better production shape — one shared key means any holder can claim any node name. See
-# docs/agent-install.md for the reserved-identity flow that closes that gap.
+# are the better production shape — in `open` mode one shared key means any holder can claim any
+# unused node name. See docs/agent-install.md for the `reservedOnly` flow that bounds that authority.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:

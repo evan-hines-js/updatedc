@@ -49,11 +49,9 @@ impl Agent {
             .env(STATE_DIR_ENV, state_dir);
         // Death-contain the agent so a SIGKILLed launcher can never orphan it — it is
         // the launcher's disposable child, exactly the "churning tower" case `ContainedChild`
-        // exists for. On Linux `arrange_parent_death_signal` adds `PR_SET_PDEATHSIG`; on
-        // Windows the kill-on-close job `ContainedChild` assigns ties the agent to the
-        // launcher's handle. The process group a graceful `CTRL_BREAK`/`SIGTERM` needs is
-        // `ContainedChild`'s own doing on both platforms — see `ContainedChild::request_stop`.
-        foundation::process::arrange_parent_death_signal(&mut cmd);
+        // exists for. Parent death, tree containment, and the process group needed for graceful
+        // `CTRL_BREAK`/`SIGTERM` are one invariant owned by `ContainedChild`; callers cannot
+        // partially configure it.
         let child = ContainedChild::spawn(cmd)?;
         // The agent inherited the child end; the launcher drops its copy so it is
         // the sole holder of the launcher end (and the channel closes when the agent dies).

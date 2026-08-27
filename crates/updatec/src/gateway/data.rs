@@ -44,27 +44,44 @@ pub(crate) fn identity_object<T>(result: Result<T, kube::Error>) -> Result<T, St
     }
 }
 
+/// The complete node-key authorization policy.
+///
+/// Every path that turns a key into node authority -- enrollment revalidation, renewal, and
+/// certificate-authenticated data-plane requests -- uses this predicate. Keeping the name,
+/// repository, kind, field shape, and key check together makes those security boundaries unable to
+/// drift.
+pub(crate) fn agent_authorizes_key(
+    agent: &crate::UpdateAgent,
+    repository: &str,
+    node: &str,
+    public_key: &str,
+) -> bool {
+    agent.metadata.name.as_deref() == Some(node)
+        && agent.spec.repository_ref.name == repository
+        && agent.spec.identity.is_well_formed_for(node)
+        && matches!(
+            agent.spec.identity.kind,
+            crate::AgentIdentityKind::Manual | crate::AgentIdentityKind::Enrolled
+        )
+        && agent.spec.identity.public_key.as_deref() == Some(public_key)
+}
+
 /// Classify one certificate-backed request using the complete identity policy.
 ///
 /// Enrolled and manually provisioned nodes use every steady-state capability only while their live
 /// object still pins the leaf's key. Reserved identities have not become machines and authorize
-/// nothing. Keeping the name, repository, kind, field shape, and key check together prevents a
-/// handler from accidentally treating mTLS authentication as authorization.
+/// nothing. Authentication supplies both the claimed node and the proof-of-possession key; the
+/// canonical predicate above decides whether the live object grants them authority.
 pub(crate) fn authorized_identity(
     identity: &ClientIdentity,
     agent: &crate::UpdateAgent,
     repository: &str,
 ) -> bool {
-    let Some(node) = identity.node_in(repository) else {
+    let (Some(node), Some(public_key)) = (identity.node_in(repository), identity.node_public_key())
+    else {
         return false;
     };
-    if agent.metadata.name.as_deref() != Some(node)
-        || agent.spec.repository_ref.name != repository
-        || !agent.spec.identity.is_well_formed_for(node)
-    {
-        return false;
-    }
-    is_pinned_leaf(identity, agent, repository)
+    agent_authorizes_key(agent, repository, node, public_key)
 }
 
 pub(crate) struct LiveAuthorizedIdentity {

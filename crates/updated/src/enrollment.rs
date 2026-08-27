@@ -388,8 +388,9 @@ fn decode_capability_bundle(
 
 /// Renew the current per-node certificate when it enters its renewal window.
 ///
-/// Enrollment itself is one-way and its root does not expire; live TUF refresh owns metadata and
-/// root rotation. Certificate renewal is therefore the only periodic enrollment control action.
+/// Enrollment itself is one-way; live TUF refresh owns metadata and TUF-root rotation. Certificate
+/// renewal is therefore the only periodic enrollment control action this module performs. Fleet
+/// CA distribution remains operator-owned configuration and is staged as an old+new PEM bundle.
 pub async fn renew_node_certificate_if_due(
     config: &NodeConfig,
     state_dir: &Path,

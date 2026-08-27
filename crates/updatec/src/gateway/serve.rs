@@ -3,6 +3,7 @@
 //! not need a restart.
 
 use super::*;
+use rustls::pki_types::pem::PemObject;
 
 /// The plaintext health router: `/healthz` (and `/`) → 200, everything else 404. It serves no
 /// repository content, so exposing it without mTLS reveals nothing — it exists only for the
@@ -36,21 +37,19 @@ pub async fn serve(
             "the enrollment client Common Name must not be empty",
         ));
     }
-    // Both the listener identity and the issuing CA are cert-manager Secrets rotated in place. They
-    // are loaded here and then re-read on a timer, so a rotation lands in a running gateway.
-    let server_config = Arc::new(Reloadable::new(updated::tls::server_config(
-        &tls.cert,
-        &tls.key,
-        &tls.client_ca,
-    )?));
-    let ca = Arc::new(Reloadable::new(load_issuing_ca(&issuing_ca)?));
+    // Both the listener identity and the issuing CA are cert-manager Secrets rotated in place.
+    // Install them only as one verified snapshot: a cross-Secret skew keeps the previous coherent
+    // generation instead of minting leaves the listener cannot authenticate.
+    let materials = Arc::new(Reloadable::new(load_gateway_materials(&tls, &issuing_ca)?));
     tokio::spawn(reload_materials(
-        tls.cert.clone(),
-        tls.key.clone(),
-        tls.client_ca.clone(),
+        GatewayTls {
+            cert: tls.cert.clone(),
+            key: tls.key.clone(),
+            client_ca: tls.client_ca.clone(),
+            enrollment_client_cn: tls.enrollment_client_cn.clone(),
+        },
         issuing_ca,
-        server_config.clone(),
-        ca.clone(),
+        materials.clone(),
     ));
 
     let data_listener = TcpListener::bind(&addresses.data).await?;
@@ -80,7 +79,6 @@ pub async fn serve(
         authorization: Arc::new(AuthorizationMemo::default()),
         enrollment,
         enrollment_client_cn: Arc::from(tls.enrollment_client_cn),
-        ca,
     });
 
     // Health: plaintext, no TLS, its own small connection budget.
@@ -92,7 +90,7 @@ pub async fn serve(
     // Data: mTLS, runs on this task so `serve` stays alive for the whole process.
     serve_tls(
         data_listener,
-        server_config,
+        materials,
         data_router,
         Arc::new(Semaphore::new(DATA_CONNECTIONS)),
         "data",
@@ -114,6 +112,38 @@ pub(crate) fn load_issuing_ca(paths: &IssuingCaPaths) -> std::io::Result<crate::
     crate::join::IssuingCa::load(&cert, &key)
 }
 
+/// Load the listener verifier and leaf issuer as one generation, proving the issuer by minting a
+/// throwaway client leaf and checking it through the exact verifier returned in this snapshot.
+/// A CA bundle may contain both old and new roots, which is how a rollover is staged without
+/// rejecting either generation of node leaf.
+pub(crate) fn load_gateway_materials(
+    tls: &GatewayTls,
+    issuing_ca: &IssuingCaPaths,
+) -> std::io::Result<GatewayMaterials> {
+    let issuing_ca = load_issuing_ca(issuing_ca)?;
+    let key = updated::csr::generate_key().map_err(|error| {
+        std::io::Error::other(format!("generating CA trust probe key: {error}"))
+    })?;
+    let csr = updated::csr::csr_for(&key, "gateway issuer trust probe").map_err(|error| {
+        std::io::Error::other(format!("generating CA trust probe CSR: {error}"))
+    })?;
+    let leaf = issuing_ca
+        .sign_client_csr("gateway-materials", "trust-probe", &csr)
+        .map_err(|error| std::io::Error::other(format!("signing CA trust probe: {error}")))?;
+    let leaf = rustls::pki_types::CertificateDer::from_pem_slice(leaf.as_bytes())
+        .map_err(|error| std::io::Error::other(format!("parsing CA trust probe: {error}")))?;
+    let server_config = updated::tls::server_config_accepting_issued_client(
+        &tls.cert,
+        &tls.key,
+        &tls.client_ca,
+        &leaf,
+    )?;
+    Ok(GatewayMaterials {
+        server_config: Arc::new(server_config),
+        issuing_ca,
+    })
+}
+
 /// Re-read the mounted certificate material forever, swapping in each new value that loads cleanly.
 ///
 /// Rebuilding unconditionally rather than diffing bytes keeps this to one code path; the work is a
@@ -121,27 +151,27 @@ pub(crate) fn load_issuing_ca(paths: &IssuingCaPaths) -> std::io::Result<crate::
 /// logged and the previous value stays live, which is the fail-safe direction: the alternative is
 /// dropping the fleet's only authenticated channel over a transient read.
 pub(crate) async fn reload_materials(
-    cert: std::path::PathBuf,
-    key: std::path::PathBuf,
-    client_ca: std::path::PathBuf,
+    tls: GatewayTls,
     issuing_ca: IssuingCaPaths,
-    server_config: Arc<Reloadable<rustls::ServerConfig>>,
-    ca: Arc<Reloadable<crate::join::IssuingCa>>,
+    materials: Arc<Reloadable<GatewayMaterials>>,
 ) {
     loop {
         tokio::time::sleep(MATERIAL_RELOAD_INTERVAL).await;
-        match updated::tls::server_config(&cert, &key, &client_ca) {
-            Ok(config) => server_config.set(config),
-            Err(error) => {
-                tracing::warn!(%error, "reloading gateway TLS material failed; keeping the loaded one")
-            }
-        }
-        match load_issuing_ca(&issuing_ca) {
-            Ok(loaded) => ca.set(loaded),
-            Err(error) => {
-                tracing::warn!(%error, "reloading the issuing CA failed; keeping the loaded one")
-            }
-        }
+        reload_materials_once(&tls, &issuing_ca, &materials);
+    }
+}
+
+pub(crate) fn reload_materials_once(
+    tls: &GatewayTls,
+    issuing_ca: &IssuingCaPaths,
+    materials: &Reloadable<GatewayMaterials>,
+) {
+    match load_gateway_materials(tls, issuing_ca) {
+        Ok(loaded) => materials.set(loaded),
+        Err(error) => tracing::warn!(
+            %error,
+            "reloading coherent gateway TLS and issuing-CA material failed; keeping the loaded generation"
+        ),
     }
 }
 
@@ -220,7 +250,7 @@ pub(crate) async fn accept_next(
 /// a handler.
 pub(crate) async fn serve_tls(
     listener: TcpListener,
-    server_config: Arc<Reloadable<rustls::ServerConfig>>,
+    materials: Arc<Reloadable<GatewayMaterials>>,
     app: Router,
     budget: Arc<Semaphore>,
     label: &'static str,
@@ -232,7 +262,8 @@ pub(crate) async fn serve_tls(
         };
         // Take the current identity per connection, so a rotated certificate applies to the next
         // handshake rather than to the next process.
-        let acceptor = TlsAcceptor::from(server_config.get());
+        let materials = materials.get();
+        let acceptor = TlsAcceptor::from(materials.server_config.clone());
         let app = app.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -251,7 +282,9 @@ pub(crate) async fn serve_tls(
             // per-node authorization check reads the trusted cert CN rather than the node's
             // self-claimed path. `None` is used only by the plaintext health listener.
             let identity = peer_identity(tls.get_ref().1);
-            let app = app.layer(Extension(identity));
+            // The handler signs through the same generation that authenticated this connection,
+            // even if a reload lands while the request is in flight.
+            let app = app.layer(Extension(identity)).layer(Extension(materials));
             serve_http(TokioIo::new(tls), app, CONNECTION_TIMEOUT).await;
         });
     }

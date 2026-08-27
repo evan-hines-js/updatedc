@@ -8,10 +8,12 @@
 //! launched keeps running. Re-implementing that per-OS at each call site is exactly the
 //! kind of platform leak this crate exists to prevent.
 //!
-//! The permanent launcher owns application processes through its own lower-level `sys`
-//! seam (it drives a raw suspended-spawn/assign/resume on Windows for a stronger no-orphan
-//! guarantee); this module is the portable, `std::process::Command`-based containment used
-//! by the churning tower.
+//! Windows closes the otherwise-fatal `CreateProcess`/job-assignment gap in two layers. The
+//! caller first joins a private kill-on-close guard job, so every new child is death-contained
+//! from the instant the kernel creates it. Each child is then created suspended, assigned to its
+//! own independently killable job, and resumed. No child instruction can run between creation
+//! and per-tree containment, while the inherited guard still covers a caller killed inside that
+//! setup window.
 
 use std::io;
 use std::process::{Child, Command, ExitStatus};
@@ -93,14 +95,41 @@ impl ContainedChild {
     #[cfg(windows)]
     fn spawn_windows(mut command: Command, extra_flags: u32) -> io::Result<Self> {
         use std::os::windows::process::CommandExt;
+        // This job contains the caller itself and is installed BEFORE CreateProcess. A normal
+        // child inherits it atomically at creation, so killing the caller in any later setup
+        // window closes the last guard handle and kills the suspended child too.
+        windows::ensure_parent_death_guard()?;
         // The Windows analogue of `process_group(0)`: the child's process-group id becomes its
         // PID, which is what `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` addresses.
         command.creation_flags(
-            windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP | extra_flags,
+            windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+                | windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+                | extra_flags,
         );
-        Self::spawn_contained(command)
+        let mut child = command.spawn()?;
+        // The child cannot execute or create descendants until it belongs to its own job. Its
+        // inherited parent guard is already live, so even an abrupt caller death here cannot
+        // leave the suspended process behind.
+        let job = match windows::Job::assign(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                kill_and_reap(&mut child);
+                return Err(error);
+            }
+        };
+        if let Err(error) = windows::resume_suspended_process(child.id()) {
+            let _ = job.terminate();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(ContainedChild {
+            child,
+            reaped: false,
+            job,
+        })
     }
 
+    #[cfg(not(windows))]
     fn spawn_contained(mut command: Command) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -109,26 +138,14 @@ impl ContainedChild {
             // negated PID reaches the whole tree and never the caller's other children.
             command.process_group(0);
         }
+        // Parent-death containment is part of the same spawn primitive as process-tree
+        // containment. No caller can remember one while forgetting the other.
+        #[cfg(target_os = "linux")]
+        unix::arrange_parent_death_signal(&mut command);
         let child = command.spawn()?;
-        // The child is ALREADY RUNNING by the time containment is established. Letting an assign
-        // failure propagate would drop `child` here, and `std::process::Child`'s Drop neither kills
-        // nor reaps — leaving an uncontained process running with no handle to it while the caller
-        // is told the launch failed. Kill it before reporting.
-        #[cfg(windows)]
-        let job = match windows::Job::assign(&child) {
-            Ok(job) => job,
-            Err(error) => {
-                let mut orphan = child;
-                let _ = orphan.kill();
-                let _ = orphan.wait();
-                return Err(error);
-            }
-        };
         Ok(ContainedChild {
             child,
             reaped: false,
-            #[cfg(windows)]
-            job,
         })
     }
 
@@ -148,29 +165,87 @@ impl ContainedChild {
         self.child.stderr.take()
     }
 
-    /// Non-blocking exit check of the root child.
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        self.reaped |= status.is_some();
-        Ok(status)
+    /// Observe only whether the root has exited, without reaping it or cleaning its descendants.
+    ///
+    /// This exists for diagnostics that must inspect the interval between a wrapper exiting and
+    /// [`wait`](Self::wait) enforcing tree cleanup (the reconciler conformance checker detects
+    /// inherited pipes there). It is not a completion operation: every caller must still finish
+    /// through `wait`, `stop`, or `kill_tree` followed by `wait`.
+    pub fn root_has_exited(&self) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            unix::child_exited_unreaped(self.child.id(), true)
+        }
+        #[cfg(windows)]
+        {
+            windows::child_exited(&self.child)
+        }
     }
 
-    /// Block until the root child has been reaped.
+    /// Non-blocking exit check of the root child.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.reaped {
+            #[cfg(windows)]
+            self.job.terminate()?;
+            return self.child.try_wait();
+        }
+        #[cfg(unix)]
+        {
+            if !unix::child_exited_unreaped(self.child.id(), true)? {
+                return Ok(None);
+            }
+            // Keep the leader as a zombie until the group is gone. Its unreaped PID pins the
+            // process-group id, so cleanup can never hit a recycled, unrelated group.
+            unix::cleanup_exited_tree(self.child.id())?;
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(Some(status))
+        }
+        #[cfg(windows)]
+        {
+            let status = self.child.try_wait()?;
+            if status.is_some() {
+                self.reaped = true;
+                // A job handle remains stable after its root exits, so clean any descendants
+                // before reporting the tree complete.
+                self.job.terminate()?;
+            }
+            Ok(status)
+        }
+    }
+
+    /// Block until the root exits, tear down every undetached descendant, then reap it.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.wait()?;
-        self.reaped = true;
-        Ok(status)
+        if self.reaped {
+            #[cfg(windows)]
+            self.job.terminate()?;
+            return self.child.wait();
+        }
+        #[cfg(unix)]
+        {
+            unix::child_exited_unreaped(self.child.id(), false)?;
+            unix::cleanup_exited_tree(self.child.id())?;
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        }
+        #[cfg(windows)]
+        {
+            let status = self.child.wait()?;
+            self.reaped = true;
+            self.job.terminate()?;
+            Ok(status)
+        }
     }
 
     /// Ask the tree to stop *gracefully* — `SIGTERM` on Unix, a `CTRL_BREAK` console event on
     /// Windows — leaving the caller to wait out a grace period and then [`kill_tree`](Self::kill_tree).
     /// This is the only graceful stop this type offers, and the only one a caller should need:
-    /// signalling a PID by hand is exactly the hazard `reaped` exists to remove, and a bare
-    /// `kill(pid, SIGTERM)` from a call site is indistinguishable from one aimed at whatever the
-    /// kernel handed that number to next.
+    /// signalling a PID by hand is exactly the hazard `reaped` exists to remove.
     ///
-    /// Once the root has been reaped this is a no-op that reports success: the tree it named is
-    /// gone, and there is nothing to ask politely. The Windows event needs two things: the child
+    /// Once the root has been reaped this is a no-op that reports success: `try_wait` and `wait`
+    /// tear down its undetached descendants before reaping, so there is nothing left to ask
+    /// politely. The Windows event needs two things: the child
     /// must lead its own process group, which spawning guarantees for every `ContainedChild` so
     /// no call site has to arrange it (and none can forget to); and it must be reachable in a
     /// console this process can raise an event in, which spawning does NOT guarantee on its own.
@@ -180,9 +255,9 @@ impl ContainedChild {
     /// the instant the event takes. A console-less caller that used plain
     /// [`spawn`](Self::spawn) has a console-less child too, and gets `Err` here rather than a
     /// silent no-op — the caller then waits out its grace and
-    /// [`kill_tree`](Self::kill_tree)s. On Unix a `SIGTERM`
-    /// to the group would reach the caller's own group before the child's `setpgid` lands, so the
-    /// leader alone is signalled and its children inherit the shutdown from it.
+    /// [`kill_tree`](Self::kill_tree)s. On Unix spawning does not return until the child's
+    /// pre-exec `setpgid` has landed, so `SIGTERM` is sent to the group and reaches wrappers and
+    /// the helpers they launched together.
     pub fn request_stop(&mut self) -> io::Result<()> {
         if self.reaped {
             return Ok(());
@@ -240,10 +315,10 @@ impl ContainedChild {
 
     /// Kill the entire tree — the process group on Unix, the job object on Windows — not just
     /// the root child. Correct at every point in the child's life, which is what makes it the
-    /// only kill this type offers: while the root is still unreaped both it and its group are
-    /// signalled (the root may not have reached its `setpgid` yet), and once it has been reaped
-    /// only the group is, because the root's PID is then the kernel's to hand to anyone. A tree
-    /// whose members are all gone is success, so this is idempotent.
+    /// only kill this type offers: while the root is unreaped its group (including the root) is
+    /// signalled.
+    /// Once it is reaped this is a no-op because the only reaping methods clean the still-PID-
+    /// pinned group first. A tree whose members are all gone is success, so this is idempotent.
     pub fn kill_tree(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -256,20 +331,22 @@ impl ContainedChild {
     }
 }
 
-/// Additively arrange for a child spawned from `command` to be killed if THIS process
-/// dies — parent-death containment for a child that is *not* wrapped in [`ContainedChild`],
-/// such as the launcher's disposable agent. On Linux this installs a `pre_exec` hook
-/// setting `PR_SET_PDEATHSIG(SIGKILL)` and re-checks the parent immediately after, closing
-/// the fork/exec race where the launcher already died before the signal was armed. Off
-/// Linux it is a no-op — macOS is a dev/test target, and Windows death-containment is a
-/// kill-on-close job object ([`ContainedChild`]) rather than a signal.
-///
-/// It only *adds* a `pre_exec` hook: it changes no other command configuration and does not
-/// disturb a hook the caller already installed, so it composes with [`ContainedChild::spawn`]
-/// and with the existing `updated`/app spawn paths (this is a new function, added additively).
-pub fn arrange_parent_death_signal(command: &mut Command) {
+#[cfg(windows)]
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+mod unix {
+    use std::io;
+
+    /// Tie every contained Linux child to its parent in the kernel, including the fork/exec race
+    /// where the parent dies before `PR_SET_PDEATHSIG` is armed. This is private because the only
+    /// valid parent-death-contained process is one spawned through [`ContainedChild`], which also
+    /// owns the tree-kill and reap invariants.
     #[cfg(target_os = "linux")]
-    {
+    pub(super) fn arrange_parent_death_signal(command: &mut std::process::Command) {
         use std::os::unix::process::CommandExt;
         let expected_ppid = std::process::id() as libc::pid_t;
         // Safety: the hook runs in the forked child before exec and calls only
@@ -292,61 +369,73 @@ pub fn arrange_parent_death_signal(command: &mut Command) {
             });
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = command;
-    }
-}
 
-#[cfg(unix)]
-mod unix {
-    use std::io;
+    /// Observe a direct child's exit without reaping it. `WNOWAIT` is the key containment detail:
+    /// the zombie keeps its PID (and therefore its process-group id) reserved until the caller has
+    /// killed every undetached descendant and deliberately reaps it.
+    pub(super) fn child_exited_unreaped(id: u32, nonblocking: bool) -> io::Result<bool> {
+        let pid = i32::try_from(id)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child PID exceeds pid_t"))?;
+        let options = libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 };
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` is writable for its full size; P_PID selects only our direct child,
+            // and WNOWAIT explicitly leaves its wait status available for `Child::wait`.
+            let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, options) };
+            if rc == 0 {
+                // POSIX permits no state change to be reported for WNOHANG; the zeroed si_pid is
+                // therefore the unambiguous "still running" result.
+                return Ok(unsafe { info.si_pid() } != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// Kill descendants after `waitid(WNOWAIT)` proved the leader has exited, while its zombie
+    /// still pins the process-group id. The leader itself needs no signal; reaping follows only
+    /// after this returns.
+    pub(super) fn cleanup_exited_tree(id: u32) -> io::Result<()> {
+        let error = match signal_group(id, libc::SIGKILL) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        // Darwin reports EPERM when the group contains only the unsignalable zombie leader. A
+        // live same-user descendant makes the group kill succeed, so this is the empty-tree case
+        // reached by ordinary single-process commands.
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) {
+            return Ok(());
+        }
+        Err(error)
+    }
 
     pub(super) fn kill_tree(id: u32, leader_reaped: bool) -> io::Result<()> {
-        let pid = i32::try_from(id)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child PID exceeds pid_t"))?;
-        for target in kill_targets(pid, leader_reaped) {
-            // ESRCH from a target means *that* target is already gone, which is the outcome we
-            // want — but it is accepted per-target: a not-yet-`setpgid` child (group ESRCH,
-            // leader killed) is never mistaken for an already-dead tree, because the leader
-            // kill succeeds.
-            //
-            // SAFETY: the targets are derived from this child's own PID — the negated value
-            // names only the group it leads, the positive value only the child itself.
-            let rc = unsafe { libc::kill(target, libc::SIGKILL) };
-            accept_kill(rc, io::Error::last_os_error())?;
-        }
-        Ok(())
-    }
-
-    /// The `kill(2)` targets for one tree, in signalling order.
-    ///
-    /// The group (`-pid`) is always signalled: it reaches every descendant, and the kernel keeps
-    /// the group's number allocated while any member survives, so it cannot name a stranger.
-    ///
-    /// The leader (`pid`) is signalled ONLY while it is still an unreaped child of ours. It has
-    /// to be, because between fork and the `process_group(0)` that runs before exec the child is
-    /// still in the caller's group and no group named `pid` exists yet — a kill of `-pid` in that
-    /// window returns ESRCH while the child is very much alive. But the instant the child is
-    /// reaped that same PID becomes the kernel's to reassign, and signalling it could SIGKILL an
-    /// unrelated process (silently: ESRCH-tolerant `accept_kill` would report success either
-    /// way). `reaped` is owned by [`ContainedChild`](super::ContainedChild) and set by the only
-    /// two calls that can reap, so no caller has to remember this ordering.
-    pub(super) fn kill_targets(pid: i32, leader_reaped: bool) -> Vec<i32> {
         if leader_reaped {
-            vec![-pid]
-        } else {
-            vec![-pid, pid]
+            // `try_wait` and `wait` kill the PID-pinned group before setting this bit. Signalling
+            // the numeric group after reaping would reintroduce a process-id reuse race.
+            return Ok(());
         }
+        signal_group(id, libc::SIGKILL)
     }
 
-    /// `SIGTERM` the still-unreaped leader. Only ever called with `reaped == false`, so the PID
-    /// is our own live child's and cannot have been recycled.
+    /// `SIGTERM` the still-PID-pinned process group so wrappers and helpers receive the graceful
+    /// request together. `CommandExt::process_group` runs before exec, and `spawn` does not return
+    /// before that setup completes.
     pub(super) fn request_stop(id: u32) -> io::Result<()> {
+        signal_group(id, libc::SIGTERM)
+    }
+
+    /// The one Unix signalling path. Spawning establishes `pid` as the root and group id before it
+    /// returns, so addressing the group reaches both the root and every undetached descendant; a
+    /// second root-only signal is redundant and would create another policy path.
+    fn signal_group(id: u32, signal: libc::c_int) -> io::Result<()> {
         let pid = i32::try_from(id)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child PID exceeds pid_t"))?;
-        // SAFETY: `pid` is this process's own unreaped child.
-        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        // SAFETY: `-pid` names the fresh group established for this unreaped direct child.
+        let rc = unsafe { libc::kill(-pid, signal) };
         accept_kill(rc, io::Error::last_os_error())
     }
 
@@ -364,15 +453,109 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use std::io;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::process::Child;
+    use std::sync::Mutex;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
+
+    /// The handle is intentionally process-global and never dropped: the OS closes it after this
+    /// process exits, which is exactly when kill-on-close must reap any child whose per-tree setup
+    /// was interrupted. A mutex makes first use atomic across caller threads; creating two guard
+    /// jobs and dropping the losing one would kill this process because it belongs to both.
+    static PARENT_DEATH_GUARD: Mutex<Option<Job>> = Mutex::new(None);
+
+    pub(super) fn ensure_parent_death_guard() -> io::Result<()> {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut guard = PARENT_DEATH_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            let job = Job::assign_handle(unsafe { GetCurrentProcess() })?;
+            *guard = Some(job);
+        }
+        Ok(())
+    }
+
+    /// The process handle is stable and signalled at exit; unlike `Child::try_wait`, this observes
+    /// it without consuming the exit status or changing the cleanup state.
+    pub(super) fn child_exited(child: &Child) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        match unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            result => Err(io::Error::other(format!(
+                "unexpected process wait result {result}"
+            ))),
+        }
+    }
+
+    /// Resume the sole primary thread of a process created with `CREATE_SUSPENDED`.
+    /// `std::process::Child` exposes the process handle but not the primary thread handle, so use
+    /// the documented ToolHelp snapshot to recover it. A suspended process cannot create another
+    /// thread; finding zero or multiple threads therefore fails closed and the caller terminates
+    /// its already-assigned job instead of guessing which thread to resume.
+    pub(super) fn resume_suspended_process(id: u32) -> io::Result<()> {
+        use std::os::windows::io::RawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, FALSE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `snapshot` is a newly owned, non-null kernel handle.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as RawHandle) };
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut thread_id = None;
+        let mut more = unsafe { Thread32First(snapshot.as_raw_handle() as HANDLE, &mut entry) };
+        loop {
+            if more == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                    return Err(error);
+                }
+                break;
+            }
+            if entry.th32OwnerProcessID == id && thread_id.replace(entry.th32ThreadID).is_some() {
+                return Err(io::Error::other(
+                    "suspended child exposed more than one thread before job assignment",
+                ));
+            }
+            more = unsafe { Thread32Next(snapshot.as_raw_handle() as HANDLE, &mut entry) };
+        }
+        let thread_id = thread_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "suspended child's primary thread was not visible",
+            )
+        })?;
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, FALSE, thread_id) };
+        if thread.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `thread` is a newly owned primary-thread handle.
+        let thread = unsafe { OwnedHandle::from_raw_handle(thread as RawHandle) };
+        if unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 
     /// Send `CTRL_BREAK` to the still-unreaped child's process group — the Windows analogue of
     /// `SIGTERM`. `ContainedChild::spawn` always sets `CREATE_NEW_PROCESS_GROUP`, so the group id
@@ -453,11 +636,19 @@ mod windows {
     /// member when the handle closes.
     pub(super) struct Job(HANDLE);
 
+    // Kernel job handles may be closed or queried from any thread. Ownership remains unique and
+    // Drop closes exactly once, so moving this RAII wrapper through the guard mutex is sound.
+    unsafe impl Send for Job {}
+
     impl Job {
         pub(super) fn assign(child: &Child) -> io::Result<Self> {
+            Self::assign_handle(child.as_raw_handle() as HANDLE)
+        }
+
+        fn assign_handle(process: HANDLE) -> io::Result<Self> {
             // Own the handle immediately so an assign failure closes it on the `?`/return.
             let job = Job(create_kill_on_close_job()?);
-            if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as _) } == 0 {
+            if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(job)
@@ -478,6 +669,31 @@ mod windows {
                 CloseHandle(self.0);
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_spawn_tests {
+    use super::*;
+
+    #[test]
+    fn a_suspended_child_is_assigned_and_resumed_before_spawn_returns() {
+        // A CREATE_SUSPENDED process would wait forever if the primary-thread recovery or resume
+        // step drifted. This native Windows test exercises the complete guard -> suspended spawn
+        // -> per-tree assignment -> resume path rather than merely compiling its FFI surface.
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "exit", "0"]);
+        let mut child = ContainedChild::spawn(command).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_windows_job_still_hard_kills_its_running_root() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "ping -n 30 127.0.0.1 >NUL"]);
+        let mut child = ContainedChild::spawn(command).unwrap();
+        child.kill_tree().unwrap();
+        assert!(!child.wait().unwrap().success());
     }
 }
 
@@ -519,19 +735,9 @@ mod tests {
     fn kill_tree_on_an_already_exited_tree_is_ok() {
         let mut contained = ContainedChild::spawn(Command::new("true")).unwrap();
         let _ = contained.wait().unwrap();
-        // ESRCH is swallowed: killing a group that already exited is success.
+        // Waiting already cleaned the PID-pinned group. A later kill is an idempotent no-op, not
+        // a signal sent to a numeric process-group id the kernel may since have recycled.
         contained.kill_tree().unwrap();
-    }
-
-    #[test]
-    fn a_reaped_leaders_pid_is_never_signalled() {
-        // The leader's PID is the kernel's to reassign the moment it is reaped, so the
-        // documented `wait(); kill_tree()` ordering must signal the group alone — signalling a
-        // recycled PID would SIGKILL an unrelated process, and ESRCH tolerance would hide it.
-        assert_eq!(unix::kill_targets(4242, true), vec![-4242]);
-        // Still unreaped: the leader must also be signalled directly, or a child killed between
-        // fork and its `setpgid` survives (the group named by its PID does not exist yet).
-        assert_eq!(unix::kill_targets(4242, false), vec![-4242, 4242]);
     }
 
     #[test]
@@ -600,7 +806,6 @@ mod tests {
         let mut contained = ContainedChild::spawn(command).unwrap();
         let mut stdout = contained.take_stdout().unwrap();
         assert!(contained.wait().unwrap().success());
-        contained.kill_tree().unwrap();
         let started = Instant::now();
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).unwrap();

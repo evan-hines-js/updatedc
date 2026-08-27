@@ -107,6 +107,103 @@ const TEST_OTHER_LEAF_KEY: &str =
     "047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1";
 const TEST_REPOSITORY: &str = "prod";
 
+fn test_ca(common_name: &str) -> (String, String) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let cert = params.self_signed(&key).unwrap();
+    (cert.pem(), key.serialize_pem())
+}
+
+fn test_server_identity() -> (String, String) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let cert = params.self_signed(&key).unwrap();
+    (cert.pem(), key.serialize_pem())
+}
+
+fn material_probe(materials: &GatewayMaterials) -> rustls::pki_types::CertificateDer<'static> {
+    use rustls::pki_types::pem::PemObject;
+
+    let key = updated::csr::generate_key().unwrap();
+    let csr = updated::csr::csr_for(&key, "test material probe").unwrap();
+    let leaf = materials
+        .issuing_ca
+        .sign_client_csr("gateway-materials", "test-probe", &csr)
+        .unwrap();
+    rustls::pki_types::CertificateDer::from_pem_slice(leaf.as_bytes()).unwrap()
+}
+
+#[test]
+fn gateway_material_reload_is_atomic_and_accepts_a_staged_ca_bundle() {
+    updated::tls::install_crypto_provider();
+    let directory = tempfile::tempdir().unwrap();
+    let server_cert = directory.path().join("server.crt");
+    let server_key = directory.path().join("server.key");
+    let client_ca = directory.path().join("client-ca.crt");
+    let issuing_cert = directory.path().join("issuing.crt");
+    let issuing_key = directory.path().join("issuing.key");
+    let (server_cert_pem, server_key_pem) = test_server_identity();
+    let (old_cert, old_key) = test_ca("old fleet CA");
+    let (new_cert, new_key) = test_ca("new fleet CA");
+    std::fs::write(&server_cert, server_cert_pem).unwrap();
+    std::fs::write(&server_key, server_key_pem).unwrap();
+    std::fs::write(&client_ca, &old_cert).unwrap();
+    std::fs::write(&issuing_cert, &old_cert).unwrap();
+    std::fs::write(&issuing_key, &old_key).unwrap();
+    let tls = GatewayTls {
+        cert: server_cert,
+        key: server_key,
+        client_ca: client_ca.clone(),
+        enrollment_client_cn: "updated-agent".into(),
+    };
+    let issuing = IssuingCaPaths {
+        cert: issuing_cert.clone(),
+        key: issuing_key.clone(),
+    };
+    let materials = Reloadable::new(load_gateway_materials(&tls, &issuing).unwrap());
+
+    // Kubernetes updates projected Secrets independently. Seeing the new issuer before its trust
+    // anchor must retain the complete old generation, not install half of the rollover.
+    std::fs::write(&issuing_cert, &new_cert).unwrap();
+    std::fs::write(&issuing_key, &new_key).unwrap();
+    reload_materials_once(&tls, &issuing, &materials);
+    updated::tls::verify_client_chain(material_probe(&materials.get()), &client_ca)
+        .expect("the failed skewed reload must leave the old signer live");
+
+    // Stage both anchors first. The same snapshot then admits old leaves while signing and
+    // admitting new leaves, which is the overlap required for a no-outage rollover.
+    std::fs::write(&client_ca, format!("{old_cert}{new_cert}")).unwrap();
+    reload_materials_once(&tls, &issuing, &materials);
+    updated::tls::verify_client_chain(material_probe(&materials.get()), &client_ca)
+        .expect("the staged bundle must trust the new issuer");
+    let old_ca = crate::join::IssuingCa::load(&old_cert, &old_key).unwrap();
+    let old_probe_key = updated::csr::generate_key().unwrap();
+    let old_probe_csr = updated::csr::csr_for(&old_probe_key, "old material probe").unwrap();
+    let old_leaf = old_ca
+        .sign_client_csr("gateway-materials", "old-probe", &old_probe_csr)
+        .unwrap();
+    use rustls::pki_types::pem::PemObject;
+    let old_leaf = rustls::pki_types::CertificateDer::from_pem_slice(old_leaf.as_bytes()).unwrap();
+    updated::tls::verify_client_chain(old_leaf, &client_ca)
+        .expect("the staged bundle must continue to trust old leaves");
+
+    // Once old leaves have drained, the old anchor can be removed and the coherent new-only
+    // generation still loads.
+    std::fs::write(&client_ca, &new_cert).unwrap();
+    reload_materials_once(&tls, &issuing, &materials);
+    updated::tls::verify_client_chain(material_probe(&materials.get()), &client_ca)
+        .expect("the completed rollover must use only the new CA");
+}
+
 fn node_leaf(repository: &str, node: &str) -> ClientIdentity {
     node_leaf_keyed(repository, node, TEST_LEAF_KEY)
 }
@@ -206,21 +303,44 @@ fn renewal_requires_a_provisioned_agent_repository_and_pinned_key() {
         "repo",
         Some(TEST_LEAF_KEY),
     );
-    assert!(is_pinned_identity(&enrolled, "repo", TEST_LEAF_KEY));
-    assert!(!is_pinned_identity(&enrolled, "other", TEST_LEAF_KEY));
-    assert!(!is_pinned_identity(&enrolled, "repo", TEST_OTHER_LEAF_KEY));
-    assert!(is_pinned_identity(
+    assert!(agent_authorizes_key(
+        &enrolled,
+        "repo",
+        "node-a",
+        TEST_LEAF_KEY
+    ));
+    assert!(!agent_authorizes_key(
+        &enrolled,
+        "other",
+        "node-a",
+        TEST_LEAF_KEY
+    ));
+    assert!(!agent_authorizes_key(
+        &enrolled,
+        "repo",
+        "node-a",
+        TEST_OTHER_LEAF_KEY
+    ));
+    assert!(!agent_authorizes_key(
+        &enrolled,
+        "repo",
+        "other-node",
+        TEST_LEAF_KEY
+    ));
+    assert!(agent_authorizes_key(
         &renewal_agent(
             crate::AgentIdentityKind::Manual,
             "repo",
             Some(TEST_LEAF_KEY)
         ),
         "repo",
+        "node-a",
         TEST_LEAF_KEY
     ));
-    assert!(!is_pinned_identity(
+    assert!(!agent_authorizes_key(
         &renewal_agent(crate::AgentIdentityKind::Enrolled, "repo", None),
         "repo",
+        "node-a",
         TEST_LEAF_KEY
     ));
 }
@@ -281,8 +401,8 @@ fn a_certificate_authenticated_route_requires_the_leaf_s_own_pinned_identity() {
         "repo",
         Some(TEST_LEAF_KEY),
     );
-    assert!(is_pinned_leaf(
-        &node_leaf_keyed("repo", "n", TEST_LEAF_KEY),
+    assert!(authorized_identity(
+        &node_leaf_keyed("repo", "node-a", TEST_LEAF_KEY),
         &enrolled,
         "repo"
     ));
@@ -291,15 +411,15 @@ fn a_certificate_authenticated_route_requires_the_leaf_s_own_pinned_identity() {
     // leaf still authenticates for the rest of its 90-day life and there is no revocation path,
     // so the pin is the only thing that stops it reading the replacement's secrets, bundle and
     // telemetry slot.
-    assert!(!is_pinned_leaf(
-        &node_leaf_keyed("repo", "n", TEST_OTHER_LEAF_KEY),
+    assert!(!authorized_identity(
+        &node_leaf_keyed("repo", "node-a", TEST_OTHER_LEAF_KEY),
         &enrolled,
         "repo"
     ));
     // The fleet CA is shared across repositories, so a leaf minted by another repository's
     // `/enroll` authenticates here and must still be refused this repository's material.
-    assert!(!is_pinned_leaf(
-        &node_leaf_keyed("repo", "n", TEST_LEAF_KEY),
+    assert!(!authorized_identity(
+        &node_leaf_keyed("repo", "node-a", TEST_LEAF_KEY),
         &renewal_agent(
             crate::AgentIdentityKind::Enrolled,
             "other",
@@ -308,8 +428,8 @@ fn a_certificate_authenticated_route_requires_the_leaf_s_own_pinned_identity() {
         "repo"
     ));
     // An operator-provisioned node pins its leaf key without using online enrollment.
-    assert!(is_pinned_leaf(
-        &node_leaf_keyed("repo", "n", TEST_LEAF_KEY),
+    assert!(authorized_identity(
+        &node_leaf_keyed("repo", "node-a", TEST_LEAF_KEY),
         &renewal_agent(
             crate::AgentIdentityKind::Manual,
             "repo",
@@ -317,13 +437,13 @@ fn a_certificate_authenticated_route_requires_the_leaf_s_own_pinned_identity() {
         ),
         "repo"
     ));
-    assert!(!is_pinned_leaf(
-        &node_leaf_keyed("repo", "n", TEST_LEAF_KEY),
+    assert!(!authorized_identity(
+        &node_leaf_keyed("repo", "node-a", TEST_LEAF_KEY),
         &renewal_agent(crate::AgentIdentityKind::Reserved, "repo", None),
         "repo"
     ));
     // A connection with no client certificate carries no key and authorizes nothing.
-    assert!(!is_pinned_leaf(
+    assert!(!authorized_identity(
         &ClientIdentity::anonymous(),
         &enrolled,
         "repo"
@@ -419,6 +539,185 @@ fn only_an_explicitly_reserved_name_may_be_completed_by_enrollment() {
     let mut established = deferred(crate::AgentIdentityKind::Reserved);
     established.spec.identity.registration_sha256 = Some("registration".into());
     assert!(!adopts_preapproval(&established, &desired));
+}
+
+#[tokio::test]
+async fn reserved_only_rejects_an_absent_name_before_inventory_creation() {
+    let mut repository = crate::UpdateRepository::new(TEST_REPOSITORY, crate::tests::repository());
+    repository.metadata.namespace = Some("default".into());
+    assert_eq!(
+        repository.spec.enrollment.mode,
+        crate::EnrollmentMode::ReservedOnly
+    );
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<(Method, String)>::new()));
+    let observed = requests.clone();
+    let client = crate::tests::apiserver(move |method, path, body| {
+        observed.lock().unwrap().push((method.clone(), path.into()));
+        match (method, path) {
+            (
+                &Method::GET,
+                "/apis/updated.dev/v1alpha1/namespaces/default/updaterepositories/prod",
+            ) => (StatusCode::OK, serde_json::to_value(&repository).unwrap()),
+            (
+                &Method::GET,
+                "/apis/coordination.k8s.io/v1/namespaces/default/leases/enrollment-lock",
+            ) => {
+                let mut lease = Lease::default();
+                lease.metadata.name = Some("enrollment-lock".into());
+                lease.metadata.resource_version = Some("1".into());
+                lease.spec = Some(LeaseSpec::default());
+                (StatusCode::OK, serde_json::to_value(lease).unwrap())
+            }
+            (
+                &Method::PUT,
+                "/apis/coordination.k8s.io/v1/namespaces/default/leases/enrollment-lock",
+            ) => (StatusCode::OK, serde_json::from_slice(&body).unwrap()),
+            (
+                &Method::GET,
+                "/apis/updated.dev/v1alpha1/namespaces/default/updateagents/unapproved",
+            ) => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": "NotFound",
+                    "message": "not found",
+                    "code": 404
+                }),
+            ),
+            _ => panic!("unexpected apiserver request: {method} {path}"),
+        }
+    });
+    let state = DataState {
+        content: direct_content_state(Arc::new(InMemory::new()), test_signer()),
+        authorization: Arc::new(AuthorizationMemo::default()),
+        enrollment: EnrollmentContext {
+            client,
+            namespace: "default".into(),
+            repository: TEST_REPOSITORY.into(),
+            public_url: "https://gateway.example".into(),
+            lock_name: "enrollment-lock".into(),
+        },
+        enrollment_client_cn: Arc::from("updated-agent"),
+    };
+    let (ca_cert, ca_key) = test_ca("reserved-only test CA");
+    let ca = crate::join::IssuingCa::load(&ca_cert, &ca_key).unwrap();
+    let key = updated::csr::generate_key().unwrap();
+    let csr = updated::csr::csr_for(&key, "unapproved").unwrap();
+    let response = register_enrollment(&state, &ca, "unapproved", &csr)
+        .await
+        .unwrap_err();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, path)| *method != Method::POST && !path.ends_with("/updateagents")),
+        "reserved-only refusal must neither create nor list dynamic inventory"
+    );
+}
+
+#[tokio::test]
+async fn enrollment_refuses_a_same_name_replacement_before_issuing_its_capability() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let name = "node-a";
+    let registration = updated_contracts::telemetry::node_object_digest(name);
+    let key = updated::csr::generate_key().unwrap();
+    let csr = updated::csr::csr_for(&key, name).unwrap();
+    let request_public_key = crate::join::csr_public_key(&csr).unwrap().to_hex();
+
+    let mut accepted = renewal_agent(
+        crate::AgentIdentityKind::Enrolled,
+        TEST_REPOSITORY,
+        Some(&request_public_key),
+    );
+    accepted.spec.identity.registration_sha256 = Some(registration.clone());
+    let mut replacement = renewal_agent(
+        crate::AgentIdentityKind::Enrolled,
+        TEST_REPOSITORY,
+        Some(TEST_OTHER_LEAF_KEY),
+    );
+    replacement.spec.identity.registration_sha256 = Some(registration.clone());
+    replacement.status = Some(crate::UpdateAgentStatus {
+        enrollment_object_key: Some(format!(
+            "enrollments/{}/{}/{}.json",
+            updated_contracts::digest::sha256_bytes(name.as_bytes()),
+            "a".repeat(64),
+            "b".repeat(64)
+        )),
+        ..Default::default()
+    });
+
+    let mut repository = crate::UpdateRepository::new(TEST_REPOSITORY, crate::tests::repository());
+    repository.metadata.namespace = Some("default".into());
+    let mut initial_lease = Lease::default();
+    initial_lease.metadata.name = Some("enrollment-lock".into());
+    initial_lease.metadata.resource_version = Some("1".into());
+    initial_lease.spec = Some(LeaseSpec::default());
+    let lease = Arc::new(std::sync::Mutex::new(initial_lease));
+    let observed_lease = lease.clone();
+    let agent_reads = Arc::new(AtomicUsize::new(0));
+    let observed_reads = agent_reads.clone();
+    let client = crate::tests::apiserver(move |method, path, body| match (method, path) {
+        (
+            &Method::GET,
+            "/apis/coordination.k8s.io/v1/namespaces/default/leases/enrollment-lock",
+        ) => (
+            StatusCode::OK,
+            serde_json::to_value(observed_lease.lock().unwrap().clone()).unwrap(),
+        ),
+        (
+            &Method::PUT,
+            "/apis/coordination.k8s.io/v1/namespaces/default/leases/enrollment-lock",
+        ) => {
+            let next: Lease = serde_json::from_slice(&body).unwrap();
+            *observed_lease.lock().unwrap() = next.clone();
+            (StatusCode::OK, serde_json::to_value(next).unwrap())
+        }
+        (&Method::GET, "/apis/updated.dev/v1alpha1/namespaces/default/updaterepositories/prod") => {
+            (StatusCode::OK, serde_json::to_value(&repository).unwrap())
+        }
+        (&Method::GET, "/apis/updated.dev/v1alpha1/namespaces/default/updateagents/node-a") => {
+            let read = observed_reads.fetch_add(1, Ordering::SeqCst);
+            let agent = if read == 0 { &accepted } else { &replacement };
+            (StatusCode::OK, serde_json::to_value(agent).unwrap())
+        }
+        _ => panic!("unexpected apiserver request: {method} {path}"),
+    });
+    let signer = Arc::new(TestSigner {
+        result: Ok(reqwest::Url::parse(
+            "https://objects.example/replacement?test-signature=secret",
+        )
+        .unwrap()),
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = DataState {
+        content: direct_content_state(Arc::new(InMemory::new()), signer.clone()),
+        authorization: Arc::new(AuthorizationMemo::default()),
+        enrollment: EnrollmentContext {
+            client,
+            namespace: "default".into(),
+            repository: TEST_REPOSITORY.into(),
+            public_url: "https://gateway.example".into(),
+            lock_name: "enrollment-lock".into(),
+        },
+        enrollment_client_cn: Arc::from("updated-agent"),
+    };
+    let (ca_cert, ca_key) = test_ca("replacement-race test CA");
+    let ca = crate::join::IssuingCa::load(&ca_cert, &ca_key).unwrap();
+
+    let response = register_enrollment(&state, &ca, name, &csr)
+        .await
+        .unwrap_err();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(agent_reads.load(Ordering::SeqCst), 2);
+    assert!(
+        signer.calls.lock().unwrap().is_empty(),
+        "a replacement identity must be rejected before its object reaches the capability signer"
+    );
 }
 
 #[test]

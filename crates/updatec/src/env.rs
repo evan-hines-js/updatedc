@@ -52,6 +52,8 @@ controller_env! {
     ENROLLMENT_LOCK_NAME = "UPDATED_ENROLLMENT_LOCK_NAME";
     /// Directory of the gateway's cert-manager-issued mTLS material.
     GATEWAY_TLS_DIR = "UPDATED_GATEWAY_TLS_DIR";
+    /// PEM bundle used to verify gateway client certificates.
+    GATEWAY_CLIENT_CA = "UPDATED_GATEWAY_CLIENT_CA";
     /// The client CN the fleet bootstrap certificate must present.
     ENROLLMENT_CLIENT_CN = "UPDATED_ENROLLMENT_CLIENT_CN";
     /// Directory of the fleet issuing CA the join endpoint signs node CSRs with.
