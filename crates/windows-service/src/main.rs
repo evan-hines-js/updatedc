@@ -20,8 +20,10 @@ fn main() {
 #[cfg(windows)]
 mod windows {
     use std::ffi::{c_void, OsString};
+    use std::io::Write as _;
     use std::os::windows::ffi::OsStrExt;
-    use std::process::Command;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::OnceLock;
@@ -33,6 +35,9 @@ mod windows {
     use foundation::process::ContainedChild;
 
     const SERVICE_NAME: &str = "SelfUpdateAgent";
+    const LAUNCHER_LOG: &str = "launcher.log";
+    const PREVIOUS_LAUNCHER_LOG: &str = "launcher.previous.log";
+    const MAX_LAUNCHER_LOG_BYTES: u64 = 4 * 1024 * 1024;
     const STOP_GRACE: Duration = Duration::from_secs(20);
     /// How often the launcher is re-checked while watching it and while stopping it.
     const POLL: Duration = Duration::from_millis(100);
@@ -72,10 +77,10 @@ mod windows {
             },
         ];
         if unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } == 0 {
-            eprintln!(
-                "selfupdate-service: StartServiceCtrlDispatcherW failed: {}",
+            service_diagnostic(&format!(
+                "StartServiceCtrlDispatcherW failed: {}",
                 std::io::Error::last_os_error()
-            );
+            ));
             std::process::exit(1);
         }
     }
@@ -139,7 +144,7 @@ mod windows {
         // failure leaves the whole stack down with the SCM believing all is well.
         let exit = run_service();
         if let Err(e) = &exit {
-            eprintln!("selfupdate-service: {e}");
+            service_diagnostic(e);
         }
         report(SERVICE_STOPPED, 0, 0, exit_code(&exit));
     }
@@ -216,7 +221,7 @@ mod windows {
                 Err(error) => {
                     // The handle is unusable, so the launcher can no longer be observed — it may
                     // well still be running. Take the tree down before reporting anything.
-                    eprintln!("selfupdate-service: watching the launcher failed ({error})");
+                    service_diagnostic(&format!("watching the launcher failed ({error})"));
                     stop_launcher(child);
                     return false;
                 }
@@ -239,9 +244,9 @@ mod windows {
         // could not be delivered. This wrapper only reports what it took.
         match child.stop(STOP_GRACE) {
             foundation::process::Stopped::Gracefully | foundation::process::Stopped::Killed => {}
-            foundation::process::Stopped::Surviving => eprintln!(
-                "selfupdate-service: the launcher did not exit after being killed; its \
-                 kill-on-close job takes it down as this process exits"
+            foundation::process::Stopped::Surviving => service_diagnostic(
+                "the launcher did not exit after being killed; its kill-on-close job takes it \
+                 down as this process exits",
             ),
         }
     }
@@ -257,12 +262,78 @@ mod windows {
         if let Some(config) = &args.config {
             command.arg("--config").arg(config);
         }
+        // A service process has no console, and the fresh console the launcher is given below is
+        // attached to nothing: every line the launcher and agent write to stderr — their only
+        // diagnostics — would vanish with it. Append the whole tree's output to a file in the
+        // state directory instead, where an operator (or CI) can read why a boot ended.
+        let mut stdout = open_launcher_log(Path::new(&args.state_dir))?;
+        writeln!(
+            stdout,
+            "\n--- selfupdate-service starting launcher {:?} ---",
+            args.launcher
+        )
+        .map_err(|e| format!("writing launcher log header: {e}"))?;
+        let stderr = stdout
+            .try_clone()
+            .map_err(|e| format!("duplicating launcher log handle: {e}"))?;
+        command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
         // Contained: the launcher and everything below it belong to a kill-on-close job object
         // this process owns, so it can never survive the service process that reports its
         // state to the SCM. A service has no console, so the launcher is given one — that is what
         // makes `request_stop`'s graceful break addressable at all.
         ContainedChild::spawn_in_new_console(command)
             .map_err(|e| format!("launching launcher {:?}: {e}", args.launcher))
+    }
+
+    /// Keep one bounded current log and one bounded predecessor. The SCM wrapper, launcher, and
+    /// agent intentionally share this sink so a process-boundary failure can never be hidden by
+    /// the service's detached console.
+    fn open_launcher_log(state_dir: &Path) -> Result<std::fs::File, String> {
+        let current = state_dir.join(LAUNCHER_LOG);
+        let previous = state_dir.join(PREVIOUS_LAUNCHER_LOG);
+        if current
+            .metadata()
+            .map(|metadata| metadata.len() >= MAX_LAUNCHER_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            match std::fs::remove_file(&previous) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "removing previous launcher log {previous:?}: {error}"
+                    ));
+                }
+            }
+            std::fs::rename(&current, &previous).map_err(|error| {
+                format!("rotating launcher log {current:?} to {previous:?}: {error}")
+            })?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&current)
+            .map_err(|error| format!("opening launcher log {current:?}: {error}"))
+    }
+
+    /// Service-host diagnostics use the same durable stream as the launcher and agent. The
+    /// `eprintln!` remains useful when this binary is run interactively; the append is what makes
+    /// the message observable when the SCM owns a process with no attached console.
+    fn service_diagnostic(message: &str) {
+        eprintln!("selfupdate-service: {message}");
+        let Some(args) = ARGS.get() else {
+            return;
+        };
+        let path = Path::new(&args.state_dir).join(LAUNCHER_LOG);
+        if let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(log, "selfupdate-service: {message}");
+        }
     }
 
     fn report(
@@ -287,10 +358,10 @@ mod windows {
         };
         unsafe {
             if SetServiceStatus(handle, &status) == 0 {
-                eprintln!(
-                    "selfupdate-service: reporting status to the SCM failed ({})",
+                service_diagnostic(&format!(
+                    "reporting status to the SCM failed ({})",
                     std::io::Error::last_os_error()
-                );
+                ));
             }
         }
     }
@@ -342,6 +413,40 @@ mod windows {
             assert_eq!(parsed.launcher, OsString::from("b.exe"));
             assert_eq!(parsed.config, Some(OsString::from("c.toml")));
             assert_eq!(parsed.agent, OsString::from("s.exe"));
+        }
+
+        #[test]
+        fn launcher_log_rotation_preserves_the_previous_failure() {
+            let unique = format!(
+                "updated-windows-service-log-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            );
+            let state_dir = std::env::temp_dir().join(unique);
+            std::fs::create_dir(&state_dir).expect("creates state directory");
+            let current = state_dir.join(LAUNCHER_LOG);
+            let previous = state_dir.join(PREVIOUS_LAUNCHER_LOG);
+            std::fs::File::create(&current)
+                .and_then(|file| file.set_len(MAX_LAUNCHER_LOG_BYTES))
+                .expect("creates an oversized current log");
+            std::fs::write(&previous, b"obsolete").expect("creates an obsolete previous log");
+
+            let mut log = open_launcher_log(&state_dir).expect("rotates and opens the log");
+            writeln!(log, "next boot").expect("writes the next boot");
+            drop(log);
+
+            assert_eq!(
+                std::fs::metadata(&previous).expect("previous log").len(),
+                MAX_LAUNCHER_LOG_BYTES
+            );
+            assert_eq!(
+                std::fs::read(&current).expect("current log"),
+                b"next boot\n"
+            );
+            std::fs::remove_dir_all(state_dir).expect("removes test state");
         }
     }
 }

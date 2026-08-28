@@ -243,6 +243,40 @@ pub(crate) struct S3Client {
     pub(crate) uses_http: bool,
 }
 
+fn s3_client_options(
+    ca_bundle: Option<&std::ffi::OsStr>,
+) -> Result<object_store::ClientOptions, StorageError> {
+    use rustls::pki_types::pem::PemObject;
+
+    let mut options = object_store::ClientOptions::new();
+    let Some(path) = ca_bundle else {
+        return Ok(options);
+    };
+    let path = Path::new(path);
+    let pem = std::fs::read(path).map_err(|error| {
+        StorageError(format!("reading SSL_CERT_FILE {}: {error}", path.display()))
+    })?;
+    let mut found = false;
+    for certificate in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
+        let certificate = certificate.map_err(|error| {
+            StorageError(format!("parsing SSL_CERT_FILE {}: {error}", path.display()))
+        })?;
+        let certificate =
+            object_store::Certificate::from_der(certificate.as_ref()).map_err(|error| {
+                StorageError(format!("parsing SSL_CERT_FILE {}: {error}", path.display()))
+            })?;
+        options = options.with_root_certificate(certificate);
+        found = true;
+    }
+    if !found {
+        return Err(StorageError(format!(
+            "SSL_CERT_FILE {} contains no certificates",
+            path.display()
+        )));
+    }
+    Ok(options)
+}
+
 /// Build one S3 client through the shared destination, credential, and endpoint policy. Object
 /// publishers use the internal client only; the gateway additionally builds a public HTTPS client
 /// for signing bearer capabilities.
@@ -274,13 +308,15 @@ pub(crate) fn s3_client(
         .map(|endpoint| validate_s3_endpoint(endpoint, exposure))
         .transpose()?
         .unwrap_or(false);
+    let client_options =
+        s3_client_options(std::env::var_os("SSL_CERT_FILE").as_deref())?.with_allow_http(uses_http);
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(&destination.bucket)
-        .with_region(&destination.region);
+        .with_region(&destination.region)
+        .with_client_options(client_options);
     if let Some(endpoint) = endpoint {
         builder = builder
             .with_endpoint(endpoint)
-            .with_allow_http(uses_http)
             .with_virtual_hosted_style_request(false);
     }
     if let Some((access, secret)) = static_credentials {
@@ -610,6 +646,22 @@ pub(crate) mod store_tests {
                 .to_string()
                 .contains("S3 credentials must be either absent"));
         }
+    }
+
+    #[test]
+    fn ssl_cert_file_is_loaded_by_the_shared_s3_client() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let bundle = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(bundle.path(), cert.pem()).unwrap();
+
+        s3_client_options(Some(bundle.path().as_os_str())).unwrap();
+
+        std::fs::write(bundle.path(), b"not a certificate").unwrap();
+        let error = s3_client_options(Some(bundle.path().as_os_str())).unwrap_err();
+        assert!(error.to_string().contains("SSL_CERT_FILE"), "{error}");
     }
 
     #[test]

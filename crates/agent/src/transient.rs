@@ -132,6 +132,12 @@ pub(crate) fn is_node_local_transient(error: &io::Error) -> bool {
     ) {
         return true;
     }
+    if io_error_chain_contains(
+        error,
+        foundation::durable::is_transient_filesystem_contention,
+    ) {
+        return true;
+    }
     // Some OS faults have no portable `ErrorKind`, so recognise their raw codes. A post-commit
     // durability failure may wrap the original `io::Error`; inspect the complete source chain so
     // the retry decision is identical before and after the durable-write boundary adds context.
@@ -139,38 +145,30 @@ pub(crate) fn is_node_local_transient(error: &io::Error) -> bool {
     {
         has_raw_os_error(error, &[libc::EIO])
     }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
-
-        has_raw_os_error(
-            error,
-            &[ERROR_SHARING_VIOLATION as i32, ERROR_LOCK_VIOLATION as i32],
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         false
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn has_raw_os_error(error: &io::Error, codes: &[i32]) -> bool {
-    if error
-        .raw_os_error()
-        .is_some_and(|code| codes.contains(&code))
-    {
+    io_error_chain_contains(error, |cause| {
+        cause
+            .raw_os_error()
+            .is_some_and(|code| codes.contains(&code))
+    })
+}
+
+fn io_error_chain_contains(error: &io::Error, predicate: impl Fn(&io::Error) -> bool) -> bool {
+    if predicate(error) {
         return true;
     }
     let mut current = error
         .get_ref()
         .map(|cause| cause as &(dyn std::error::Error + 'static));
     while let Some(cause) = current {
-        if cause
-            .downcast_ref::<io::Error>()
-            .and_then(io::Error::raw_os_error)
-            .is_some_and(|code| codes.contains(&code))
-        {
+        if cause.downcast_ref::<io::Error>().is_some_and(&predicate) {
             return true;
         }
         current = cause.source();
@@ -181,16 +179,17 @@ fn has_raw_os_error(error: &io::Error, codes: &[i32]) -> bool {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
     #[test]
-    fn file_sharing_faults_are_node_local_even_when_durability_wraps_them() {
-        for code in [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION] {
-            let direct = io::Error::from_raw_os_error(code as i32);
-            assert!(is_node_local_transient(&direct));
+    fn filesystem_contention_policy_survives_durability_wrapping() {
+        // The real exclusive-handle test returns ACCESS_DENIED on the Actions filesystem. Prove
+        // that agent recovery delegates that result to foundation's shared contention policy even
+        // after the durable boundary adds an io::Error source layer.
+        let direct = io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+        assert!(is_node_local_transient(&direct));
 
-            let wrapped = io::Error::other(io::Error::from_raw_os_error(code as i32));
-            assert!(is_node_local_transient(&wrapped));
-        }
+        let wrapped = io::Error::other(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+        assert!(is_node_local_transient(&wrapped));
     }
 }

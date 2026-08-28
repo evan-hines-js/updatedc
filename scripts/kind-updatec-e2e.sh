@@ -1195,16 +1195,16 @@ for ordinal in 0 1 2 3 4; do
     echo "FAIL: agent-$ordinal registered with identity '$identity', expected enrolled" >&2
     exit 1
   }
-  kubectl -n updated-system exec "agent-$ordinal" -c agent -- \
-    grep -q '"routingBaseUrl":"https://updatec-gateway/"' \
-      /var/lib/updated/launcher/enrollment.json || {
-    echo "FAIL: agent-$ordinal did not persist the reachable in-cluster routing URL" >&2
-    exit 1
-  }
   poll_until "$NODE_SETTLE_TIMEOUT" kubectl_log_contains "agent-$ordinal" \
     'cold-installed application 1.0.0 from the first trusted assignment' -c agent || {
     echo "FAIL: agent-$ordinal did not cold-install through online enrollment" >&2
     kubectl -n updated-system logs "agent-$ordinal" -c agent --tail=200 >&2 || true
+    exit 1
+  }
+  kubectl -n updated-system exec "agent-$ordinal" -c agent -- \
+    grep -q '"routingBaseUrl":"https://updatec-gateway/"' \
+      /var/lib/updated/launcher/enrollment.json || {
+    echo "FAIL: agent-$ordinal did not persist the reachable in-cluster routing URL" >&2
     exit 1
   }
   log="$(kubectl -n updated-system logs "agent-$ordinal" -c agent)"

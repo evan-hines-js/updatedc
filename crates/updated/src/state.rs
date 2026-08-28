@@ -397,20 +397,31 @@ pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
     }
 }
 
-/// Read the committed record at `path`, distinguishing absent from corrupt.
-pub fn read_installed(path: &Path) -> Installed {
+/// Read the committed record at `path`, distinguishing absent, corrupt, and an I/O failure.
+///
+/// Durable-state mutations use this form so a transient sharing/lock error retains its OS error
+/// code and reaches the caller's retry policy. Treating that error as corrupt would turn a busy
+/// Windows file into a permanent state verdict before the retry boundary can see it.
+pub fn try_read_installed(path: &Path) -> io::Result<Installed> {
     match foundation::file::read_bounded_regular(
         path,
         INSTALLED_RECORD_MAX_BYTES,
         foundation::file::FinalSymlink::Refuse,
     ) {
-        Ok(raw) => match serde_json::from_slice::<InstalledState>(&raw) {
+        Ok(raw) => Ok(match serde_json::from_slice::<InstalledState>(&raw) {
             Ok(s) if s.validate().is_ok() => Installed::Present(Box::new(s)),
             Ok(_) | Err(_) => Installed::Invalid,
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Installed::Missing,
-        Err(_) => Installed::Invalid,
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Installed::Missing),
+        Err(error) => Err(error),
     }
+}
+
+/// Observe the committed record fail-closed: an unreadable record is not absence and must never
+/// open the first-install path. Mutation code uses [`try_read_installed`] instead, preserving the
+/// same parser and validation while allowing node-local I/O faults to be retried.
+pub fn read_installed(path: &Path) -> Installed {
+    try_read_installed(path).unwrap_or(Installed::Invalid)
 }
 
 /// Atomically and durably write the committed record.
@@ -734,6 +745,18 @@ mod tests {
         // case, so the NotFound guard must not be widened to catch every error.
         let isdir = tempfile::tempdir().unwrap();
         assert!(matches!(read_installed(isdir.path()), Installed::Invalid));
+    }
+
+    #[test]
+    fn checked_reads_separate_state_verdicts_from_io_failures() {
+        let (_dir, path) = tmp("checked-read");
+        assert!(matches!(try_read_installed(&path), Ok(Installed::Missing)));
+
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(matches!(try_read_installed(&path), Ok(Installed::Invalid)));
+
+        let isdir = tempfile::tempdir().unwrap();
+        assert!(try_read_installed(isdir.path()).is_err());
     }
 
     #[test]

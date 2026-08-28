@@ -102,6 +102,28 @@ wait_master_loaded_runtime() {
   return 1
 }
 
+rejection_count() {
+  local ledger="$INSTALL/state/rejected"
+  [[ -f "$ledger" ]] || { echo 0; return; }
+  wc -l <"$ledger"
+}
+
+# A failed activation first records its verdict and rollback journal, then exits so the next boot
+# performs the one rollback path. Synchronize on those durable facts: a log line emitted while the
+# next boot plans recovery is diagnostic output, not a state-machine boundary.
+wait_failed_candidate_recovered() {
+  local previous_rejections="$1" expected_version="$2" active="$INSTALL/active-release"
+  for _ in {1..200}; do
+    if (( $(rejection_count) > previous_rejections )) &&
+       [[ -f "$active" ]] && grep -q "\"version\":\"$expected_version\"" "$active" &&
+       [[ ! -e "$INSTALL/state/transaction.json" ]]; then
+      return
+    fi
+    sleep 0.1
+  done
+  fail "failed candidate did not reach a durable rejection and completed rollback"
+}
+
 make_config() {
   local destination="$1" version="$2" validity="${3:-valid}"
   mkdir -p "$destination/bin" "$destination/config"
@@ -287,11 +309,11 @@ done
 [[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "replayed apply restarted the master"
 [[ "$(pgrep -P "$master_pid" | sort -n | tail -n1)" == "$replay_worker" ]] || fail "replayed apply needlessly replaced the live worker"
 [[ "$(stat -Lc '%d:%i' "/proc/$master_pid/exe")" == "$replay_inode" ]] || fail "replayed apply needlessly re-execed the live binary"
+rejections_before="$(rejection_count)"
 publish 3.0.0 "$WORK/bundle-3.0.0"
-sleep 6
+wait_failed_candidate_recovered "$rejections_before" 2.0.0
 [[ "$(curl -fsS "http://127.0.0.1:$HTTP_PORT/")" == 2.0.0 ]] || fail "invalid binary displaced the healthy release"
 grep -q 'candidate HAProxy configuration failed validation' "$STACK_LOG" || fail "invalid binary validation failure was not recorded"
-grep -q 'rejected 3.0.0 after failed activation' "$STACK_LOG" || fail "invalid binary was not rejected"
 [[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "master PID changed while rejecting the invalid release"
 [[ "$(stat -Lc '%d:%i' "/proc/$master_pid/exe")" == "$replay_inode" ]] || fail "rejecting the invalid release replaced the live executable"
 pgrep -P "$master_pid" | grep -qx "$replay_worker" || fail "rejecting the invalid release replaced the live worker"

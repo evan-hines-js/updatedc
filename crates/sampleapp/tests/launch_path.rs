@@ -85,16 +85,20 @@ fn free_port() -> u16 {
 /// Launch as a reconciler does: the resolved program, the resolved cwd, and an explicitly
 /// constructed environment (nothing ambient crosses the boundary).
 fn launch(resolved: &updated::provider::Resolved, port: u16, record: &Path) -> Child {
-    let child = Command::new(&resolved.program)
+    let mut command = Command::new(&resolved.program);
+    command
         .args(["--addr", &format!("127.0.0.1:{port}")])
         .args(["--await-record", &record.display().to_string()])
         .current_dir(&resolved.cwd)
-        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    // Exercise the same minimal environment policy as a real reconciler invocation. A bare
+    // `env_clear()` is not a valid Windows environment: without SystemRoot Winsock cannot load its
+    // provider catalog, so the application fails with WSASERVICE_NOT_FOUND before this test ever
+    // reaches the launch-cwd invariant it exists to prove.
+    updated::reconciler::apply_environment(&mut command);
+    let child = command.spawn().unwrap();
     // A hook records its reap handle immediately after the spawn; the workload will not serve
     // until it does.
     std::fs::write(record, format!("{{\"pid\":{}}}", child.id())).unwrap();
@@ -209,18 +213,16 @@ fn an_unrecorded_workload_never_binds_the_service_address() {
             // A record from a previous workload does not license a new process to serve.
             std::fs::write(&record, "{\"pid\":1}").unwrap();
         }
-        let status = Command::new(&resolved.program)
+        let mut command = Command::new(&resolved.program);
+        command
             .args(["--addr", &addr])
             .args(["--await-record", &record.display().to_string()])
             .current_dir(&resolved.cwd)
-            .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
-            .wait()
-            .unwrap();
+            .stderr(Stdio::null());
+        updated::reconciler::apply_environment(&mut command);
+        let status = command.spawn().unwrap().wait().unwrap();
         assert!(
             !status.success(),
             "an unrecorded workload must refuse to serve ({record:?})"

@@ -541,7 +541,7 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     loop {
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(e) if attempt < 50 && is_transient_lock(&e) => {
+            Err(e) if attempt < 50 && is_transient_filesystem_contention(&e) => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(
                     (20 * u64::from(attempt)).min(100),
@@ -552,7 +552,14 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-fn is_transient_lock(error: &io::Error) -> bool {
+/// Whether an OS error is the platform's answer to temporary filesystem contention.
+///
+/// This is the one raw-code policy shared by durable replacement and higher-level recovery.
+/// Windows reports an incompatible open as any of ACCESS_DENIED, SHARING_VIOLATION, or
+/// LOCK_VIOLATION depending on the filesystem and which operation detects the held handle.
+/// Classifying ACCESS_DENIED here does not grant access or suppress a failure: every caller bounds
+/// its retries and ultimately returns the original error if the denial is a permanent ACL issue.
+pub fn is_transient_filesystem_contention(error: &io::Error) -> bool {
     match error.raw_os_error() {
         #[cfg(windows)]
         Some(5) | Some(32) | Some(33) => true,
@@ -652,6 +659,28 @@ mod tests {
         atomic_write(&p, ".test-", b"first").unwrap();
         atomic_write(&p, ".test-", b"second-longer").unwrap();
         assert_eq!(fs::read(p).unwrap(), b"second-longer");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_filesystem_contention_has_one_raw_code_policy() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION,
+            ERROR_SHARING_VIOLATION,
+        };
+
+        for code in [
+            ERROR_ACCESS_DENIED,
+            ERROR_SHARING_VIOLATION,
+            ERROR_LOCK_VIOLATION,
+        ] {
+            assert!(is_transient_filesystem_contention(
+                &io::Error::from_raw_os_error(code as i32)
+            ));
+        }
+        assert!(!is_transient_filesystem_contention(
+            &io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)
+        ));
     }
 
     #[cfg(unix)]

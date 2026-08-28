@@ -372,7 +372,9 @@ pub mod testing {
         ManagedRuntime {
             product: "app".into(),
             channel: "stable".into(),
-            install_root: "/app".into(),
+            // Absolute on the platform running the test: `Path::is_absolute` rejects a bare
+            // `/app` on Windows, and `validate` rejects the whole runtime with it.
+            install_root: if cfg!(windows) { r"C:\app" } else { "/app" }.into(),
             inputs: crate::dataflow::InputSelection::default(),
             repository: ManagedRepositoryLimits {
                 metadata_limit: 1 << 20,
@@ -425,6 +427,11 @@ mod tests {
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: runtime(),
         }
+    }
+
+    #[test]
+    fn shared_runtime_fixture_is_valid_on_the_host_platform() {
+        runtime().validate().expect("shared runtime fixture");
     }
 
     #[test]

@@ -21,8 +21,13 @@ $service = 'SelfUpdateAgent'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 # Runtime state must never live below Cargo's cached target directory. Restoring that directory
 # can otherwise turn this cold-install test into a restart while still leaving the binary build
-# cache perfectly valid. A unique OS-temporary root makes "empty node" true by construction.
-$work = Join-Path ([IO.Path]::GetTempPath()) "updated-scm-e2e-$([Guid]::NewGuid().ToString('N'))"
+# cache perfectly valid. The service runs as LocalSystem, so its fixture belongs under the same
+# machine-wide ProgramData boundary as a real installation—not the interactive runner's private
+# user-profile temp directory. A unique child still makes "empty node" true by construction.
+$machineData = [System.Environment]::GetFolderPath(
+    [System.Environment+SpecialFolder]::CommonApplicationData
+)
+$work = Join-Path $machineData "updated-scm-e2e-$([Guid]::NewGuid().ToString('N'))"
 $routingRepo = Join-Path $work 'routing-repo'
 $routingKeys = Join-Path $work 'routing-keys'
 $releaseRepo = Join-Path $work 'release-repo'
@@ -100,6 +105,8 @@ function Wait-Operation(
 function Wait-ConfirmedInstall([string]$version, [int]$seconds = 60) {
     $path = Join-Path $install 'state\installed.json'
     $deadline = (Get-Date).AddSeconds($seconds)
+    $lastJson = '<missing>'
+    $lastReadError = '<none>'
     do {
         if (Test-Path -LiteralPath $path) {
             try {
@@ -117,6 +124,8 @@ function Wait-ConfirmedInstall([string]$version, [int]$seconds = 60) {
                 } finally {
                     $stream.Dispose()
                 }
+                $lastJson = $json
+                $lastReadError = '<none>'
                 $state = $json | ConvertFrom-Json
                 if ($state.release.version -eq $version -and
                     $state.confirmed -eq $true -and
@@ -126,11 +135,28 @@ function Wait-ConfirmedInstall([string]$version, [int]$seconds = 60) {
             } catch {
                 # The state writer uses atomic replacement. A sharing violation from an antivirus
                 # or indexer is transient and remains bounded by the same completion deadline.
+                $lastReadError = $_.Exception.Message
             }
         }
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $deadline)
-    throw "release $version never reached a confirmed installed state"
+
+    # The service's stdout is not attached to Actions. Make a timeout identify which boundary was
+    # missed without changing the lifecycle timing: hook history distinguishes a missing health
+    # gate from a failed durable commit, while the last raw record exposes parse/sharing failures.
+    $installedService = Get-CimInstance Win32_Service -Filter "Name='$service'" -ErrorAction SilentlyContinue
+    $serviceState = if ($installedService) {
+        "$($installedService.State), pid=$($installedService.ProcessId), exit=$($installedService.ExitCode)"
+    } else {
+        '<missing>'
+    }
+    $tree = @(Get-TreeProcessDetails)
+    $operations = @(Read-Operations)
+    $launcherLog = Join-Path $launcherState 'launcher.log'
+    throw "release $version never reached a confirmed installed state; service=[$serviceState]; " +
+        "process-tree=[$($tree -join ' | ')]; operations=[$($operations -join ' | ')]; " +
+        "installed.json=[$lastJson]; last-read-error=[$lastReadError]; " +
+        "launcher-log=[$launcherLog]"
 }
 
 function Get-TreeProcessIds() {
@@ -139,6 +165,14 @@ function Get-TreeProcessIds() {
         $ids += (Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
     }
     return $ids
+}
+
+function Get-TreeProcessDetails() {
+    $names = @('updated-launcher.exe', 'updated-agent.exe', 'selfupdate-service.exe')
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $names -contains $_.Name } |
+        Sort-Object Name, ProcessId |
+        ForEach-Object { "$($_.Name):pid=$($_.ProcessId),parent=$($_.ParentProcessId)" })
 }
 
 function Wait-ProcessExit([int[]]$ids, [int]$seconds = 30) {
@@ -263,9 +297,10 @@ exit 0
         storage = @{inactiveReleases=2; inactiveProviders=2; inactiveAgents=1; inactiveBytes=1073741824; inactiveRepositoryCaches=2}
         # `checkIntervalSeconds` is capped at MAX_CHECK_INTERVAL_SECONDS (16) — three of a node's
         # report gaps must fit inside the 60s freshness window every reader ages reports against, so
-        # a signed assignment carrying a slower cadence is rejected at publish. This test only wants
-        # a cadence slow enough not to churn, so sit at the ceiling.
-        timeouts = @{checkIntervalSeconds=16; healthGraceSeconds=10; healthSuccesses=1; healthIntervalSeconds=1; refreshRetrySeconds=5; confirmationWindowSeconds=120; agentCheckIntervalSeconds=3600}
+        # a signed assignment carrying a slower cadence is rejected at publish. The fixture's hook
+        # is immediate and deterministic, so use the same short health/confirmation timing as the
+        # native HAProxy lifecycle test. A long production soak window would only burn CI time here.
+        timeouts = @{checkIntervalSeconds=16; healthGraceSeconds=4; healthSuccesses=1; healthIntervalSeconds=1; refreshRetrySeconds=5; confirmationWindowSeconds=2; agentCheckIntervalSeconds=3600}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $routingRepo --keys $routingKeys `
@@ -339,8 +374,11 @@ ca = '$(Join-Path $certs 'ca.crt')'
     # first boot's apply carries `install`. The authoritative completion barrier is installed.json:
     # it cannot become confirmed until the boot health gate has passed and the state transition has
     # committed. Do not maintain a second, receipt-derived definition of "healthy installation".
-    $null = Wait-Operation 'apply' 'install'
     $installed = Wait-ConfirmedInstall '1.0.0'
+    # The installed record is the authoritative completion barrier. Keep the receipt assertion as
+    # proof of the path taken, but check it only after completion so its narrower diagnostic cannot
+    # hide the service/process/state evidence emitted by Wait-ConfirmedInstall on a failed boot.
+    $null = Wait-Operation 'apply' 'install' 0 1
 
     $desired = Read-DesiredAgent
     if (-not $desired.Equals([IO.Path]::GetFullPath($initialAgent), [StringComparison]::OrdinalIgnoreCase)) {
@@ -375,6 +413,17 @@ finally {
         try { Wait-ServiceState 'Stopped' 10 } catch { }
     }
     & sc.exe delete $service 2>$null | Out-Null
+    # The service host appends the launcher's and agent's output here. Always surface a bounded
+    # tail so both CI and an operator can see the fatal boundary without flooding the job log.
+    foreach ($name in @('launcher.previous.log', 'launcher.log')) {
+        $launcherLog = Join-Path $launcherState $name
+        if (Test-Path -LiteralPath $launcherLog) {
+            Write-Host "--- $name (last 200 launcher + agent lines) ---"
+            Get-Content -LiteralPath $launcherLog -Tail 200 |
+                ForEach-Object { Write-Host $_ }
+            Write-Host "--- end $name ---"
+        }
+    }
     if ($gatewayProcess) { Stop-Process -Id $gatewayProcess.Id -Force -ErrorAction SilentlyContinue }
     if ($objectProcess) { Stop-Process -Id $objectProcess.Id -Force -ErrorAction SilentlyContinue }
 }

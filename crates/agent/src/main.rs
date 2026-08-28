@@ -552,12 +552,31 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // deferred would converge the machine onto the very release the rollback is undoing. A rollback
     // recovery instead re-runs the predecessor's own `apply` on every boot until the rollback
     // completes — see [`complete_recovery_activation`].
-    if recovery_transaction.is_none()
-        && converge_environment(&opts, &store, boot_reason, attempt::BOOT)?.host_action()
-            == HostAction::Reboot
-    {
-        request_host_reboot(&shutdown).await?;
-        return Ok(());
+    if recovery_transaction.is_none() {
+        log(&format!(
+            "starting reconciler apply for release {} with reason {}",
+            current.as_deref().unwrap_or("<unknown>"),
+            boot_reason.as_str()
+        ));
+        let convergence = match converge_environment(&opts, &store, boot_reason, attempt::BOOT) {
+            Ok(convergence) => convergence,
+            Err(failure) => {
+                error(&format!(
+                    "reconciler apply for release {} with reason {} failed: {failure}",
+                    current.as_deref().unwrap_or("<unknown>"),
+                    boot_reason.as_str()
+                ));
+                return Err(failure.into());
+            }
+        };
+        log(&format!(
+            "reconciler apply for release {} completed; entering the boot health gate",
+            current.as_deref().unwrap_or("<unknown>")
+        ));
+        if convergence.host_action() == HostAction::Reboot {
+            request_host_reboot(&shutdown).await?;
+            return Ok(());
+        }
     }
     // Gate readiness: the release's own `healthcheck` must pass before this boot is trusted. It is
     // the only health source — the agent owns no workload process to observe — and readiness was
@@ -577,6 +596,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // Attempt identity, release identity and providers are resolved together, from one source, so
     // the gate can never observe one release with another's hooks or under another's attempt.
     let target = boot_gate_target(recovery_transaction.as_ref(), &installed_state, boot_reason);
+    log(&format!(
+        "starting boot health gate for release {} with reason {}",
+        target.candidate.version,
+        target.reason.as_str()
+    ));
     let mut reconciler = ReleaseReconciler::new(&opts, target.lifecycle.as_ref(), target.reason);
     let gate = update::became_healthy(
         &mut reconciler,
@@ -591,17 +615,30 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await;
-    if let update::Health::Inconclusive(cause) = &gate {
-        // No verdict about these bytes: the probes stopped reaching the node reconciler (a corrupt
-        // or pruned provider tree, ENOSPC/EACCES/EIO preparing the invocation), so this says more
-        // about the disk than about the release. Note it — and then fall through to the SAME
-        // bounded failure path an unhealthy gate takes: these faults are deterministic (a provider
-        // tree that will not resolve resolves no better on the next boot), so treating them as
-        // "try again later" would relaunch into the identical failure forever.
-        warn(&format!(
-            "the boot readiness gate could not reach the node reconciler ({cause}); treating it as \
-             a failed gate so the bounded recovery below still terminates"
-        ));
+    match &gate {
+        update::Health::Ready => log(&format!(
+            "boot health gate passed for release {}",
+            target.candidate.version
+        )),
+        update::Health::Unhealthy => warn(&format!(
+            "boot health gate reported release {} unhealthy",
+            target.candidate.version
+        )),
+        update::Health::Inconclusive(cause) => {
+            // No verdict about these bytes: the probes stopped reaching the node reconciler (a
+            // corrupt or pruned provider tree, ENOSPC/EACCES/EIO preparing the invocation), so
+            // this says more about the disk than about the release. Note it — and then fall
+            // through to the SAME bounded failure path an unhealthy gate takes: these faults are
+            // deterministic (a provider tree that will not resolve resolves no better on the next
+            // boot), so treating them as "try again later" would relaunch into the identical
+            // failure forever.
+            warn(&format!(
+                "the boot readiness gate for release {} could not reach the node reconciler \
+                 ({cause}); treating it as a failed gate so the bounded recovery below still \
+                 terminates",
+                target.candidate.version
+            ));
+        }
     }
     let gate_passed = matches!(gate, update::Health::Ready);
     if !gate_passed {
@@ -694,21 +731,22 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // The head has now proven healthy this boot: confirm it so a later transient unhealth of this
     // (proven) head is reported and reconciled, not rejected as a broken head.
     if gate_passed {
-        if let updated::state::Installed::Present(mut state) = store.installed() {
-            if state.confirm_provisional() {
-                // Confirmation is a durable state transition, not best-effort bookkeeping. If an
-                // antivirus/indexer briefly holds `installed.json` on Windows, retry the same
-                // idempotent commit through the one node-local-transient policy. Any permanent
-                // failure exits for launcher-driven recovery instead of continuing forever with a
-                // healthy release still marked provisional and therefore rejectable on restart.
-                recover_through_transients(
-                    "confirming the health-proven release",
-                    &mut launcher,
-                    &shutdown,
-                    || store.commit_installed(&state),
-                )
-                .await?;
-            }
+        // Confirmation is one store operation so BOTH of its installed-state reads retain a
+        // Windows sharing/lock error. Reading through the fail-closed observer here would convert
+        // that transient into `Invalid` and silently skip this transition before the retry policy
+        // ever saw it.
+        let newly_confirmed = recover_through_transients(
+            "confirming the health-proven release",
+            &mut launcher,
+            &shutdown,
+            || store.confirm_provisional(),
+        )
+        .await?;
+        if newly_confirmed {
+            log(&format!(
+                "release {} reached a confirmed installed state",
+                target.candidate.version
+            ));
         }
     }
     if recovery_transaction

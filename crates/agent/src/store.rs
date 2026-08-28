@@ -5,7 +5,7 @@ use updated::config::Paths;
 use updated::install::InstallTransaction;
 use updated::reject::Rejections;
 use updated::state::{
-    read_installed, write_installed, Installed, InstalledState, RepositoryLineage,
+    try_read_installed, write_installed, Installed, InstalledState, RepositoryLineage,
 };
 use updated::transaction::Transaction;
 
@@ -58,16 +58,24 @@ impl Store {
     }
 
     pub(crate) fn installed(&self) -> Installed {
+        self.try_installed().unwrap_or(Installed::Invalid)
+    }
+
+    /// The mutation-side installed-state reader. Observers deliberately fail closed through
+    /// [`Store::installed`]; state transitions must instead preserve a sharing/lock I/O error so
+    /// the one node-local retry policy can classify it rather than silently converting it into a
+    /// permanent `Invalid` verdict.
+    fn try_installed(&self) -> io::Result<Installed> {
         match &self.backend {
-            Backend::File { paths, .. } => read_installed(&paths.installed),
+            Backend::File { paths, .. } => try_read_installed(&paths.installed),
             #[cfg(test)]
-            Backend::Memory(memory) => match &memory.installed {
+            Backend::Memory(memory) => Ok(match &memory.installed {
                 Some(state) if state.validate().is_ok() => {
                     Installed::Present(Box::new(state.clone()))
                 }
                 Some(_) => Installed::Invalid,
                 None => Installed::Missing,
-            },
+            }),
         }
     }
 
@@ -227,6 +235,33 @@ impl Store {
         }
     }
 
+    /// Promote the active provisional head through the same checked read and commit grammar as
+    /// every other installed-state mutation. Keeping the read inside this operation prevents a
+    /// caller from observing `Invalid` on a transient Windows sharing fault and silently skipping
+    /// confirmation before the retry boundary is reached.
+    pub(crate) fn confirm_provisional(&mut self) -> io::Result<bool> {
+        let mut state = match self.try_installed()? {
+            Installed::Present(state) => state,
+            Installed::Missing => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cannot confirm a missing installed state",
+                ));
+            }
+            Installed::Invalid => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot confirm a corrupt installed state",
+                ));
+            }
+        };
+        if !state.confirm_provisional() {
+            return Ok(false);
+        }
+        self.commit_installed(&state)?;
+        Ok(true)
+    }
+
     /// Enforce the complete installed-record transition grammar at the durable write boundary.
     ///
     /// Checking only that the active pointer named `state.release` left a second update path: any
@@ -235,7 +270,7 @@ impl Store {
     /// created only from first-install intent, change executable identity only under update or
     /// rollback evidence, or perform one of the three metadata-only transitions below.
     fn validate_installed_transition(&self, next: &InstalledState) -> io::Result<()> {
-        match self.installed() {
+        match self.try_installed()? {
             Installed::Missing if self.install_commit_is_authorized(next)? => Ok(()),
             Installed::Missing => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -581,7 +616,7 @@ impl Store {
             return Ok(true);
         }
         let active = self.active_release()?;
-        let Installed::Present(installed) = self.installed() else {
+        let Installed::Present(installed) = self.try_installed()? else {
             return Ok(false);
         };
         Ok(match tx.phase {
@@ -647,7 +682,7 @@ impl Store {
             if existing.id == tx.id
                 && existing.phase == updated::transaction::Phase::Committed
                 && tx.phase == updated::transaction::Phase::RollbackActivating
-                && !self.pending_authorizes_rollback_journal(tx)
+                && !self.pending_authorizes_rollback_journal(tx)?
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -667,7 +702,7 @@ impl Store {
     }
 
     fn forward_commit_is_authorized(&self, tx: &Transaction) -> io::Result<bool> {
-        let Installed::Present(installed) = self.installed() else {
+        let Installed::Present(installed) = self.try_installed()? else {
             return Ok(false);
         };
         Ok(
@@ -690,10 +725,10 @@ impl Store {
     }
 
     fn journal_start_is_authorized(&self, tx: &Transaction) -> io::Result<bool> {
-        if self.pending_authorizes_rollback_journal(tx) {
+        if self.pending_authorizes_rollback_journal(tx)? {
             return Ok(true);
         }
-        let Installed::Present(installed) = self.installed() else {
+        let Installed::Present(installed) = self.try_installed()? else {
             return Ok(false);
         };
         Ok(tx.phase == updated::transaction::Phase::Prepared
@@ -708,17 +743,17 @@ impl Store {
     /// The one non-Prepared journal start: materializing rollback intent already carried by the
     /// atomic installed record. Every identity is copied from that record, so a caller cannot use
     /// this exception to manufacture a different predecessor or candidate.
-    fn pending_authorizes_rollback_journal(&self, tx: &Transaction) -> bool {
-        let Installed::Present(installed) = self.installed() else {
-            return false;
+    fn pending_authorizes_rollback_journal(&self, tx: &Transaction) -> io::Result<bool> {
+        let Installed::Present(installed) = self.try_installed()? else {
+            return Ok(false);
         };
         let Some(pending) = &installed.pending else {
-            return false;
+            return Ok(false);
         };
-        tx.phase == updated::transaction::Phase::RollbackActivating
+        Ok(tx.phase == updated::transaction::Phase::RollbackActivating
             && tx.rollback_health_failures == 0
             && tx.matches_pending(pending)
-            && tx.matches_candidate(&installed)
+            && tx.matches_candidate(&installed))
     }
     /// Persist first-install intent without ever burying a different interrupted install. An
     /// install has no abort path: every non-committed record is resumed, and a committed record is
@@ -782,7 +817,7 @@ impl Store {
             return Ok(false);
         }
         let active = self.active_release()?;
-        Ok(match self.installed() {
+        Ok(match self.try_installed()? {
             Installed::Missing => active.is_none(),
             Installed::Present(current) => {
                 !current.confirmed
@@ -836,7 +871,7 @@ impl Store {
                 Ok(self.active_release()?.as_ref() == Some(&tx.release))
             }
             updated::install::InstallPhase::Committed => {
-                let Installed::Present(installed) = self.installed() else {
+                let Installed::Present(installed) = self.try_installed()? else {
                     return Ok(false);
                 };
                 Ok(self.active_release()?.as_ref() == Some(&tx.release)
@@ -850,7 +885,7 @@ impl Store {
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn clear_install_journal(&mut self) -> io::Result<()> {
         if let Some(tx) = self.install_journal()? {
-            let installed = match self.installed() {
+            let installed = match self.try_installed()? {
                 Installed::Present(state) => Some(state),
                 Installed::Missing | Installed::Invalid => None,
             };
@@ -1507,6 +1542,62 @@ mod tests {
             store.installed(),
             Installed::Present(installed) if *installed == state
         ));
+    }
+
+    #[test]
+    fn provisional_confirmation_is_one_idempotent_store_transition() {
+        let transaction = install_transaction('1', InstallPhase::Started);
+        let state = InstalledState::provisional(
+            transaction.repository_lineage,
+            transaction.release.clone(),
+            transaction.archive_sha256,
+            transaction.lifecycle,
+        );
+        let mut store = Store::memory(MemoryBackend {
+            installed: Some(state),
+            active: Some(transaction.release),
+            ..MemoryBackend::default()
+        });
+
+        assert!(store.confirm_provisional().unwrap());
+        assert!(matches!(
+            store.installed(),
+            Installed::Present(installed) if installed.confirmed && installed.pending.is_none()
+        ));
+        assert!(!store.confirm_provisional().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn confirmation_preserves_a_windows_sharing_fault_for_the_retry_boundary() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::resolve(directory.path(), &directory.path().join("enrollment"));
+        let mut store = Store::open(paths.clone()).unwrap();
+        let transaction = install_transaction('1', InstallPhase::Started);
+        let state = InstalledState::provisional(
+            transaction.repository_lineage,
+            transaction.release.clone(),
+            transaction.archive_sha256,
+            transaction.lifecycle,
+        );
+        write_active(&paths.active_release, &transaction.release).unwrap();
+        write_installed(&paths.installed, &state).unwrap();
+
+        let exclusive = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&paths.installed)
+            .unwrap();
+        let error = store.confirm_provisional().unwrap_err();
+        assert!(
+            crate::transient::is_node_local_transient(&error),
+            "the checked store read must retain the sharing violation: {error:?}"
+        );
+
+        drop(exclusive);
+        assert!(store.confirm_provisional().unwrap());
     }
 
     #[test]
