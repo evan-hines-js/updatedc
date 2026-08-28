@@ -57,15 +57,11 @@ impl Store {
         })
     }
 
-    pub(crate) fn installed(&self) -> Installed {
-        self.try_installed().unwrap_or(Installed::Invalid)
-    }
-
-    /// The mutation-side installed-state reader. Observers deliberately fail closed through
-    /// [`Store::installed`]; state transitions must instead preserve a sharing/lock I/O error so
-    /// the one node-local retry policy can classify it rather than silently converting it into a
-    /// permanent `Invalid` verdict.
-    fn try_installed(&self) -> io::Result<Installed> {
+    /// Read the installed record without erasing the distinction between corrupt content and an
+    /// I/O failure. In particular, Windows may briefly deny a read while another process still
+    /// holds a sharing-incompatible handle; callers must pass that error to the node-local retry
+    /// policy rather than silently treating a valid record as corrupt.
+    pub(crate) fn installed(&self) -> io::Result<Installed> {
         match &self.backend {
             Backend::File { paths, .. } => try_read_installed(&paths.installed),
             #[cfg(test)]
@@ -240,7 +236,7 @@ impl Store {
     /// caller from observing `Invalid` on a transient Windows sharing fault and silently skipping
     /// confirmation before the retry boundary is reached.
     pub(crate) fn confirm_provisional(&mut self) -> io::Result<bool> {
-        let mut state = match self.try_installed()? {
+        let mut state = match self.installed()? {
             Installed::Present(state) => state,
             Installed::Missing => {
                 return Err(io::Error::new(
@@ -270,7 +266,7 @@ impl Store {
     /// created only from first-install intent, change executable identity only under update or
     /// rollback evidence, or perform one of the three metadata-only transitions below.
     fn validate_installed_transition(&self, next: &InstalledState) -> io::Result<()> {
-        match self.try_installed()? {
+        match self.installed()? {
             Installed::Missing if self.install_commit_is_authorized(next)? => Ok(()),
             Installed::Missing => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -616,7 +612,7 @@ impl Store {
             return Ok(true);
         }
         let active = self.active_release()?;
-        let Installed::Present(installed) = self.try_installed()? else {
+        let Installed::Present(installed) = self.installed()? else {
             return Ok(false);
         };
         Ok(match tx.phase {
@@ -702,7 +698,7 @@ impl Store {
     }
 
     fn forward_commit_is_authorized(&self, tx: &Transaction) -> io::Result<bool> {
-        let Installed::Present(installed) = self.try_installed()? else {
+        let Installed::Present(installed) = self.installed()? else {
             return Ok(false);
         };
         Ok(
@@ -728,7 +724,7 @@ impl Store {
         if self.pending_authorizes_rollback_journal(tx)? {
             return Ok(true);
         }
-        let Installed::Present(installed) = self.try_installed()? else {
+        let Installed::Present(installed) = self.installed()? else {
             return Ok(false);
         };
         Ok(tx.phase == updated::transaction::Phase::Prepared
@@ -744,7 +740,7 @@ impl Store {
     /// atomic installed record. Every identity is copied from that record, so a caller cannot use
     /// this exception to manufacture a different predecessor or candidate.
     fn pending_authorizes_rollback_journal(&self, tx: &Transaction) -> io::Result<bool> {
-        let Installed::Present(installed) = self.try_installed()? else {
+        let Installed::Present(installed) = self.installed()? else {
             return Ok(false);
         };
         let Some(pending) = &installed.pending else {
@@ -817,7 +813,7 @@ impl Store {
             return Ok(false);
         }
         let active = self.active_release()?;
-        Ok(match self.try_installed()? {
+        Ok(match self.installed()? {
             Installed::Missing => active.is_none(),
             Installed::Present(current) => {
                 !current.confirmed
@@ -871,7 +867,7 @@ impl Store {
                 Ok(self.active_release()?.as_ref() == Some(&tx.release))
             }
             updated::install::InstallPhase::Committed => {
-                let Installed::Present(installed) = self.try_installed()? else {
+                let Installed::Present(installed) = self.installed()? else {
                     return Ok(false);
                 };
                 Ok(self.active_release()?.as_ref() == Some(&tx.release)
@@ -885,7 +881,7 @@ impl Store {
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn clear_install_journal(&mut self) -> io::Result<()> {
         if let Some(tx) = self.install_journal()? {
-            let installed = match self.try_installed()? {
+            let installed = match self.installed()? {
                 Installed::Present(state) => Some(state),
                 Installed::Missing | Installed::Invalid => None,
             };
@@ -1142,7 +1138,7 @@ mod tests {
         store.write_install_journal(&fallback).unwrap();
         store.clear_install_journal().unwrap();
         assert!(matches!(
-            store.installed(),
+            store.installed().unwrap(),
             Installed::Present(installed) if *installed == replacement
         ));
     }
@@ -1290,7 +1286,7 @@ mod tests {
             "activation alone is not authority to replace the committed executable identity"
         );
         assert!(matches!(
-            store.installed(),
+            store.installed().unwrap(),
             Installed::Present(installed) if *installed == current
         ));
     }
@@ -1539,7 +1535,7 @@ mod tests {
         store.activate(&state.release).unwrap();
         store.commit_installed(&state).unwrap();
         assert!(matches!(
-            store.installed(),
+            store.installed().unwrap(),
             Installed::Present(installed) if *installed == state
         ));
     }
@@ -1561,7 +1557,7 @@ mod tests {
 
         assert!(store.confirm_provisional().unwrap());
         assert!(matches!(
-            store.installed(),
+            store.installed().unwrap(),
             Installed::Present(installed) if installed.confirmed && installed.pending.is_none()
         ));
         assert!(!store.confirm_provisional().unwrap());
@@ -1569,8 +1565,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn confirmation_preserves_a_windows_sharing_fault_for_the_retry_boundary() {
+    fn confirmation_preserves_a_windows_replace_fault_for_the_retry_boundary() {
         use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
         let directory = tempfile::tempdir().unwrap();
         let paths = Paths::resolve(directory.path(), &directory.path().join("enrollment"));
@@ -1585,18 +1582,21 @@ mod tests {
         write_active(&paths.active_release, &transaction.release).unwrap();
         write_installed(&paths.installed, &state).unwrap();
 
-        let exclusive = std::fs::OpenOptions::new()
+        // Confirmation first reads installed.json, then atomically replaces it. Keep reads legal
+        // while withholding delete sharing so this exercises the replacement boundary itself.
+        let replacement_blocker = std::fs::OpenOptions::new()
             .read(true)
-            .share_mode(0)
+            .share_mode(FILE_SHARE_READ)
             .open(&paths.installed)
             .unwrap();
+        assert!(matches!(store.installed().unwrap(), Installed::Present(_)));
         let error = store.confirm_provisional().unwrap_err();
         assert!(
             crate::transient::is_node_local_transient(&error),
-            "the checked store read must retain the sharing violation: {error:?}"
+            "the atomic replacement must retain the sharing violation: {error:?}"
         );
 
-        drop(exclusive);
+        drop(replacement_blocker);
         assert!(store.confirm_provisional().unwrap());
     }
 
@@ -1630,7 +1630,7 @@ mod tests {
             ..MemoryBackend::default()
         });
 
-        assert!(matches!(store.installed(), Installed::Invalid));
+        assert!(matches!(store.installed().unwrap(), Installed::Invalid));
         assert_eq!(
             store.journal().unwrap_err().kind(),
             io::ErrorKind::InvalidData

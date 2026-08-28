@@ -247,7 +247,7 @@ async fn reconverge_environment(
         return Ok(result);
     }
 
-    let installed = match store.installed() {
+    let installed = match store.installed()? {
         Installed::Present(installed) => installed,
         _ => {
             return Err(io::Error::new(
@@ -368,7 +368,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // The disk is not trusted merely because it was verified during installation. This
     // check is local and deliberately precedes every repository access. A modified
     // committed bundle is never converged onto, even when the network is unavailable.
-    if let updated::state::Installed::Present(installed) = store.installed() {
+    if let updated::state::Installed::Present(installed) = store.installed()? {
         if let Err(error) =
             updated::bundle::verify_release(&opts.paths.versions, &installed.release)
         {
@@ -558,17 +558,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             current.as_deref().unwrap_or("<unknown>"),
             boot_reason.as_str()
         ));
-        let convergence = match converge_environment(&opts, &store, boot_reason, attempt::BOOT) {
-            Ok(convergence) => convergence,
-            Err(failure) => {
-                error(&format!(
-                    "reconciler apply for release {} with reason {} failed: {failure}",
-                    current.as_deref().unwrap_or("<unknown>"),
-                    boot_reason.as_str()
-                ));
-                return Err(failure.into());
-            }
-        };
+        let convergence =
+            recover_through_transients("boot reconciler apply", &mut launcher, &shutdown, || {
+                converge_environment(&opts, &store, boot_reason, attempt::BOOT)
+            })
+            .await?;
         log(&format!(
             "reconciler apply for release {} completed; entering the boot health gate",
             current.as_deref().unwrap_or("<unknown>")
@@ -589,10 +583,23 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // set staged for exactly this rollback) — not the candidate's. Otherwise an update that revised
     // the lifecycle provider, then failed, would gate the healthy predecessor with the candidate's
     // hooks, reject it, and crash-loop a good release.
-    let installed_state = match store.installed() {
-        Installed::Present(installed) => installed,
-        _ => return Err("cannot verify a boot without an installed release".into()),
-    };
+    let installed_state = recover_through_transients(
+        "reading installed state for the boot health gate",
+        &mut launcher,
+        &shutdown,
+        || match store.installed()? {
+            Installed::Present(installed) => Ok(installed),
+            Installed::Missing => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot verify a boot without an installed release",
+            )),
+            Installed::Invalid => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot verify a boot with a corrupt installed release",
+            )),
+        },
+    )
+    .await?;
     // Attempt identity, release identity and providers are resolved together, from one source, so
     // the gate can never observe one release with another's hooks or under another's attempt.
     let target = boot_gate_target(recovery_transaction.as_ref(), &installed_state, boot_reason);
@@ -620,9 +627,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             "boot health gate passed for release {}",
             target.candidate.version
         )),
-        update::Health::Unhealthy => warn(&format!(
-            "boot health gate reported release {} unhealthy",
-            target.candidate.version
+        update::Health::Unhealthy(cause) => warn(&format!(
+            "boot health gate reported release {} unhealthy ({cause})",
+            target.candidate.version,
         )),
         update::Health::Inconclusive(cause) => {
             // No verdict about these bytes: the probes stopped reaching the node reconciler (a
@@ -693,48 +700,44 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // Otherwise the answer is the committed record's alone: revert inside a confirmation
         // window, reject a never-proven provisional head, or merely report. See
         // [`boot::plan_gate_failure`].
-        match store.installed() {
-            Installed::Present(state) => match boot::plan_gate_failure(&state) {
-                GateFailure::Revert => {
-                    if let Err(error) = revert_unconfirmed_head(&mut store, &state, bytes_repaired)
-                    {
-                        return Err(exit_for_relaunch("recording the revert", &error));
-                    }
-                    return Err(
-                        "the unconfirmed release failed its boot health gate; reverting on the \
+        match boot::plan_gate_failure(&installed_state) {
+            GateFailure::Revert => {
+                if let Err(error) =
+                    revert_unconfirmed_head(&mut store, &installed_state, bytes_repaired)
+                {
+                    return Err(exit_for_relaunch("recording the revert", &error));
+                }
+                return Err(
+                    "the unconfirmed release failed its boot health gate; reverting on the \
                          next boot"
-                            .into(),
-                    );
+                        .into(),
+                );
+            }
+            GateFailure::RejectProvisional => {
+                if let Err(error) = reject_provisional_head(&mut store, &installed_state) {
+                    return Err(exit_for_relaunch(
+                        "rejecting the failed provisional head",
+                        &error,
+                    ));
                 }
-                GateFailure::RejectProvisional => {
-                    if let Err(error) = reject_provisional_head(&mut store, &state) {
-                        return Err(exit_for_relaunch(
-                            "rejecting the failed provisional head",
-                            &error,
-                        ));
-                    }
-                    return Err("the provisional head failed its boot health gate".into());
-                }
-                // A confirmed release that is unhealthy is REPORTED, never reverted locally: the
-                // reconciler owns the workload and may converge it later, and there is no
-                // predecessor image left to revert to. Exiting instead would hand the node to the
-                // init system's restart loop with nothing to fix on the next boot.
-                GateFailure::Report => warn(&format!(
-                    "the committed release {} is unhealthy; reporting it and continuing to \
+                return Err("the provisional head failed its boot health gate".into());
+            }
+            // A confirmed release that is unhealthy is REPORTED, never reverted locally: the
+            // reconciler owns the workload and may converge it later, and there is no
+            // predecessor image left to revert to. Exiting instead would hand the node to the
+            // init system's restart loop with nothing to fix on the next boot.
+            GateFailure::Report => warn(&format!(
+                "the committed release {} is unhealthy; reporting it and continuing to \
                      reconcile",
-                    state.release.version
-                )),
-            },
-            _ => return Err("cannot verify a boot without an installed release".into()),
+                installed_state.release.version
+            )),
         }
     }
     // The head has now proven healthy this boot: confirm it so a later transient unhealth of this
     // (proven) head is reported and reconciled, not rejected as a broken head.
     if gate_passed {
-        // Confirmation is one store operation so BOTH of its installed-state reads retain a
-        // Windows sharing/lock error. Reading through the fail-closed observer here would convert
-        // that transient into `Invalid` and silently skip this transition before the retry policy
-        // ever saw it.
+        // Confirmation is one store operation so both of its installed-state reads remain inside
+        // the same Windows sharing/lock retry boundary.
         let newly_confirmed = recover_through_transients(
             "confirming the health-proven release",
             &mut launcher,
@@ -805,7 +808,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if defer_recovery_commit {
         if let Some(state) = &plan.commit {
             store.commit_installed(state)?;
-            pending = installed_pending(&store);
+            pending = installed_pending(&store)?;
         }
     }
     // Keep the journal until both release reconciliation and any environmental rollback
@@ -1055,7 +1058,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
         // tick, so the heartbeat below is reached however the cycle ends — no `continue` added here
         // later can spend the node's freshness budget in silence.
         let flow: Result<TickFlow, Box<dyn std::error::Error>> = async {
-            if let updated::state::Installed::Present(installed) = store.installed() {
+            if let updated::state::Installed::Present(installed) = store.installed()? {
                 if let Err(error) =
                     updated::bundle::verify_release(&opts.paths.versions, &installed.release)
                 {
@@ -1080,7 +1083,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                             ));
                         }
                     };
-                    current = match store.installed() {
+                    current = match store.installed()? {
                         updated::state::Installed::Present(state) => Some(state.release.version),
                         _ => None,
                     };
@@ -1092,7 +1095,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                     // days later would be read by the boot gate as an unconfirmed release inside its
                     // window: a revert to the predecessor plus a permanent rejection of a release
                     // that had long since proven itself.
-                    pending = installed_pending(&store);
+                    pending = installed_pending(&store)?;
                     // The SAME converge the runtime arm below runs, for the same reason: the
                     // reconciler owns every workload process, so `apply` is the only step that puts
                     // the repaired bytes into service. Without it the tampered image would keep
@@ -1254,7 +1257,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                         current = Some(version);
                         // The commit recorded the update as unconfirmed; pick it up so its
                         // window is watched and a crash is caught on the next boot.
-                        pending = installed_pending(&store);
+                        pending = installed_pending(&store)?;
                         garbage_collect(&opts, &store);
                         if host_action == HostAction::Reboot {
                             return Ok(TickFlow::Reboot);
@@ -1553,7 +1556,7 @@ mod tests {
         );
         // The collector derives its protected set from that same record, so probe and collector
         // cannot name different provider releases.
-        match store.installed() {
+        match store.installed().unwrap() {
             Installed::Present(state) => assert_eq!(state.lifecycle, after_repair.1),
             _ => panic!("expected the repaired record"),
         }
@@ -2080,7 +2083,7 @@ mod tests {
         assert!(store.is_rejected(&lineage, &predecessor_rejection));
         assert!(!store.is_rejected(&lineage, &digest("archive-one")));
         assert!(store.journal().unwrap().is_none());
-        match store.installed() {
+        match store.installed().unwrap() {
             Installed::Present(state) => {
                 assert_eq!(state.release, predecessor);
                 assert!(
@@ -2173,7 +2176,7 @@ mod tests {
         assert!(store.is_rejected(&lineage, &predecessor_rejection));
         assert!(!store.is_rejected(&lineage, &digest("archive-one")));
         assert!(store.journal().unwrap().is_none());
-        match store.installed() {
+        match store.installed().unwrap() {
             Installed::Present(state) => {
                 assert_eq!(state.release, predecessor);
                 assert!(!state.confirmed);
@@ -2259,7 +2262,7 @@ mod tests {
         // And the boot that follows can still drive it: the record still names the candidate, so
         // the journal classifies as a resumable rollback.
         let situation = Situation {
-            installed: store.installed(),
+            installed: store.installed().unwrap(),
             active: Some(head.release.clone()),
             journal: store.journal().unwrap(),
             bad_agent: None,

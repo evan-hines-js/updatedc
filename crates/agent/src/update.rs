@@ -144,6 +144,37 @@ pub(crate) enum InvocationFailure {
     Inconclusive(io::Error),
 }
 
+#[derive(Debug)]
+struct ContextualIoError {
+    context: String,
+    source: io::Error,
+}
+
+impl std::fmt::Display for ContextualIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for ContextualIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Add the operation and path without erasing the source `io::Error`. The transient-fault
+/// classifier walks this chain to retain Windows sharing/lock codes, while the outer message makes
+/// a service log identify the exact durable boundary that failed.
+fn io_error_with_context(error: io::Error, context: impl Into<String>) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        ContextualIoError {
+            context: context.into(),
+            source: error,
+        },
+    )
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ReleaseTarget<'a> {
     pub(crate) release: &'a updated::bundle::ReleaseId,
@@ -200,6 +231,7 @@ pub(crate) trait Reconciler {
     fn observe(
         &mut self,
         operation: ObservationOperation,
+        timeout: Duration,
         lifecycle_attempt_id: &str,
         candidate: ReleaseTarget<'_>,
         predecessor: ReleaseTarget<'_>,
@@ -256,6 +288,7 @@ impl Reconciler for ReleaseReconciler<'_> {
     fn observe(
         &mut self,
         operation: ObservationOperation,
+        timeout: Duration,
         lifecycle_attempt_id: &str,
         candidate: ReleaseTarget<'_>,
         predecessor: ReleaseTarget<'_>,
@@ -264,6 +297,7 @@ impl Reconciler for ReleaseReconciler<'_> {
             self.lifecycle,
             self.opts,
             operation,
+            timeout,
             LifecycleInvocation {
                 reason: self.reason,
                 id: lifecycle_attempt_id,
@@ -303,7 +337,7 @@ pub(crate) fn prepare_fingerprint_job(
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<FingerprintJob> {
     Ok(FingerprintJob {
-        command: prepare_lifecycle_command(release, opts, Operation::Inspect, invocation)?,
+        command: prepare_lifecycle_command(release, opts, Operation::Inspect, None, invocation)?,
         definition_sha256: release.archive_sha256.clone(),
     })
 }
@@ -351,7 +385,7 @@ pub(crate) fn converge_environment(
     reason: Reason,
     attempt_id: &str,
 ) -> io::Result<updated_contracts::reconciler::SuccessfulMutation> {
-    let updated::state::Installed::Present(installed) = store.installed() else {
+    let updated::state::Installed::Present(installed) = store.installed()? else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "a verified installed release is required for convergence",
@@ -438,32 +472,25 @@ pub(crate) async fn became_healthy<T: Reconciler>(
     // switch-over and could never be unset — a state volume that fills at t=2s would then still be
     // reported as an unhealthy CANDIDATE and earn that release a permanent rejection. Whether the
     // probes could still reach the reconciler when the deadline arrived is the question that
-    // actually distinguishes the two faults, so `unreached` is cleared by any answer and set by any
-    // failure in front of the reconciler.
-    let mut unreached: Option<io::Error> = None;
+    // actually distinguishes the two faults, so the final invocation failure is retained exactly.
+    let mut last_probe: Option<Result<(), InvocationFailure>> = None;
     while Instant::now() < deadline {
         if Instant::now() >= next {
-            let ok = match reconciler.observe(
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let probe = reconciler.observe(
                 ObservationOperation::Healthcheck,
+                remaining,
                 lifecycle_attempt_id,
                 candidate,
                 predecessor,
-            ) {
-                Ok(()) => {
-                    unreached = None;
-                    true
-                }
-                Err(InvocationFailure::ReleaseFault(_)) => {
-                    unreached = None;
-                    false
-                }
-                // The probe never reached the reconciler. It still counts as a failed observation
-                // for cadence — readiness is consecutive evidence — but it is not a verdict.
-                Err(InvocationFailure::Inconclusive(error)) => {
-                    unreached = Some(error);
-                    false
-                }
-            };
+            );
+            // Both failure classes reset consecutive readiness. Their distinction matters only if
+            // this remains the final probe, so retain the result intact for the gate verdict.
+            let ok = probe.is_ok();
+            last_probe = Some(probe);
             if readiness.observe(ok) {
                 return Health::Ready;
             }
@@ -476,9 +503,19 @@ pub(crate) async fn became_healthy<T: Reconciler>(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    match unreached {
-        Some(error) => Health::Inconclusive(error),
-        None => Health::Unhealthy,
+    match last_probe {
+        Some(Err(InvocationFailure::ReleaseFault(error))) => Health::Unhealthy(error),
+        Some(Err(InvocationFailure::Inconclusive(error))) => Health::Inconclusive(error),
+        Some(Ok(())) => Health::Unhealthy(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the readiness grace expired before {successes} consecutive successful healthchecks"
+            ),
+        )),
+        None => Health::Inconclusive(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the readiness grace expired before any healthcheck completed",
+        )),
     }
 }
 
@@ -496,7 +533,7 @@ pub(crate) enum Health {
     Ready,
     /// The grace expired with the reconciler still answering, and its last answer was not ready (a
     /// non-zero exit, or it wedged past its own timeout).
-    Unhealthy,
+    Unhealthy(io::Error),
     /// No verdict: when the grace expired the probes were no longer reaching the reconciler at all.
     /// Carries that failure for the log.
     Inconclusive(io::Error),
@@ -541,7 +578,7 @@ pub(crate) async fn apply_update<T: Reconciler>(
         }
     }
 
-    let installed = match store.installed() {
+    let installed = match store.installed()? {
         Installed::Present(state) => state,
         _ => return Err(io::Error::other("a verified installed release is required")),
     };
@@ -676,7 +713,12 @@ async fn switch_over<T: Reconciler>(
         .await
         {
             Health::Ready => {}
-            Health::Unhealthy => return reject_then_recover(store, &mut tx),
+            Health::Unhealthy(error) => {
+                warn(&format!(
+                    "the candidate failed its readiness gate ({error})"
+                ));
+                return reject_then_recover(store, &mut tx);
+            }
             // The gate never reached the reconciler, so it observed nothing about the candidate.
             // Restart for boot recovery *without* recording a rejection — the same fail-safe class as
             // the pointer-write case above — so the healthy release is retried once the node's own
@@ -836,7 +878,7 @@ pub(crate) fn run_lifecycle_observation(
     operation: ObservationOperation,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<()> {
-    invoke_lifecycle_observation(lifecycle, opts, operation, invocation)
+    invoke_lifecycle_observation(lifecycle, opts, operation, HEALTHCHECK_TIMEOUT, invocation)
         .map_err(InvocationFailure::into_io_error)
 }
 
@@ -850,7 +892,7 @@ fn invoke_lifecycle_mutation(
     let max_attempts = updated_contracts::reconciler::MAX_MUTATION_ATTEMPTS;
 
     for attempt in 1..=max_attempts {
-        let prepared = prepare_lifecycle_command(lifecycle, opts, phase, invocation)
+        let prepared = prepare_lifecycle_command(lifecycle, opts, phase, None, invocation)
             .map_err(InvocationFailure::Inconclusive)?;
         let output = run_prepared_lifecycle_command(prepared, None)?;
         let updated::reconciler::InvocationResult::Mutation(resolution) = output.result else {
@@ -894,7 +936,15 @@ fn invoke_lifecycle_mutation(
                     &opts.paths.last_reconciliation,
                     &record,
                 )
-                .map_err(InvocationFailure::Inconclusive)?;
+                .map_err(|error| {
+                    InvocationFailure::Inconclusive(io_error_with_context(
+                        error,
+                        format!(
+                            "reconciler {phase} succeeded, but persisting its audit record to {} failed",
+                            opts.paths.last_reconciliation.display()
+                        ),
+                    ))
+                })?;
                 if let Some(message) = record.result().message() {
                     log(&format!("reconciler {phase}: {message}"));
                 }
@@ -926,10 +976,17 @@ fn invoke_lifecycle_observation(
     lifecycle: &updated::state::ProviderRelease,
     opts: &Options,
     operation: ObservationOperation,
+    runtime_ceiling: Duration,
     invocation: LifecycleInvocation<'_>,
 ) -> Result<(), InvocationFailure> {
-    let prepared = prepare_lifecycle_command(lifecycle, opts, operation.operation(), invocation)
-        .map_err(InvocationFailure::Inconclusive)?;
+    let prepared = prepare_lifecycle_command(
+        lifecycle,
+        opts,
+        operation.operation(),
+        Some(runtime_ceiling),
+        invocation,
+    )
+    .map_err(InvocationFailure::Inconclusive)?;
     let output = run_prepared_lifecycle_command(prepared, None)?;
     match output.result {
         updated::reconciler::InvocationResult::Observation => Ok(()),
@@ -1031,12 +1088,47 @@ pub(crate) fn clear_stale_invocation_data(paths: &updated::config::Paths) -> io:
     let products = match std::fs::read_dir(&paths.provider_state_root) {
         Ok(products) => products,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(io_error_with_context(
+                error,
+                format!(
+                    "reading reconciler state root {}",
+                    paths.provider_state_root.display()
+                ),
+            ));
+        }
     };
     for product in products {
-        let product = product?;
-        if product.file_type()?.is_dir() {
-            foundation::durable::remove_path(&product.path().join("invocations"))?;
+        let product = product.map_err(|error| {
+            io_error_with_context(
+                error,
+                format!(
+                    "enumerating reconciler state root {}",
+                    paths.provider_state_root.display()
+                ),
+            )
+        })?;
+        let product_path = product.path();
+        if product
+            .file_type()
+            .map_err(|error| {
+                io_error_with_context(
+                    error,
+                    format!("reading reconciler state entry {}", product_path.display()),
+                )
+            })?
+            .is_dir()
+        {
+            let invocations = product_path.join("invocations");
+            foundation::durable::remove_path(&invocations).map_err(|error| {
+                io_error_with_context(
+                    error,
+                    format!(
+                        "removing stale plaintext reconciler exchanges {}",
+                        invocations.display()
+                    ),
+                )
+            })?;
         }
     }
     Ok(())
@@ -1046,6 +1138,7 @@ fn prepare_lifecycle_command(
     lifecycle: &updated::state::ProviderRelease,
     opts: &Options,
     operation: Operation,
+    runtime_ceiling: Option<Duration>,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<PreparedLifecycleCommand> {
     operation
@@ -1070,7 +1163,10 @@ fn prepare_lifecycle_command(
             "staged lifecycle manifest has the wrong product",
         ));
     }
-    let timeout = lifecycle_timeout(operation, Duration::from_millis(lifecycle.timeout_millis));
+    let mut timeout = lifecycle_timeout(operation, Duration::from_millis(lifecycle.timeout_millis));
+    if let Some(runtime_ceiling) = runtime_ceiling {
+        timeout = timeout.min(runtime_ceiling);
+    }
     let phase_name = operation.as_str();
     let app_provider = updated::provider::BundleStore::for_app(&opts.paths);
     let candidate_dir = app_provider.location(candidate.release);
@@ -1850,6 +1946,9 @@ mod tests {
         /// so a fault can be made to arrive PART WAY THROUGH a grace period.
         healthcheck_failure_from: usize,
         healthcheck_calls: usize,
+        healthcheck_timeouts: Vec<Duration>,
+        health_successes: u32,
+        health_interval: Duration,
         fail_first_apply: bool,
         unreach_first_apply: bool,
         applies: usize,
@@ -1920,14 +2019,22 @@ mod tests {
         fn observe(
             &mut self,
             operation: ObservationOperation,
+            timeout: Duration,
             lifecycle_attempt_id: &str,
             _: ReleaseTarget<'_>,
             _: ReleaseTarget<'_>,
         ) -> Result<(), InvocationFailure> {
+            if operation == ObservationOperation::Healthcheck {
+                self.healthcheck_timeouts.push(timeout);
+            }
             self.invoke_operation(operation.operation(), lifecycle_attempt_id)
         }
         fn verification_policy(&self) -> (Duration, u32, Duration) {
-            (Duration::from_secs(1), 1, Duration::ZERO)
+            (
+                Duration::from_secs(1),
+                self.health_successes.max(1),
+                self.health_interval,
+            )
         }
     }
 
@@ -2150,16 +2257,27 @@ mod tests {
             healthcheck_failure: Some(FakeFailure::ReleaseFault),
             ..Default::default()
         };
-        assert!(matches!(
-            became_healthy(
-                &mut answered,
-                attempt::BOOT,
-                target(&candidate),
-                target(&candidate),
-            )
-            .await,
-            Health::Unhealthy
-        ));
+        match became_healthy(
+            &mut answered,
+            attempt::BOOT,
+            target(&candidate),
+            target(&candidate),
+        )
+        .await
+        {
+            Health::Unhealthy(error) => assert!(
+                error.to_string().contains("injected healthcheck answer"),
+                "the release verdict must retain the reconciler's exact failure: {error}"
+            ),
+            _ => panic!("a reconciler answer must produce an unhealthy release verdict"),
+        }
+        assert!(
+            answered
+                .healthcheck_timeouts
+                .iter()
+                .all(|timeout| *timeout <= Duration::from_secs(1)),
+            "no probe may outlive the gate's remaining grace"
+        );
     }
 
     /// The verdict follows the LAST probe, not "did the reconciler ever answer". After a
@@ -2193,6 +2311,31 @@ mod tests {
             "one early answer must not latch the gate into judging the release"
         );
         assert!(reconciler.healthcheck_calls > 1, "the grace kept probing");
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_success_run_is_unhealthy_not_inconclusive() {
+        let candidate = release("2.0.0", "two");
+        let mut reconciler = FakeReconciler {
+            health_successes: 2,
+            health_interval: Duration::from_secs(2),
+            ..Default::default()
+        };
+
+        match became_healthy(
+            &mut reconciler,
+            attempt::BOOT,
+            target(&candidate),
+            target(&candidate),
+        )
+        .await
+        {
+            Health::Unhealthy(error) => assert!(error
+                .to_string()
+                .contains("before 2 consecutive successful healthchecks")),
+            _ => panic!("one success cannot satisfy a two-success readiness policy"),
+        }
+        assert_eq!(reconciler.healthcheck_calls, 1);
     }
 
     /// The harshest consequence in the system — a durable, never-expiring rejection — must never be

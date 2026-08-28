@@ -2134,7 +2134,10 @@ pub(crate) mod wiring_tests {
             updated_contracts::enrollment::EnrollmentBundle::from_bounded_json(enrollment_bytes)
                 .expect("published enrollment object");
         assert_eq!(enrollment.agent_id, "n1");
-        assert_eq!(enrollment.install_root, std::path::Path::new("/opt/app"));
+        assert_eq!(
+            enrollment.install_root,
+            updated_contracts::assignment::testing::runtime().install_root
+        );
         assert!(
             enrollment_object_key.ends_with(&format!(
                 "{}.json",

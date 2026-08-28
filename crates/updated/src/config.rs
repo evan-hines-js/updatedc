@@ -68,7 +68,12 @@ mod repository_location_tests {
 
     #[test]
     fn locality_uses_the_canonical_repository_grammar() {
-        assert!(base_url_is_local("FILE:///opt/updated/").unwrap());
+        #[cfg(windows)]
+        let native_file_base = "FILE:///C:/updated/";
+        #[cfg(not(windows))]
+        let native_file_base = "FILE:///opt/updated/";
+
+        assert!(base_url_is_local(native_file_base).unwrap());
         assert!(!base_url_is_local("https://EXAMPLE.com:443/").unwrap());
         assert!(base_url_is_local("file:relative").is_err());
         assert!(base_url_is_local("http://example.com/").is_err());

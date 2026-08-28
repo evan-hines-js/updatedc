@@ -65,8 +65,8 @@ struct InstalledReleaseIdentity {
     manifest_sha256: String,
 }
 
-fn installed_release_identity(store: &Store) -> InstalledReleaseIdentity {
-    match store.installed() {
+fn installed_release_identity(store: &Store) -> io::Result<InstalledReleaseIdentity> {
+    Ok(match store.installed()? {
         updated::state::Installed::Present(state) => InstalledReleaseIdentity {
             version: state.release.version,
             archive_sha256: state.archive_sha256,
@@ -76,7 +76,7 @@ fn installed_release_identity(store: &Store) -> InstalledReleaseIdentity {
         updated::state::Installed::Missing | updated::state::Installed::Invalid => {
             InstalledReleaseIdentity::default()
         }
-    }
+    })
 }
 
 /// Whether this node has durably rejected the release `assignment` names — either invalid
@@ -135,7 +135,15 @@ impl Heartbeat {
             return;
         };
         let document = assignment.document();
-        let installed = installed_release_identity(store);
+        let installed = match installed_release_identity(store) {
+            Ok(installed) => installed,
+            Err(error) => {
+                warn(&format!(
+                    "omitting rollout telemetry because installed state could not be read: {error}"
+                ));
+                return;
+            }
+        };
         let rejected = rejects_assigned_release(store, assignment);
         let runtime_converged = opts.runtime_is_converged(&document.runtime);
         let healthy = state.settled && runtime_converged;

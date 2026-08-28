@@ -20,6 +20,11 @@ pub const TEMP_DIRECTORY_LEASE_FILE: &str = ".updated-active.lock";
 /// The prefix [`install_executable`] stages under, and the one it sweeps.
 const EXECUTABLE_TEMP_PREFIX: &str = ".executable-";
 
+/// One bounded policy for the short-lived sharing and executable-lock contention that can affect
+/// durable rename and removal. Keeping the budget here prevents individual callers from drifting
+/// into either an immediate restart loop or an unbounded wait.
+const FILESYSTEM_CONTENTION_RETRIES: u32 = 50;
+
 /// Who may read a durable file once it is committed. Every file this module creates commits to
 /// exactly one of these at `open(2)`/`CreateFileW` time — permissions are never widened and then
 /// narrowed, and no caller ever chmods (or `icacls`es) afterwards, which is the property that
@@ -508,10 +513,13 @@ fn abandoned_temp_directory_lease(path: &Path) -> Option<File> {
 /// already gone is success. The path must be a file — use [`remove_path`] for a path whose shape
 /// is not ours to assume.
 pub fn remove_file(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
+    let removed = retry_filesystem_contention(|| match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    })?;
+    if !removed {
+        return Ok(());
     }
     sync_dir(parent_dir(path)).map_err(unsynced)
 }
@@ -525,11 +533,18 @@ pub fn remove_file(path: &Path) -> io::Result<()> {
 /// A symlink is removed as the link, never followed, so this can never delete a tree the link
 /// merely pointed at. Removing something that is already gone is success.
 pub fn remove_path(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path)?,
-        Ok(_) => return remove_file(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
+    let removed = retry_filesystem_contention(|| match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path).map(|()| true),
+        Ok(_) => match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    })?;
+    if !removed {
+        return Ok(());
     }
     sync_dir(parent_dir(path)).map_err(unsynced)
 }
@@ -537,17 +552,22 @@ pub fn remove_path(path: &Path) -> io::Result<()> {
 /// Replace `to` with `from`, tolerating the short-lived executable/file locks seen
 /// during process teardown and antivirus scanning. Permanent errors surface at once.
 pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    retry_filesystem_contention(|| fs::rename(from, to))
+}
+
+fn retry_filesystem_contention<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let mut attempt = 0u32;
     loop {
-        match fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 50 && is_transient_filesystem_contention(&e) => {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < FILESYSTEM_CONTENTION_RETRIES
+                    && is_transient_filesystem_contention(&error) =>
+            {
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(
-                    (20 * u64::from(attempt)).min(100),
-                ));
+                std::thread::sleep(Duration::from_millis((20 * u64::from(attempt)).min(100)));
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         }
     }
 }

@@ -16,7 +16,8 @@ esac
 if [ ! -f /data/ready ]; then
   rm -rf "$repo" "$keys" "$fixtures"
   server init --repo "$repo" --keys "$keys"
-  for major in $(seq 1 22); do
+  max_major=$(publish_fuzz_max_major "${UPDATEC_FUZZ_ROUNDS:-0}")
+  for major in $(seq 1 "$max_major"); do
     version="${major}.0.0"
     source="$fixtures/$version"
     mkdir -p "$source/bin" "$source/config"
@@ -191,7 +192,8 @@ valid_tmp=/data/.valid-versions.tmp
 corrupt_tmp=/data/.corrupt-versions.tmp
 : >"$valid_tmp"
 : >"$corrupt_tmp"
-for major in $(seq 1 22); do
+max_major=$(publish_fuzz_max_major "${UPDATEC_FUZZ_ROUNDS:-0}")
+for major in $(seq 1 "$max_major"); do
   version="${major}.0.0"
   if publish_fuzz_is_corrupt "$version"; then
     printf '%s\n' "$version" >>"$corrupt_tmp"

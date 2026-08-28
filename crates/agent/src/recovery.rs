@@ -289,7 +289,7 @@ pub(crate) fn gather_situation(
     evidence: &launcher::Evidence,
 ) -> io::Result<Situation> {
     let active = store.active_release()?;
-    let installed = store.installed();
+    let installed = store.installed()?;
     let journal = store.journal()?;
     Ok(Situation {
         installed,
@@ -345,7 +345,7 @@ pub(crate) fn execute_boot_plan(
         }
         evidence.clear_rejected_agent()?;
     }
-    Ok(installed_pending(store))
+    installed_pending(store)
 }
 
 /// Apply the durable half of a boot [`Plan`] to the [`Store`].
@@ -391,11 +391,11 @@ pub(crate) fn rejected_agent_hash(path: &std::path::Path) -> Option<&str> {
 }
 
 /// The unconfirmed update recorded in the installed state, if any.
-pub(crate) fn installed_pending(store: &Store) -> Option<Pending> {
-    match store.installed() {
+pub(crate) fn installed_pending(store: &Store) -> io::Result<Option<Pending>> {
+    Ok(match store.installed()? {
         Installed::Present(s) => s.pending,
-        _ => None,
-    }
+        Installed::Missing | Installed::Invalid => None,
+    })
 }
 
 /// Run one steady-state probe against the committed release and the lifecycle provider that must
@@ -413,7 +413,7 @@ pub(crate) fn probe_steady_target<T>(
     store: &Store,
     probe: impl FnOnce(&updated::bundle::ReleaseId, &str, &updated::state::ProviderRelease) -> T,
 ) -> io::Result<T> {
-    match store.installed() {
+    match store.installed()? {
         Installed::Present(state) => Ok(probe(
             &state.release,
             &state.archive_sha256,
@@ -431,7 +431,7 @@ pub(crate) fn probe_steady_target<T>(
 /// in-memory pending intent (and continue suppressing updates) after a write failure.
 pub(crate) fn confirm_update(store: &mut Store) -> bool {
     match store.installed() {
-        Installed::Present(mut st) => {
+        Ok(Installed::Present(mut st)) => {
             if !st.settle_update() {
                 return true;
             }
@@ -444,11 +444,17 @@ pub(crate) fn confirm_update(store: &mut Store) -> bool {
             }
             true
         }
-        Installed::Missing | Installed::Invalid => {
+        Ok(Installed::Missing | Installed::Invalid) => {
             // In-memory pending intent must not be cleared when its authoritative durable record
             // disappeared or became corrupt. Keep reporting the update in flight and let the next
             // boot fail closed on the same state.
             warn("could not durably confirm the update: installed state is missing or invalid");
+            false
+        }
+        Err(error) => {
+            warn(&format!(
+                "could not read installed state while confirming the update ({error}); will retry"
+            ));
             false
         }
     }
@@ -493,7 +499,7 @@ mod confirmation_tests {
 
         assert!(confirm_update(&mut store));
         assert!(matches!(
-            store.installed(),
+            store.installed().unwrap(),
             Installed::Present(state) if state.pending.is_none()
         ));
 

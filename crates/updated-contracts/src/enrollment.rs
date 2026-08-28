@@ -157,7 +157,7 @@ mod tests {
             agent_id: ResourceName::new("agent-7").unwrap(),
             routing_base_url: base.into(),
             assignment: "assignments/agents/agent-7.json".into(),
-            install_root: "/var/lib/app".into(),
+            install_root: crate::assignment::testing::runtime().install_root,
             routing_root: "{}".into(),
         }
     }
@@ -175,9 +175,12 @@ mod tests {
         assert!(bundle("https://updates.example/routing/")
             .validate_shape()
             .is_ok());
-        assert!(bundle("file:///var/lib/updated/routing/")
-            .validate_shape()
-            .is_ok());
+        let offline = if cfg!(windows) {
+            "file:///C:/ProgramData/updated/routing/"
+        } else {
+            "file:///var/lib/updated/routing/"
+        };
+        assert!(bundle(offline).validate_shape().is_ok());
         for invalid in [
             "http://updates.example/routing/",
             "https://user:secret@updates.example/routing/",

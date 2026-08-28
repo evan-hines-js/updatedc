@@ -2319,7 +2319,6 @@ mod tests {
     fn runtime() -> updated_contracts::assignment::ManagedRuntime {
         let minimal = updated_contracts::assignment::testing::minimal_runtime();
         updated_contracts::assignment::ManagedRuntime {
-            install_root: "/opt/app".into(),
             // A one-byte target ceiling, so a test can trip the download bound deliberately.
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 target_limit: 1,

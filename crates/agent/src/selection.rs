@@ -258,7 +258,14 @@ pub(crate) async fn check_application(
     };
     let lineage = assignment.repository_lineage();
     let assignment = assignment.document();
-    let installed = store.installed();
+    let installed = match store.installed() {
+        Ok(installed) => installed,
+        Err(error) => {
+            return AppOutcome::Fatal(format!(
+                "reading installed state before application selection: {error}"
+            ));
+        }
+    };
     let ordered_current = match &installed {
         updated::state::Installed::Present(state) => state.version_floor_for(lineage),
         updated::state::Installed::Missing | updated::state::Installed::Invalid => None,

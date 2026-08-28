@@ -189,7 +189,14 @@ pub fn canonical_repository_base(value: &str) -> Result<url::Url, String> {
     }
     match url.scheme() {
         "https" if url.host_str().is_some() => Ok(url),
-        "file" if url.host_str().is_none() && url.to_file_path().is_ok() => Ok(url),
+        "https" => Err("HTTPS repository base must name a host".into()),
+        "file" if url.host_str().is_some() => {
+            Err("file repository base must not name a remote host".into())
+        }
+        "file" if url.to_file_path().is_err() => {
+            Err("file repository base is not an absolute directory on this platform".into())
+        }
+        "file" => Ok(url),
         scheme => Err(format!("uses unsupported {scheme} scheme")),
     }
 }
@@ -409,6 +416,15 @@ mod tests {
 
     use testing::runtime;
 
+    #[cfg(windows)]
+    const OFFLINE_METADATA: &str = r"C:\ProgramData\updated\repository\metadata\";
+    #[cfg(not(windows))]
+    const OFFLINE_METADATA: &str = "/opt/updated/repository/metadata/";
+    #[cfg(windows)]
+    const OFFLINE_TARGETS: &str = "file:///C:/ProgramData/updated/repository/targets/";
+    #[cfg(not(windows))]
+    const OFFLINE_TARGETS: &str = "file:///opt/updated/repository/targets/";
+
     fn assignment() -> RepositoryAssignment {
         RepositoryAssignment {
             schema: RepositoryAssignment::SCHEMA,
@@ -447,12 +463,26 @@ mod tests {
             value.metadata_url = invalid.into();
             assert!(value.validate().is_err(), "{invalid:?} must be refused");
         }
-        value.metadata_url = "/opt/updated/repository/metadata/".into();
-        value.targets_url = "file:///opt/updated/repository/targets/".into();
+        value.metadata_url = OFFLINE_METADATA.into();
+        value.targets_url = OFFLINE_TARGETS.into();
         assert!(
             value.validate().is_ok(),
             "absolute offline repositories remain supported"
         );
+    }
+
+    #[test]
+    fn file_repository_bases_must_be_absolute_on_the_running_platform() {
+        assert_eq!(
+            canonical_repository_base(OFFLINE_TARGETS)
+                .expect("the host-native offline URL is usable")
+                .scheme(),
+            "file"
+        );
+        #[cfg(windows)]
+        assert!(canonical_repository_base("file:///opt/updated/targets/")
+            .unwrap_err()
+            .contains("on this platform"));
     }
 
     #[test]
@@ -665,8 +695,8 @@ mod tests {
         value.validate().unwrap();
 
         let mut offline = value.clone();
-        offline.metadata_url = "/opt/update/metadata/".into();
-        offline.targets_url = "file:///opt/update/targets/".into();
+        offline.metadata_url = OFFLINE_METADATA.into();
+        offline.targets_url = OFFLINE_TARGETS.into();
         offline.validate().unwrap();
 
         let mut obsolete = value;

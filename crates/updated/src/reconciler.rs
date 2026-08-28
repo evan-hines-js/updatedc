@@ -151,15 +151,25 @@ pub fn apply_environment(command: &mut Command) {
             .or_else(|| std::env::var_os("WINDIR"))
             .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
         let system32 = std::path::PathBuf::from(&system_root).join("System32");
-        let powershell = system32.join("WindowsPowerShell/v1.0");
+        let powershell = system32.join("WindowsPowerShell").join("v1.0");
+        let builtin_modules = powershell.join("Modules");
         command
             .env("SystemRoot", &system_root)
             .env("WINDIR", &system_root)
+            // `env_clear` leaves PSModulePath absent. Windows PowerShell then synthesizes its
+            // normal user and machine module search path during startup, which can block a
+            // service-hosted reconciler before the script executes its first line. Pin module
+            // discovery and PATH to the built-in Windows runtime; other helpers must be addressed
+            // explicitly by the reconciler bundle.
+            .env("PSModulePath", builtin_modules)
             .env(
                 "PATH",
                 std::env::join_paths([system32, powershell]).unwrap_or_default(),
             );
-        for name in ["TEMP", "TMP"] {
+        // These are interpreter/runtime locations supplied by the service account, not application
+        // configuration. LOCALAPPDATA is where Windows PowerShell 5.1 keeps its module-analysis
+        // cache; the remaining profile and program directories are deliberately absent.
+        for name in ["TEMP", "TMP", "SystemDrive", "LOCALAPPDATA"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
@@ -350,6 +360,7 @@ mod tests {
         command
             .env("AMBIENT", "leaked")
             .env("PATH", "/opt/ambient")
+            .env("PSModulePath", "/opt/ambient/modules")
             .env("TOKEN", "ambient");
         apply_environment(&mut command);
         let environment: BTreeMap<String, String> = command
@@ -376,6 +387,31 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(path, "/usr/sbin:/usr/bin:/sbin:/bin");
+        #[cfg(windows)]
+        {
+            let system_root = std::env::var_os("SystemRoot")
+                .or_else(|| std::env::var_os("WINDIR"))
+                .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+            assert_eq!(
+                environment.get("PSModulePath"),
+                Some(
+                    &std::path::PathBuf::from(system_root)
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("Modules")
+                        .to_string_lossy()
+                        .into_owned()
+                ),
+                "the hook sees only Windows PowerShell's built-in modules"
+            );
+            for name in ["USERPROFILE", "APPDATA", "ProgramData", "ProgramFiles"] {
+                assert!(
+                    !environment.contains_key(name),
+                    "the hook must not inherit machine-specific {name}"
+                );
+            }
+        }
         assert!(
             command.get_args().next().is_none(),
             "the chokepoint contributes no arguments, so no secret can land in argv"

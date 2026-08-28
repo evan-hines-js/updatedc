@@ -4,8 +4,15 @@
 use crate::*;
 
 pub(crate) fn garbage_collect(opts: &Options, store: &Store) {
-    let Installed::Present(installed) = store.installed() else {
-        return;
+    let installed = match store.installed() {
+        Ok(Installed::Present(installed)) => installed,
+        Ok(Installed::Missing | Installed::Invalid) => return,
+        Err(error) => {
+            warn(&format!(
+                "garbage collection skipped because installed state could not be read: {error}"
+            ));
+            return;
+        }
     };
     let mut releases = vec![installed.release.clone()];
     let mut providers = Vec::new();

@@ -70,7 +70,7 @@ pub(crate) async fn ensure_installed(
     store: &mut Store,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some(tx) = store.install_journal()? {
-        let installed = match store.installed() {
+        let installed = match store.installed()? {
             updated::state::Installed::Present(state) => Some(state),
             _ => None,
         };
@@ -97,7 +97,7 @@ pub(crate) async fn ensure_installed(
     }
 
     match (
-        store.installed(),
+        store.installed()?,
         updated::state::read_enrollment(&opts.paths.installed),
     ) {
         (updated::state::Installed::Missing, updated::state::EnrollmentState::Missing) => {

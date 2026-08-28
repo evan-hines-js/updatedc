@@ -676,7 +676,7 @@ mod tests {
             agent_id: updated_contracts::identity::ResourceName::new("agent-a").unwrap(),
             routing_base_url: "https://updates.example/".into(),
             assignment: "assignments/agents/agent-a.json".into(),
-            install_root: "/var/lib/app".into(),
+            install_root: updated_contracts::assignment::testing::runtime().install_root,
             routing_root: "{}".into(),
         })
         .unwrap()
@@ -792,7 +792,7 @@ mod tests {
             agent_id: updated_contracts::identity::ResourceName::new(agent_id).unwrap(),
             routing_base_url: "https://updates.example/".into(),
             assignment: format!("assignments/agents/{agent_id}.json"),
-            install_root: "/var/lib/app".into(),
+            install_root: updated_contracts::assignment::testing::runtime().install_root,
             routing_root: format!("{{\"marker\":\"{marker}\"}}"),
         }
     }

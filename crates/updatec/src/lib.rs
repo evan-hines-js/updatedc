@@ -1898,13 +1898,13 @@ mod tests {
             repository,
             storage,
             timeouts,
-            install_root: _,
+            install_root,
             inputs: _,
         } = updated_contracts::assignment::testing::runtime();
         RuntimeSpec {
             product,
             channel,
-            install_root: "/opt/app".into(),
+            install_root: install_root.to_string_lossy().into_owned(),
             repository,
             storage,
             timeouts,

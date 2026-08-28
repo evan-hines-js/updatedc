@@ -47,7 +47,7 @@ pub(crate) async fn repair_committed_bundle(
         Ok(repo) => return Ok(Repair::FromAssignment(Box::new(repo))),
         Err(error) => error,
     };
-    let Installed::Present(installed) = store.installed() else {
+    let Installed::Present(installed) = store.installed()? else {
         return Err(assignment_error);
     };
     let Some(pending) = &installed.pending else {
@@ -100,7 +100,7 @@ pub(crate) async fn repair_from_assignment(
     let repo = TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
         .await
         .map_err(|error| format!("loading the signed repair assignment: {error}"))?;
-    let Installed::Present(installed) = store.installed() else {
+    let Installed::Present(installed) = store.installed()? else {
         return Err("repair requires a valid committed application record".into());
     };
     // A repair re-acquires the release this node is ALREADY committed to, so it must lift the

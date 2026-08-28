@@ -577,7 +577,7 @@ pub(crate) mod lease_tests {
             agent_id: updated_contracts::identity::ResourceName::new("web-01").unwrap(),
             routing_base_url: "https://control/".into(),
             assignment: "a/agents/web-01.json".into(),
-            install_root: "/var/lib/app".into(),
+            install_root: updated_contracts::assignment::testing::runtime().install_root,
             routing_root: "{}".into(),
         };
         let bytes = bundle.to_bounded_json().unwrap();

@@ -402,7 +402,7 @@ kubectl -n updated-system create secret generic routing-probe-tls \
 
 docker build -f crates/updatec/Dockerfile.e2e -t updatec-e2e:kind .
 kind load docker-image --name "$NAME" updatec-e2e:kind
-cat <<'YAML' | kubectl apply -f -
+cat <<YAML | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: release-repository, namespace: updated-system}
@@ -424,6 +424,7 @@ spec:
         - name: release-server
           image: updatec-e2e:kind
           command: [/usr/local/bin/release-server]
+          env: [{name: UPDATEC_FUZZ_ROUNDS, value: "$FUZZ_ROUNDS"}]
           ports: [{name: https, containerPort: 8080}]
           volumeMounts:
             - {name: repository, mountPath: /data}
@@ -483,7 +484,7 @@ if ! kubectl -n updated-system exec deployment/release-server -c release-server 
   kubectl -n updated-system logs deployment/release-server -c release-server --tail=100 >&2 || true
   exit 1
 fi
-echo "release repository published versions 1.0.0 through 20.0.0"
+echo "release repository published versions 1.0.0 through $(publish_fuzz_max_major "$FUZZ_ROUNDS").0.0"
 kubectl -n updated-system exec deployment/release-server -c release-server -- \
   cat /data/repository/metadata/root.json >"$WORK/release-root.json"
 PLATFORM="$(kubectl -n updated-system exec deployment/release-server -c release-server -- \
@@ -1629,10 +1630,9 @@ replace_group_deployment() {
 fuzz_state=${UPDATEC_FUZZ_SEED:-20260718}
 echo "starting $FUZZ_ROUNDS fleet-fuzz generations (seed $fuzz_state)"
 for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
-  first=$((4 + (round - 1) * 3))
-  edge_version="${first}.0.0"
-  batch_version="$((first + 1)).0.0"
-  default_version="$((first + 2)).0.0"
+  edge_version="$(publish_fuzz_generation_version "$round" 0)"
+  batch_version="$(publish_fuzz_generation_version "$round" 1)"
+  default_version="$(publish_fuzz_generation_version "$round" 2)"
   edge_sha="$(app_sha "$edge_version")"
   batch_sha="$(app_sha "$batch_version")"
   default_sha="$(app_sha "$default_version")"
@@ -1726,10 +1726,10 @@ done
 # an unlaunchable newest artifact, prove every node rolls back to its predecessor, then let
 # the control plane choose a valid recovery. All three routes are changed so this
 # also exercises simultaneous independent rejection state across the 2/2/1 fleet.
-echo "fleet fuzz fault: assigning intentionally unlaunchable 18.0.0"
-corrupt_sha="$(app_sha 18.0.0)"
+echo "fleet fuzz fault: assigning intentionally unlaunchable $PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION"
+corrupt_sha="$(app_sha "$PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION")"
 for role in edge batch default; do
-  replace_group_deployment "$role" 18.0.0 "$corrupt_sha"
+  replace_group_deployment "$role" "$PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION" "$corrupt_sha"
 done
 # Wait for the rejection itself rather than sampling the logs once after a fixed pause: nodes are
 # admitted to a deployment in the control plane's own order, so "has this node rejected these bytes
@@ -1749,9 +1749,9 @@ done
 # the container.
 rejected_corrupt() {
   kubectl_log_contains "agent-$1" \
-      'recovery: rejected 18.0.0 after failed activation' -c agent \
+      "recovery: rejected $PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION after failed activation" -c agent \
     || kubectl_log_contains "agent-$1" \
-      'recovery: rejected 18.0.0 after failed activation' -c agent --previous
+      "recovery: rejected $PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION after failed activation" -c agent --previous
 }
 
 # Read the roles back out of the API rather than from the mutation loop's plan, so the oracle for
@@ -1785,14 +1785,14 @@ for role in edge batch default; do
   }
   poll_until "$NODE_SETTLE_TIMEOUT" a_member_rejected_the_corrupt_release || true
   [[ -n "$rejector" ]] || {
-    echo "FAIL: no $role node recorded rejection of corrupt 18.0.0 (members: ${members[*]})" >&2
+    echo "FAIL: no $role node recorded rejection of corrupt $PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION (members: ${members[*]})" >&2
     for index in "${members[@]}"; do
       kubectl -n updated-system logs "agent-$index" -c agent --tail=100 >&2 || true
     done
     exit 1
   }
   rejector_of[rejector]=1
-  echo "$role: agent-$rejector rejected corrupt 18.0.0"
+  echo "$role: agent-$rejector rejected corrupt $PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION"
 done
 verify_fleet verify-fuzz-rollback "$expected"
 # Now that the whole fleet has settled back on its predecessors, no OTHER node may hold a record of
@@ -1802,14 +1802,14 @@ for index in 0 1 2 3 4; do
     continue
   fi
   if rejected_corrupt "$index"; then
-    echo "FAIL: corrupt 18.0.0 also reached agent-$index (${role_of[index]}); the halt did not \
+    echo "FAIL: corrupt $PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION also reached agent-$index (${role_of[index]}); the halt did not \
 contain it to the node that proved the regression" >&2
     exit 1
   fi
 done
-echo "one node per group rejected 18.0.0, the halt kept it from the rest, and every node retained its exact predecessor"
+echo "one node per group rejected $PUBLISH_FUZZ_PRIMARY_CORRUPT_VERSION, the halt kept it from the rest, and every node retained its exact predecessor"
 
-for recovery_version in 19.0.0 20.0.0; do
+for recovery_version in $(publish_fuzz_recovery_versions); do
   recovery_sha="$(app_sha "$recovery_version")"
   for role in edge batch default; do
     replace_group_deployment "$role" "$recovery_version" "$recovery_sha"

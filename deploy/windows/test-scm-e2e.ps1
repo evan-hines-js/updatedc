@@ -83,7 +83,7 @@ function Wait-Operation(
     [string]$operation,
     [string]$reason = '',
     [int]$after = 0,
-    [int]$seconds = 60
+    [int]$seconds = 15
 ) {
     $deadline = (Get-Date).AddSeconds($seconds)
     do {
@@ -102,7 +102,10 @@ function Wait-Operation(
 # hook result has passed the boot gate and installed.json has been atomically promoted to a
 # confirmed head. Waiting on that state is the single completion barrier before exercising SCM
 # stop/restart; otherwise the test can kill the agent between the healthcheck receipt and commit.
-function Wait-ConfirmedInstall([string]$version, [int]$seconds = 60) {
+# This fixture has a four-second health grace and an immediate health hook. The agent enforces that
+# grace on the hook process itself. The outer 45-second deadline also covers the separately bounded
+# initial apply plus service startup before producing diagnostics for a broken first boot.
+function Wait-ConfirmedInstall([string]$version, [int]$seconds = 45) {
     $path = Join-Path $install 'state\installed.json'
     $deadline = (Get-Date).AddSeconds($seconds)
     $lastJson = '<missing>'
@@ -153,9 +156,17 @@ function Wait-ConfirmedInstall([string]$version, [int]$seconds = 60) {
     $tree = @(Get-TreeProcessDetails)
     $operations = @(Read-Operations)
     $launcherLog = Join-Path $launcherState 'launcher.log'
+    $reconciliationPath = Join-Path $install 'state\reconciliation.json'
+    $lastReconciliation = if (Test-Path -LiteralPath $reconciliationPath) {
+        try { [IO.File]::ReadAllText($reconciliationPath) }
+        catch { "<unreadable: $($_.Exception.Message)>" }
+    } else {
+        '<missing>'
+    }
     throw "release $version never reached a confirmed installed state; service=[$serviceState]; " +
         "process-tree=[$($tree -join ' | ')]; operations=[$($operations -join ' | ')]; " +
         "installed.json=[$lastJson]; last-read-error=[$lastReadError]; " +
+        "reconciliation.json=[$lastReconciliation]; " +
         "launcher-log=[$launcherLog]"
 }
 
@@ -168,11 +179,31 @@ function Get-TreeProcessIds() {
 }
 
 function Get-TreeProcessDetails() {
-    $names = @('updated-launcher.exe', 'updated-agent.exe', 'selfupdate-service.exe')
-    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $names -contains $_.Name } |
-        Sort-Object Name, ProcessId |
-        ForEach-Object { "$($_.Name):pid=$($_.ProcessId),parent=$($_.ParentProcessId)" })
+    # Every process under the service host, not only the three binaries this test owns: a
+    # reconciler hook (powershell.exe) that never returned is the interesting one, and its threads'
+    # wait reasons say whether it is suspended, blocked on the console, or still starting up.
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $tree = @()
+    $frontier = @($all | Where-Object { $_.Name -eq 'selfupdate-service.exe' } | ForEach-Object { $_.ProcessId })
+    while ($frontier.Count -gt 0) {
+        $tree += $frontier
+        $frontier = @($all |
+            Where-Object { $frontier -contains $_.ParentProcessId -and $tree -notcontains $_.ProcessId } |
+            ForEach-Object { $_.ProcessId })
+    }
+    return @($all | Where-Object { $tree -contains $_.ProcessId } | Sort-Object CreationDate | ForEach-Object {
+        $threads = '<gone>'
+        $live = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+        if ($live) {
+            $threads = @($live.Threads | ForEach-Object {
+                try { "$($_.ThreadState)/$($_.WaitReason)" } catch { "$($_.ThreadState)" }
+            }) -join ','
+        }
+        $command = if ($_.CommandLine) { $_.CommandLine } else { '' }
+        if ($command.Length -gt 200) { $command = $command.Substring(0, 200) + '...' }
+        $started = if ($_.CreationDate) { $_.CreationDate.ToString('HH:mm:ss') } else { '?' }
+        "$($_.Name):pid=$($_.ProcessId),parent=$($_.ParentProcessId),started=$started,threads=[$threads],cmd=[$command]"
+    })
 }
 
 function Wait-ProcessExit([int[]]$ids, [int]$seconds = 30) {
