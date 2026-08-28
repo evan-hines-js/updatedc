@@ -696,9 +696,18 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if gate_passed {
         if let updated::state::Installed::Present(mut state) = store.installed() {
             if state.confirm_provisional() {
-                if let Err(error) = store.commit_installed(&state) {
-                    warn(&format!("confirming the proven head failed: {error}"));
-                }
+                // Confirmation is a durable state transition, not best-effort bookkeeping. If an
+                // antivirus/indexer briefly holds `installed.json` on Windows, retry the same
+                // idempotent commit through the one node-local-transient policy. Any permanent
+                // failure exits for launcher-driven recovery instead of continuing forever with a
+                // healthy release still marked provisional and therefore rejectable on restart.
+                recover_through_transients(
+                    "confirming the health-proven release",
+                    &mut launcher,
+                    &shutdown,
+                    || store.commit_installed(&state),
+                )
+                .await?;
             }
         }
     }

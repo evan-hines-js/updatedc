@@ -19,7 +19,10 @@ param()
 $ErrorActionPreference = 'Stop'
 $service = 'SelfUpdateAgent'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$work = Join-Path $root 'target\scm-e2e'
+# Runtime state must never live below Cargo's cached target directory. Restoring that directory
+# can otherwise turn this cold-install test into a restart while still leaving the binary build
+# cache perfectly valid. A unique OS-temporary root makes "empty node" true by construction.
+$work = Join-Path ([IO.Path]::GetTempPath()) "updated-scm-e2e-$([Guid]::NewGuid().ToString('N'))"
 $routingRepo = Join-Path $work 'routing-repo'
 $routingKeys = Join-Path $work 'routing-keys'
 $releaseRepo = Join-Path $work 'release-repo'
@@ -51,6 +54,15 @@ function Wait-ServiceState([string]$wanted, [int]$seconds = 30) {
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $deadline)
     throw "service did not reach $wanted within ${seconds}s"
+}
+
+function Wait-ServiceDeleted([int]$seconds = 30) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do {
+        if (-not (Get-Service -Name $service -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+    throw "service was still registered ${seconds}s after deletion"
 }
 
 # The reconciler's recorded history: one immutable file per invocation, containing
@@ -91,7 +103,21 @@ function Wait-ConfirmedInstall([string]$version, [int]$seconds = 60) {
     do {
         if (Test-Path -LiteralPath $path) {
             try {
-                $state = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+                # The agent promotes this record with atomic replacement. Open with delete sharing
+                # so observing the barrier can never prevent the very transition being observed.
+                $stream = [IO.File]::Open(
+                    $path,
+                    [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read,
+                    ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+                )
+                try {
+                    $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true, 4096, $true)
+                    try { $json = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                } finally {
+                    $stream.Dispose()
+                }
+                $state = $json | ConvertFrom-Json
                 if ($state.release.version -eq $version -and
                     $state.confirmed -eq $true -and
                     $null -eq $state.pending) {
@@ -135,10 +161,17 @@ function Read-DesiredAgent() {
 }
 
 try {
-    & sc.exe stop $service 2>$null | Out-Null
-    & sc.exe delete $service 2>$null | Out-Null
-    Start-Sleep -Milliseconds 500
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    $existingService = Get-Service -Name $service -ErrorAction SilentlyContinue
+    if ($existingService) {
+        if ($existingService.Status.ToString() -ne 'Stopped') {
+            & sc.exe stop $service 2>$null | Out-Null
+            Wait-ServiceState 'Stopped'
+        }
+        & sc.exe delete $service 2>$null | Out-Null
+        if ($LASTEXITCODE) { throw "deleting the previous service failed with exit code $LASTEXITCODE" }
+        Wait-ServiceDeleted
+    }
+    New-Item -ItemType Directory -Force $work | Out-Null
     New-Item -ItemType Directory -Force $launcherState | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'bin') | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'config') | Out-Null

@@ -915,12 +915,13 @@ mod tests {
     }
 
     /// Backdate an entry's mtime without pulling in a dependency: reopening and rewriting
-    /// would only refresh it, so set it directly through `File::set_times`. A directory cannot be
-    /// opened for writing, so it is backdated through a read handle.
+    /// would only refresh it, so set it directly through `File::set_times`. Windows requires a
+    /// directory handle with `FILE_WRITE_ATTRIBUTES` and `FILE_FLAG_BACKUP_SEMANTICS`; a normal
+    /// read handle can inspect a directory but cannot change its timestamps.
     fn filetime_set(path: &Path, when: SystemTime) {
         let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
         if path.is_dir() {
-            File::open(path)
+            directory_handle_for_timestamp(path)
                 .and_then(|handle| handle.set_times(times))
                 .expect("backdate staged directory");
             return;
@@ -931,6 +932,24 @@ mod tests {
             .unwrap()
             .set_times(times)
             .unwrap();
+    }
+
+    #[cfg(not(windows))]
+    fn directory_handle_for_timestamp(path: &Path) -> io::Result<File> {
+        File::open(path)
+    }
+
+    #[cfg(windows)]
+    fn directory_handle_for_timestamp(path: &Path) -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        };
+
+        File::options()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
     }
 
     #[test]

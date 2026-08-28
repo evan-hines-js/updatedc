@@ -132,31 +132,65 @@ pub(crate) fn is_node_local_transient(error: &io::Error) -> bool {
     ) {
         return true;
     }
-    // A hardware/transport read or write error has no `ErrorKind` of its own — it arrives
-    // `Uncategorized`, which is not matchable — so it is recognised by its raw code. A post-commit
-    // fsync failure arrives wrapped by `foundation::durable` ("the change landed but is not proved
-    // durable"), and an `io::Error` carrying that payload cannot ALSO carry a raw code — `Os` and
-    // `Custom` are alternative representations — so for those the code lives one `source` hop down,
-    // which `foundation::durable` documents and pins with a regression test.
+    // Some OS faults have no portable `ErrorKind`, so recognise their raw codes. A post-commit
+    // durability failure may wrap the original `io::Error`; inspect the complete source chain so
+    // the retry decision is identical before and after the durable-write boundary adds context.
     #[cfg(unix)]
     {
-        if error.raw_os_error() == Some(libc::EIO) {
-            return true;
-        }
-        let mut source = std::error::Error::source(error);
-        while let Some(current) = source {
-            if current
-                .downcast_ref::<io::Error>()
-                .is_some_and(|cause| cause.raw_os_error() == Some(libc::EIO))
-            {
-                return true;
-            }
-            source = current.source();
-        }
-        false
+        has_raw_os_error(error, &[libc::EIO])
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+        has_raw_os_error(
+            error,
+            &[ERROR_SHARING_VIOLATION as i32, ERROR_LOCK_VIOLATION as i32],
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn has_raw_os_error(error: &io::Error, codes: &[i32]) -> bool {
+    if error
+        .raw_os_error()
+        .is_some_and(|code| codes.contains(&code))
+    {
+        return true;
+    }
+    let mut current = error
+        .get_ref()
+        .map(|cause| cause as &(dyn std::error::Error + 'static));
+    while let Some(cause) = current {
+        if cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .is_some_and(|code| codes.contains(&code))
+        {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    #[test]
+    fn file_sharing_faults_are_node_local_even_when_durability_wraps_them() {
+        for code in [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION] {
+            let direct = io::Error::from_raw_os_error(code as i32);
+            assert!(is_node_local_transient(&direct));
+
+            let wrapped = io::Error::other(io::Error::from_raw_os_error(code as i32));
+            assert!(is_node_local_transient(&wrapped));
+        }
     }
 }
