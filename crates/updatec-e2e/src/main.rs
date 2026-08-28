@@ -22,7 +22,14 @@ mod haproxy;
 mod labeler;
 mod layout;
 mod probe;
+#[cfg(unix)]
 mod soak;
+#[cfg(not(unix))]
+mod soak {
+    pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
+        Err("the resident soak controller requires a Unix host".into())
+    }
+}
 pub(crate) use chaos::*;
 pub(crate) use cluster::*;
 pub(crate) use controls::*;

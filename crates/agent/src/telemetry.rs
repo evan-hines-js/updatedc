@@ -645,11 +645,14 @@ mod tests {
                 let _ = stream.write_all(&capability);
             }
         });
-        let object_client = reqwest::Client::builder()
-            .add_root_certificate(reqwest::Certificate::from_der(ca.der()).unwrap())
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        // Exercise the production anonymous-object TLS constructor. Building a second reqwest
+        // policy here used reqwest's implicit rustls provider; under the all-features Windows build
+        // that drifted from the explicitly selected aws-lc/FIPS provider used by the test server
+        // and every real agent client, so the TLS handshake never reached the endpoint.
+        let ca_dir = tempfile::tempdir().unwrap();
+        let ca_path = ca_dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        let object_client = updated::tls::anonymous_object_client_with_ca(&ca_path).unwrap();
         (control_base, object_client, control_requests, object_writes)
     }
 

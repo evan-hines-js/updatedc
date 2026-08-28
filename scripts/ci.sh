@@ -137,8 +137,7 @@ section() {
 }
 
 run_rust() {
-  local generated_crds e2e_rc killfuzz_pid="" killfuzz_rc=0
-  generated_crds="$WORK/generated-crds.yaml"
+  local e2e_rc killfuzz_pid="" killfuzz_rc=0
 
   section "Installer guardrails"
   case "$(uname -s)" in
@@ -174,25 +173,7 @@ run_rust() {
       ;;
   esac
 
-  section "Rust formatting"
-  cargo fmt --all --check
-
-  case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*)
-      section "Generated CRDs"
-      echo "SKIP: CRD byte comparison runs on Unix to avoid checkout newline conversion"
-      ;;
-    *)
-      section "Generated CRDs"
-      cargo run -q -p updatec --example crdgen >"$generated_crds"
-      if ! diff -u deploy/charts/updatec/crds/updated.dev_crds.yaml "$generated_crds"; then
-        echo "FAIL: deploy/charts/updatec/crds/updated.dev_crds.yaml is stale" >&2
-        echo "regenerate it with:" >&2
-        echo "  cargo run -q -p updatec --example crdgen > deploy/charts/updatec/crds/updated.dev_crds.yaml" >&2
-        return 1
-      fi
-      ;;
-  esac
+  ./scripts/check-source.sh
 
   section "Rust tests"
   cargo test --workspace --all-targets --all-features

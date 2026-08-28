@@ -161,7 +161,7 @@ impl ReleaseTarget<'_> {
 }
 
 impl InvocationFailure {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn kind(&self) -> io::ErrorKind {
         match self {
@@ -1443,6 +1443,7 @@ mod tests {
     use super::*;
     use crate::test_support::{deployment_rejection, digest, release};
 
+    #[cfg(unix)]
     fn test_invocation_data() -> InvocationData {
         let state_dir = std::env::temp_dir().join(format!(
             "updated-agent-invocation-test-{}-{}",

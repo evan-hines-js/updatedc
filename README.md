@@ -342,6 +342,16 @@ same proven-bad bytes eligible again.
 
 ## Try it
 
+Install the repository-owned pre-commit hook once per clone:
+
+```sh
+./scripts/install-git-hooks.sh
+```
+
+The hook rejects staged whitespace errors, unformatted Rust, and stale generated CRDs. It checks
+the exact staged tree (so partially staged files cannot hide a failure) and calls the same
+`scripts/check-source.sh` entrypoint as CI, so local and remote source checks cannot drift.
+
 Run every CI check supported by the current host through the same entrypoint GitHub Actions uses:
 
 ```sh

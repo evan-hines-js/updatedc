@@ -54,16 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = std::env::var(updatec::env::LISTEN).unwrap_or_else(|_| "0.0.0.0:8080".into());
         let health_addr =
             std::env::var(updatec::env::HEALTH_LISTEN).unwrap_or_else(|_| "0.0.0.0:8081".into());
-        let storage = loop {
-            match updatec::runtime::repository_store(client.clone(), &namespace, &repository).await
-            {
-                Ok(configured) => break configured,
-                Err(error) => {
-                    tracing::warn!(%error, "gateway storage is not configured yet; retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            }
-        };
         let enrollment = updatec::gateway::EnrollmentContext {
             client: client.clone(),
             namespace: namespace.clone(),
@@ -107,7 +97,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data: addr,
                 health: health_addr,
             },
-            storage,
             enrollment,
             issuing_ca,
             tls,

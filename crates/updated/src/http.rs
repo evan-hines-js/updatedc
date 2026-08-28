@@ -53,21 +53,26 @@ fn invalid_endpoint(what: &str, transport: EndpointTransport) -> io::Error {
     )
 }
 
-/// Build the one client policy for operator-configured outbound endpoints. Redirects are refused
-/// so a signed body, bearer header, or trusted health origin never escapes from the configured
-/// authority to another host. Every caller must also name where its total deadline lives.
+/// Build the one client policy for operator-configured outbound endpoints. Redirects and ambient
+/// process proxies are refused so a signed body, bearer header, mTLS identity, or exact-object URL
+/// never escapes from the configured authority to another host. Every caller must also name where
+/// its total deadline lives.
 pub fn outbound_client(deadline: OutboundDeadline) -> io::Result<reqwest::Client> {
     finish_outbound_client(reqwest::Client::builder(), deadline)
 }
 
-/// Apply the shared redirect/deadline invariant to a caller-supplied builder (for example, one
-/// carrying an explicit rustls mTLS config). This is the only place an outbound reqwest client is
-/// finalized, so specialized TLS cannot drift from the ordinary webhook/health policy.
+/// Apply the shared authority/redirect/deadline invariant to a caller-supplied builder (for
+/// example, one carrying an explicit rustls mTLS config). This is the only place an outbound
+/// reqwest client is finalized, so specialized TLS cannot drift from the ordinary webhook/health
+/// policy. Proxying is configuration by inherited process state and can terminate TLS away from
+/// the URL's authority; this system has no proxy trust/configuration surface, so it fails closed.
 pub fn finish_outbound_client(
     mut builder: reqwest::ClientBuilder,
     deadline: OutboundDeadline,
 ) -> io::Result<reqwest::Client> {
-    builder = builder.redirect(reqwest::redirect::Policy::none());
+    builder = builder
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
     if let OutboundDeadline::Total(timeout) = deadline {
         builder = builder.timeout(timeout);
     }

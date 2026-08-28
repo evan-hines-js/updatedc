@@ -220,16 +220,14 @@ mod tests {
 
     #[test]
     fn local_repositories_refuse_inputs_they_cannot_fetch() {
+        let local = crate::test_support::local_repository_base();
         let input = InputSelection {
             generation: "a".repeat(64),
             object_sha256: "b".repeat(64),
             files: ["host".to_string()].into_iter().collect(),
         };
-        assert!(RuntimeDataManager::new(&routing("/srv/repository/"), &input).is_err());
-        assert!(
-            RuntimeDataManager::new(&routing("/srv/repository/"), &InputSelection::default())
-                .is_ok()
-        );
+        assert!(RuntimeDataManager::new(&routing(&local), &input).is_err());
+        assert!(RuntimeDataManager::new(&routing(&local), &InputSelection::default()).is_ok());
     }
 
     #[test]
@@ -296,9 +294,11 @@ mod tests {
             .unwrap()
             .selection()
             .unwrap();
-        let mut manager =
-            RuntimeDataManager::new(&routing("/srv/repository/"), &InputSelection::default())
-                .unwrap();
+        let mut manager = RuntimeDataManager::new(
+            &routing(&crate::test_support::local_repository_base()),
+            &InputSelection::default(),
+        )
+        .unwrap();
         manager.current = snapshot.clone();
         manager.current_selection = selection.clone();
 

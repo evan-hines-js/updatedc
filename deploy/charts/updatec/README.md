@@ -182,8 +182,10 @@ require a *shared* (ReadWriteMany) volume rather than one volume each.
 
 ## Notes
 
-- The gateway does not open its health listener until its `UpdateRepository` exists. On a fresh
-  install it is usually waiting for that resource, not failing. `helm --wait` will time out on it.
+- The gateway opens `/livez` immediately but keeps `/readyz` closed until its `UpdateRepository`
+  exists and the authenticated data listener is ready. On a fresh install an unready gateway is
+  usually waiting for that resource, not failing. `helm --wait` will time out if the repository is
+  intentionally created only after the Helm command returns.
 - The controller uses `Recreate` while its volume is exclusive (the default RWO), because a rolling
   update would deadlock waiting for the old pod to release it. Declaring ReadWriteMany
   `accessModes` switches it to `RollingUpdate` automatically.

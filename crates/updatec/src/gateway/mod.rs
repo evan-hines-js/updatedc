@@ -10,8 +10,9 @@
 //!   `/v1/node/inputs/{assignment_sha256}` (the assignment-bound file snapshot),
 //!   `/v1/node/outputs` and `/v1/node/report` (exact S3 write capabilities), and
 //!   `/healthz`.
-//! * **health** (plaintext): `/healthz` and `/`, for orchestrator probes that cannot present a
-//!   cert. Nothing else.
+//! * **health** (plaintext): `/livez` and `/readyz`, for orchestrator probes that cannot present a
+//!   cert. Liveness opens before repository configuration; readiness opens with the data plane.
+//!   Nothing else.
 //!
 //! Each listener is a different `Router`, so a route it must not expose simply is not mounted —
 //! which is exactly what makes the lists above an inventory of the exposed surface rather than a
@@ -80,7 +81,7 @@ const ENROLLMENT_LOCK_RETRY: Duration = Duration::from_millis(50);
 /// The health listener has no control plane: one route, a two-byte body, no store I/O, no
 /// authentication. Sharing the data listener's larger bound made this port the cheapest way to
 /// take the gateway down — [`HEALTH_CONNECTIONS`] permits, held by anyone who can reach the port,
-/// each for up to half an hour (pipeline a few MB of `GET /healthz` and stop reading: the response
+/// each for up to half an hour (pipeline a few MB of `GET /livez` and stop reading: the response
 /// write blocks with no header-read timer armed). `serve_plain` then blocks in `acquire_owned`,
 /// probes stop being answered, and the chart points BOTH the readiness and liveness probes at this
 /// port — so the kubelet marks the gateway NotReady and then kills it, taking the enrollment and

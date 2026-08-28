@@ -103,7 +103,7 @@ pub(crate) async fn bring_up_cluster() -> Result<(), Box<dyn std::error::Error>>
     }
     println!("[e2e] building the operator environment; this takes a few minutes");
     let status = Command::new(root.join("scripts/kind-updatec-e2e.sh"))
-        .args(["--fuzz-rounds", "0"])
+        .args(["--fuzz-rounds", "0", "--preserve-repository"])
         .env("UPDATEC_KIND_CLUSTER", &cluster)
         .env("UPDATEC_KEEP_KIND_CLUSTER", "1")
         .status()?;
@@ -122,15 +122,6 @@ pub(crate) async fn bring_up_cluster() -> Result<(), Box<dyn std::error::Error>>
         "[e2e] node pod capacity: {pod_capacity} ({NODE_COUNT} managed services, {} reserved for system workloads)",
         REQUIRED_POD_CAPACITY - NODE_COUNT
     );
-    println!("[e2e] removing the base kind run's intentionally ambiguous group");
-    run(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "delete",
-        "updategroup",
-        "overlapping-edge",
-        "--ignore-not-found",
-    ]))?;
     println!("[e2e] scaling the managed fleet to {TOTAL_AGENTS} agents");
     run(kubectl().args([
         "-n",
@@ -1158,12 +1149,12 @@ fn apply_resources(
     // Per-set UpdateGroupSet (default maxConcurrent = members-1): never both groups of a
     // set roll at once, so every set always keeps a group serving.
     for set in 0..SET_COUNT {
-        items.push(serde_json::json!({
-            "apiVersion":"updated.dev/v1alpha1",
-            "kind":"UpdateGroupSet",
-            "metadata":{"name":set_name(set),"namespace":NAMESPACE},
-            "spec":{"selector":{"matchLabels":{SET_LABEL:set_name(set)}}}
-        }));
+        let name = set_name(set);
+        items.push(serde_json::to_value(fixture::group_set_resource(
+            &name,
+            std::collections::BTreeMap::from([(SET_LABEL.into(), name.clone())]),
+            None,
+        ))?);
     }
     // One fleet-wide UpdateGroupSet over every managed group, on top of the per-set caps:
     // the control plane keeps at most FLEET_CONCURRENCY groups rolling at once, and —
@@ -1172,15 +1163,11 @@ fn apply_resources(
     // many DISTINCT sets, each set keeping its other group up: fleet-wide pacing without
     // ever draining a set. As one group settles the next (in set order) starts, so the
     // pipeline stays full without pausing set-by-set.
-    items.push(serde_json::json!({
-        "apiVersion":"updated.dev/v1alpha1",
-        "kind":"UpdateGroupSet",
-        "metadata":{"name":FLEET_SET,"namespace":NAMESPACE},
-        "spec":{
-            "selector":{"matchLabels":{FLEET_LABEL:FLEET_VALUE}},
-            "maxConcurrent":FLEET_CONCURRENCY
-        }
-    }));
+    items.push(serde_json::to_value(fixture::group_set_resource(
+        FLEET_SET,
+        std::collections::BTreeMap::from([(FLEET_LABEL.into(), FLEET_VALUE.into())]),
+        Some(FLEET_CONCURRENCY),
+    ))?);
     // The external slice: same app + fast cadence as a cohort, but with NO fleet/set labels —
     // deliberately outside the per-set Services and the fleet throttle. It stands in for a fleet
     // that lives outside Kubernetes; the reconciler, not a selector, gives it endpoints.

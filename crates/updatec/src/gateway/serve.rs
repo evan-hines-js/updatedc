@@ -5,28 +5,29 @@
 use super::*;
 use rustls::pki_types::pem::PemObject;
 
-/// The plaintext health router: `/healthz` (and `/`) → 200, everything else 404. It serves no
-/// repository content, so exposing it without mTLS reveals nothing — it exists only for the
-/// orchestrator's probes, which cannot present a client certificate.
-pub(crate) fn health_router() -> Router {
+/// Repository creation and Secret rotation run on different clocks. The former is a startup
+/// dependency that the operator may satisfy a moment after the pod starts; the latter is steady
+/// maintenance where a minute avoids needless API and object-store churn. Keeping these bounds
+/// distinct prevents a normal creation race from holding enrollment offline for a full minute.
+const INITIAL_REPOSITORY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The plaintext process-health router. Liveness says the process can still make progress;
+/// readiness says the authenticated data listener has a configured repository behind it. Keeping
+/// those as different facts lets the gateway wait for its operator-created `UpdateRepository`
+/// without either receiving traffic early or being killed in a configuration crash loop.
+pub(crate) fn health_router(readiness: Arc<std::sync::atomic::AtomicBool>) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
-        .route("/", get(healthz))
+        .route("/livez", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(readiness)
 }
 
-/// Run the gateway: the mTLS data listener (repository objects, enrollment, telemetry) and the
-/// plaintext health listener, until one of them fails.
-///
-/// `store`/`prefix` are the INITIAL destination and are the caller's to supply even though
-/// [`reload_destination`] re-derives the same pair from `enrollment` every
-/// [`MATERIAL_RELOAD_INTERVAL`]. The two are not the same rule: a gateway with no store cannot
-/// serve, so the first build must block until it succeeds, while [`rebuild_destination`] is
-/// deliberately fail-safe and keeps the live store on a transient apiserver blip. Building the
-/// first one here would put a retry-until-ready loop inside a function whose contract is "already
-/// listening".
+/// Run the gateway: liveness starts immediately, readiness remains closed until the initial object
+/// destination exists, and the mTLS data listener then serves for the process lifetime. Initial
+/// destination acquisition and later reloads live in this one lifecycle so Kubernetes cannot kill
+/// a healthy process merely because the operator has not created its repository yet.
 pub async fn serve(
     addresses: GatewayAddresses,
-    storage: crate::runtime::RepositoryStore,
     enrollment: EnrollmentContext,
     issuing_ca: IssuingCaPaths,
     tls: GatewayTls,
@@ -37,6 +38,30 @@ pub async fn serve(
             "the enrollment client Common Name must not be empty",
         ));
     }
+    let health_listener = TcpListener::bind(&addresses.health).await?;
+    let readiness = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn(serve_plain(
+        health_listener,
+        health_router(readiness.clone()),
+        Arc::new(Semaphore::new(HEALTH_CONNECTIONS)),
+    ));
+
+    let storage = loop {
+        match crate::runtime::repository_store(
+            enrollment.client.clone(),
+            &enrollment.namespace,
+            &enrollment.repository,
+        )
+        .await
+        {
+            Ok(configured) => break configured,
+            Err(error) => {
+                tracing::warn!(%error, "gateway storage is not configured yet; retrying");
+                tokio::time::sleep(INITIAL_REPOSITORY_RETRY_INTERVAL).await;
+            }
+        }
+    };
+
     // Both the listener identity and the issuing CA are cert-manager Secrets rotated in place.
     // Install them only as one verified snapshot: a cross-Secret skew keeps the previous coherent
     // generation instead of minting leaves the listener cannot authenticate.
@@ -53,7 +78,6 @@ pub async fn serve(
     ));
 
     let data_listener = TcpListener::bind(&addresses.data).await?;
-    let health_listener = TcpListener::bind(&addresses.health).await?;
     tracing::info!(
         data = %addresses.data, health = %addresses.health,
         "repository gateway listening (mTLS data + plaintext health)"
@@ -81,13 +105,9 @@ pub async fn serve(
         enrollment_client_cn: Arc::from(tls.enrollment_client_cn),
     });
 
-    // Health: plaintext, no TLS, its own small connection budget.
-    tokio::spawn(serve_plain(
-        health_listener,
-        health_router(),
-        Arc::new(Semaphore::new(HEALTH_CONNECTIONS)),
-    ));
-    // Data: mTLS, runs on this task so `serve` stays alive for the whole process.
+    // Data: mTLS, runs on this task so `serve` stays alive for the whole process. Publish readiness
+    // only after the listener, trust material, destination, and router all exist.
+    readiness.store(true, std::sync::atomic::Ordering::Release);
     serve_tls(
         data_listener,
         materials,
@@ -96,6 +116,7 @@ pub async fn serve(
         "data",
     )
     .await;
+    readiness.store(false, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -335,4 +356,14 @@ where
 
 pub(crate) async fn healthz() -> &'static str {
     "ok"
+}
+
+pub(crate) async fn readyz(
+    State(readiness): State<Arc<std::sync::atomic::AtomicBool>>,
+) -> StatusCode {
+    if readiness.load(std::sync::atomic::Ordering::Acquire) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }

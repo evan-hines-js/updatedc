@@ -29,7 +29,7 @@ $launcherState = Join-Path $work 'launcher-state'
 $install = Join-Path $work 'install'
 $bundle = Join-Path $work 'bundle-1.0.0'
 $providerSource = Join-Path $work 'reconciler-source'
-$receipt = Join-Path $work 'reconciler-operations.log'
+$receipts = Join-Path $work 'reconciler-operations'
 $config = Join-Path $work 'config.toml'
 $runtime = Join-Path $work 'runtime.json'
 $repoPort = 21980
@@ -53,17 +53,58 @@ function Wait-ServiceState([string]$wanted, [int]$seconds = 30) {
     throw "service did not reach $wanted within ${seconds}s"
 }
 
-# The reconciler's recorded history: one line per invocation, `operation<TAB>attempt-id<TAB>reason`.
-function Wait-Operation([string]$operation, [int]$seconds = 60) {
+# The reconciler's recorded history: one immutable file per invocation, containing
+# `operation<TAB>attempt-id<TAB>reason`. A shared append-only file makes the hook's write race the
+# harness's polling reads on Windows; publish a complete uniquely named receipt instead.
+function Read-Operations() {
+    if (-not (Test-Path $receipts)) { return @() }
+    return @(Get-ChildItem -LiteralPath $receipts -Filter '*.log' | Sort-Object Name |
+        ForEach-Object { [IO.File]::ReadAllText($_.FullName) })
+}
+
+function Wait-Operation(
+    [string]$operation,
+    [string]$reason = '',
+    [int]$after = 0,
+    [int]$seconds = 60
+) {
     $deadline = (Get-Date).AddSeconds($seconds)
     do {
-        if (Test-Path $receipt) {
-            $match = Get-Content $receipt | Where-Object { $_.StartsWith("$operation`t") }
-            if ($match) { return $match }
+        $match = Read-Operations | Select-Object -Skip $after | Where-Object {
+            $fields = $_ -split "`t"
+            $fields[0] -eq $operation -and (-not $reason -or $fields[2] -eq $reason)
+        } | Select-Object -Last 1
+        if ($match) { return $match }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+    $suffix = if ($reason) { " with reason '$reason'" } else { '' }
+    throw "the agent never invoked the reconciler's $operation operation$suffix"
+}
+
+# A hook receipt proves invocation, not completion. The agent only owns a release durably once the
+# hook result has passed the boot gate and installed.json has been atomically promoted to a
+# confirmed head. Waiting on that state is the single completion barrier before exercising SCM
+# stop/restart; otherwise the test can kill the agent between the healthcheck receipt and commit.
+function Wait-ConfirmedInstall([string]$version, [int]$seconds = 60) {
+    $path = Join-Path $install 'state\installed.json'
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do {
+        if (Test-Path -LiteralPath $path) {
+            try {
+                $state = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+                if ($state.release.version -eq $version -and
+                    $state.confirmed -eq $true -and
+                    $null -eq $state.pending) {
+                    return $state
+                }
+            } catch {
+                # The state writer uses atomic replacement. A sharing violation from an antivirus
+                # or indexer is transient and remains bounded by the same completion deadline.
+            }
         }
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $deadline)
-    throw "the agent never invoked the reconciler's $operation operation"
+    throw "release $version never reached a confirmed installed state"
 }
 
 function Get-TreeProcessIds() {
@@ -102,6 +143,7 @@ try {
     New-Item -ItemType Directory -Force (Join-Path $bundle 'bin') | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'config') | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $providerSource 'bin') | Out-Null
+    New-Item -ItemType Directory -Force $receipts | Out-Null
 
     Push-Location $root
     try {
@@ -134,7 +176,11 @@ function Value([string] `$name) {
 }
 if ((Value '--protocol') -ne '1') { exit 2 }
 `$line = "`$operation`t`$(Value '--attempt-id')`t`$(Value '--reason')`t`$(Value '--candidate-version')"
-Add-Content -LiteralPath '$receipt' -Value `$line
+`$token = "`$([DateTime]::UtcNow.Ticks)-`$([Guid]::NewGuid().ToString('N'))"
+`$pendingReceipt = Join-Path '$receipts' "`$token.tmp"
+`$completeReceipt = Join-Path '$receipts' "`$token.log"
+[IO.File]::WriteAllText(`$pendingReceipt, `$line, [Text.UTF8Encoding]::new(`$false))
+Move-Item -LiteralPath `$pendingReceipt -Destination `$completeReceipt
 if (`$operation -eq 'inspect') { Write-Output "candidate-version=`$(Value '--candidate-version')" }
 if (`$operation -eq 'apply' -or `$operation -eq 'rollback') {
     [IO.File]::WriteAllText(
@@ -179,14 +225,14 @@ exit 0
     $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $setTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
     $runtimeJson = @{
-        product = 'app'; channel = 'stable'; install_root = $install
-        repository = @{metadata_limit=1048576; target_limit=536870912; transport_timeout_seconds=30}
-        storage = @{inactive_releases=2; inactive_providers=2; inactive_agents=1; inactive_bytes=1073741824; inactive_repository_caches=2}
-        # `check_interval_seconds` is capped at MAX_CHECK_INTERVAL_SECONDS (16) — three of a node's
+        product = 'app'; channel = 'stable'; installRoot = $install
+        repository = @{metadataLimit=1048576; targetLimit=536870912; transportTimeoutSeconds=30}
+        storage = @{inactiveReleases=2; inactiveProviders=2; inactiveAgents=1; inactiveBytes=1073741824; inactiveRepositoryCaches=2}
+        # `checkIntervalSeconds` is capped at MAX_CHECK_INTERVAL_SECONDS (16) — three of a node's
         # report gaps must fit inside the 60s freshness window every reader ages reports against, so
         # a signed assignment carrying a slower cadence is rejected at publish. This test only wants
         # a cadence slow enough not to churn, so sit at the ceiling.
-        timeouts = @{check_interval_seconds=16; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; agent_check_interval_seconds=3600}
+        timeouts = @{checkIntervalSeconds=16; healthGraceSeconds=10; healthSuccesses=1; healthIntervalSeconds=1; refreshRetrySeconds=5; confirmationWindowSeconds=120; agentCheckIntervalSeconds=3600}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $routingRepo --keys $routingKeys `
@@ -257,22 +303,17 @@ ca = '$(Join-Path $certs 'ca.crt')'
     Wait-ServiceState 'Running'
 
     # The agent converged the release the only way it can: through the release's own hooks. The
-    # first boot's apply carries `install`, and the boot readiness gate runs under the reserved
-    # `boot` identity.
-    $apply = Wait-Operation 'apply'
-    if (($apply -split "`t")[2] -ne 'install') { throw "the first converge was not an install: $apply" }
-    $gate = Wait-Operation 'healthcheck'
-    if (($gate -split "`t")[1] -ne 'boot') { throw "the boot readiness gate did not run under the boot identity: $gate" }
+    # first boot's apply carries `install`. The authoritative completion barrier is installed.json:
+    # it cannot become confirmed until the boot health gate has passed and the state transition has
+    # committed. Do not maintain a second, receipt-derived definition of "healthy installation".
+    $null = Wait-Operation 'apply' 'install'
+    $installed = Wait-ConfirmedInstall '1.0.0'
 
     $desired = Read-DesiredAgent
     if (-not $desired.Equals([IO.Path]::GetFullPath($initialAgent), [StringComparison]::OrdinalIgnoreCase)) {
         throw "the launcher pointer does not name the initial agent: $desired"
     }
-    $installed = Get-Content (Join-Path $install 'state\installed.json') -Raw | ConvertFrom-Json
     $active = Get-Content (Join-Path $install 'active-release') -Raw | ConvertFrom-Json
-    if ($installed.release.version -ne '1.0.0' -or $null -ne $installed.pending) {
-        throw 'installed state does not commit the seeded bundle'
-    }
     if ($active.version -ne $installed.release.version -or $active.manifest_sha256 -ne $installed.release.manifest_sha256) {
         throw 'active-release does not name the committed bundle'
     }
@@ -287,17 +328,10 @@ ca = '$(Join-Path $certs 'ca.crt')'
 
     # A fresh launch re-converges the committed bundle through the same reconciler, this time as a
     # restart, and never moves the agent pointer.
-    $before = (Get-Content $receipt).Count
+    $before = @(Read-Operations).Count
     & sc.exe start $service | Out-Null
     Wait-ServiceState 'Running'
-    $deadline = (Get-Date).AddSeconds(60)
-    do {
-        $restart = Get-Content $receipt | Select-Object -Skip $before |
-            Where-Object { $_.StartsWith("apply`t") -and ($_ -split "`t")[2] -eq 'restart' }
-        if ($restart) { break }
-        Start-Sleep -Milliseconds 200
-    } while ((Get-Date) -lt $deadline)
-    if (-not $restart) { throw 'the relaunched agent never re-converged the committed release' }
+    $restart = Wait-Operation 'apply' 'restart' $before
     if ((Read-DesiredAgent) -ne $desired) { throw 'the SCM restart changed the agent pointer' }
 
     Write-Host "SUCCESS: SCM stop ended the launcher+agent tree cleanly and a fresh start re-converged committed bundle 1.0.0 through its own reconciler" -ForegroundColor Green

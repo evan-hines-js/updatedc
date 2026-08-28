@@ -10,6 +10,29 @@
 use updated::bundle::ReleaseId;
 use updated::state::{ProviderRelease, RepositoryLineage};
 
+/// An absolute path that is deliberately absent, portable across every host in the CI matrix.
+///
+/// Tests use this wherever production requires an absolute install or offline-repository path.
+/// Keeping it here prevents Unix literals from quietly becoming relative paths on Windows and
+/// gives all nominal agent fixtures one filesystem identity.
+pub(crate) fn nonexistent_root() -> std::path::PathBuf {
+    std::env::temp_dir().join("updated-agent-tests-do-not-create")
+}
+
+/// The directory-shaped spelling accepted by the canonical repository parser.
+pub(crate) fn local_repository_base() -> String {
+    format!(
+        "{}{}",
+        nonexistent_root().join("routing").display(),
+        std::path::MAIN_SEPARATOR
+    )
+}
+
+/// Canonical LF form for structural source assertions, independent of checkout policy.
+pub(crate) fn normalized_source(source: &str) -> String {
+    source.lines().collect::<Vec<_>>().join("\n")
+}
+
 /// A stable canonical digest for a human-readable fixture identity.
 pub(crate) fn digest(identity: &str) -> String {
     if updated_contracts::is_canonical_sha256(identity) {

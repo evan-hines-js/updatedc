@@ -195,11 +195,17 @@ fn open_regular_with_options(
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
+        // Windows rejects an ordinary file open on a directory with ACCESS_DENIED before we can
+        // inspect the returned handle. BACKUP_SEMANTICS is the documented flag that permits the
+        // open; the handle-based `metadata().is_file()` check below then classifies the directory
+        // as InvalidData, exactly as Unix does. This matters to every caller that distinguishes a
+        // malformed path entry from a genuine permission failure. It does not relax the regular-
+        // file invariant: no handle is returned until the common check below accepts it.
+        let mut flags = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
         if final_symlink == FinalSymlink::Refuse {
-            options.custom_flags(
-                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-            );
+            flags |= windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         }
+        options.custom_flags(flags);
     }
 
     let opened = options.open(path);

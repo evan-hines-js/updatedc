@@ -51,9 +51,9 @@ spec:
             - name: health
               containerPort: 8081
           readinessProbe:
-            httpGet: {path: /healthz, port: health}
+            httpGet: {path: /readyz, port: health}
           livenessProbe:
-            httpGet: {path: /healthz, port: health}
+            httpGet: {path: /livez, port: health}
           securityContext: {{- include "updatec.containerSecurityContext" . | nindent 12 }}
           resources: {{- toYaml .Values.gateway.resources | nindent 12 }}
           env:

@@ -279,8 +279,9 @@ jobs:
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with: {install_only: true}
       - run: ./scripts/ci.sh kind
-      - if: failure()
-        run: kubectl -n updated-system logs deployment/updatec || true
+      - name: Preserve diagnostics
+        if: failure()
+        run: ./scripts/kind-diagnostics.sh
 
   updatec-fleet-e2e:
     name: updatec fleet E2E (lifecycle, rollback, HAProxy)
@@ -303,9 +304,7 @@ jobs:
         run: ./scripts/ci.sh fleet
       - name: Preserve diagnostics
         if: failure()
-        run: |
-          kubectl -n updated-system get pods,updateagents,updategroups -o wide || true
-          kubectl -n updated-system logs deployment/updatec-controller --tail=200 || true
+        run: ./scripts/kind-diagnostics.sh
 
   # The container images the Helm charts pull. Until these exist, a chart is a manifest with
   # nothing to install: `image: updatec:kind` only ever resolved inside a side-loaded kind cluster.

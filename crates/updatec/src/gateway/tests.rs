@@ -919,8 +919,8 @@ async fn a_client_that_stops_reading_cannot_hold_a_connection_past_the_deadline(
 /// then stops reading leaves hyper blocked mid-write with no header-read timer armed, so only
 /// the overall deadline releases the permit. At the data plane's 30 minutes,
 /// [`HEALTH_CONNECTIONS`] sockets and no credentials stop `serve_plain` from accepting — and
-/// the chart points both the readiness and the liveness probe at this port, so the kubelet
-/// then kills the gateway and the enrollment control plane goes with it.
+/// both orchestrator probes use this port, so exhausting it would hide both process health and
+/// data-plane readiness from the kubelet.
 #[tokio::test(start_paused = true)]
 async fn a_wedged_health_connection_is_released_on_the_health_listeners_own_deadline() {
     use tokio::io::AsyncWriteExt as _;
@@ -928,13 +928,14 @@ async fn a_wedged_health_connection_is_released_on_the_health_listeners_own_dead
     // Smaller than one probe response, so hyper is left blocked mid-write with the request
     // head already parsed.
     let (mut client, server) = tokio::io::duplex(64);
+    let readiness = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let served = tokio::spawn(serve_http(
         TokioIo::new(server),
-        health_router(),
+        health_router(readiness),
         HEALTH_CONNECTION_TIMEOUT,
     ));
     client
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: gateway\r\n\r\n")
+        .write_all(b"GET /livez HTTP/1.1\r\nHost: gateway\r\n\r\n")
         .await
         .unwrap();
 
@@ -948,6 +949,44 @@ async fn a_wedged_health_connection_is_released_on_the_health_listeners_own_dead
         "the health listener must not inherit the release-download deadline"
     );
     drop(client);
+}
+
+#[tokio::test]
+async fn liveness_opens_before_repository_readiness() {
+    let readiness = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let response = health_router(readiness.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/livez")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = health_router(readiness.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    readiness.store(true, std::sync::atomic::Ordering::Release);
+    let response = health_router(readiness)
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 async fn seeded() -> Arc<InMemory> {

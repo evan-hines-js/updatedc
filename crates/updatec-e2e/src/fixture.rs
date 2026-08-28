@@ -27,9 +27,13 @@ pub(crate) const STATE_MAX_SHARDS: u8 = 8;
 pub(crate) const SOAK_FLEET_LABEL: &str = "soak.updated.dev/fleet";
 pub(crate) const SOAK_FLEET_VALUE: &str = "managed";
 pub(crate) const SOAK_COHORT_LABEL: &str = "soak.updated.dev/cohort";
+#[cfg(unix)]
 pub(crate) const SOAK_NODE_LABEL: &str = "soak.updated.dev/node";
+#[cfg(unix)]
 pub(crate) const SOAK_CHAOS_LABEL: &str = "soak.updated.dev/campaign";
+#[cfg(unix)]
 pub(crate) const SOAK_CHAOS_VALUE: &str = "managed";
+#[cfg(unix)]
 pub(crate) const SOAK_CHAOS_NAME_PREFIX: &str = "soak-round-";
 pub(crate) const SOAK_GROUPS: [&str; 3] = ["soak-a", "soak-b", "soak-c"];
 pub(crate) const SOAK_GROUP_SET: &str = "soak-fleet";
@@ -179,25 +183,42 @@ pub(crate) fn group(name: &str, deployment: DeploymentSpec) -> UpdateGroup {
     group
 }
 
-pub(crate) fn group_set() -> UpdateGroupSet {
+/// Construct every fleet fixture's set through the typed API. In particular, repository scope is
+/// required here rather than repeated in JSON call sites, so a CRD change cannot leave the CI
+/// driver's rollout sets orphaned from the controller that owns them.
+pub(crate) fn group_set_resource(
+    name: &str,
+    match_labels: BTreeMap<String, String>,
+    max_concurrent: Option<u32>,
+) -> UpdateGroupSet {
     let mut set = UpdateGroupSet::new(
-        SOAK_GROUP_SET,
+        name,
         UpdateGroupSetSpec {
             repository_ref: LocalObjectReference {
                 name: REPOSITORY_NAME.into(),
             },
-            selector: LabelSelector {
-                match_labels: BTreeMap::from([(SOAK_FLEET_LABEL.into(), SOAK_FLEET_VALUE.into())]),
-            },
-            max_concurrent: Some(SOAK_MAX_CONCURRENT),
+            selector: LabelSelector { match_labels },
+            max_concurrent,
             rollout_windows: vec![],
             calendar: vec![],
-            max_regressions: Some(SOAK_MAX_REGRESSIONS),
-            on_regression: RegressionResponse::Rollback,
-            stuck_after_seconds: Some(SOAK_STUCK_AFTER_SECONDS),
+            max_regressions: None,
+            on_regression: RegressionResponse::default(),
+            stuck_after_seconds: None,
         },
     );
     set.metadata.namespace = Some(NAMESPACE.into());
+    set
+}
+
+pub(crate) fn group_set() -> UpdateGroupSet {
+    let mut set = group_set_resource(
+        SOAK_GROUP_SET,
+        BTreeMap::from([(SOAK_FLEET_LABEL.into(), SOAK_FLEET_VALUE.into())]),
+        Some(SOAK_MAX_CONCURRENT),
+    );
+    set.spec.max_regressions = Some(SOAK_MAX_REGRESSIONS);
+    set.spec.on_regression = RegressionResponse::Rollback;
+    set.spec.stuck_after_seconds = Some(SOAK_STUCK_AFTER_SECONDS);
     set
 }
 

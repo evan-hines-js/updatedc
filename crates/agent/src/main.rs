@@ -1733,11 +1733,13 @@ mod tests {
         // later, for a reason no reader could see. The structure that makes that impossible is the
         // cycle body being an expression whose early exits leave the block, not the tick, with the
         // single emit after it — so this asserts the structure, which is the invariant.
-        let source = include_str!("main.rs");
+        let source = crate::test_support::normalized_source(include_str!("main.rs"));
         // The writer itself lives with `Heartbeat`; the cycle below is its only caller.
         let emitter = concat!("telemetry::report_", "running_state(");
         assert_eq!(
-            include_str!("heartbeat.rs").matches(emitter).count(),
+            crate::test_support::normalized_source(include_str!("heartbeat.rs"))
+                .matches(emitter)
+                .count(),
             1,
             "reports must have exactly one writer"
         );
@@ -1746,16 +1748,23 @@ mod tests {
             0,
             "and the cycle reaches it only through `Heartbeat::emit`"
         );
+        // Match Rust tokens, not checkout line endings. Git may materialize this file as CRLF on
+        // Windows; whitespace is not part of the invariant.
+        let emit_call = concat!(".", "emit(");
         assert_eq!(
-            source.matches("heartbeat\n            .emit(").count(),
+            source.matches(emit_call).count(),
             1,
-            "and exactly one call site, at the end of the cycle"
+            "exactly one emit call"
         );
         let block = source
             .find("let flow: Result<TickFlow")
             .expect("the cycle body is one expression");
         let tail = &source[block..];
-        let emit = tail.find(".emit(").expect("the cycle ends in a report");
+        let emit = tail.find(emit_call).expect("the cycle ends in a report");
+        assert!(
+            tail[..emit].trim_end().ends_with("heartbeat"),
+            "the cycle's one emit belongs to its Heartbeat"
+        );
         assert!(
             !tail[..emit].contains("\n            continue;")
                 && !tail[..emit].contains("\n        continue;"),
@@ -2275,10 +2284,10 @@ mod tests {
     /// repository so nothing here reaches the network.
     fn options() -> Options {
         use updated::config::{Paths, Routing};
-        let root = PathBuf::from("/nonexistent/updated-agent-tests");
+        let root = crate::test_support::nonexistent_root();
         let routing = Routing {
             root: root.join("enrollment/routing"),
-            base_url: format!("{}/", root.join("routing").display()),
+            base_url: crate::test_support::local_repository_base(),
             assignment: "assignments/agents/agent-test.json".into(),
             transport_timeout: Duration::from_secs(30),
             mtls: updated::tls::Identity::new(
@@ -2324,7 +2333,7 @@ mod tests {
         // must not exist, so a path that escaped into a real filesystem operation would fail
         // loudly rather than write somewhere.
         updated_contracts::assignment::ManagedRuntime {
-            install_root: PathBuf::from("/nonexistent/updated-agent-tests"),
+            install_root: crate::test_support::nonexistent_root(),
             ..updated_contracts::assignment::testing::runtime()
         }
     }
@@ -2467,7 +2476,7 @@ mod tests {
         // A changed input, repaired bundle, and ordinary steady-state cycle all reach the release
         // the same way: `apply --reason restart`, which is the reconciler's cue to re-converge
         // whatever it owns onto the current values. `install` is the first boot's alone.
-        let source = include_str!("main.rs");
+        let source = crate::test_support::normalized_source(include_str!("main.rs"));
         let loop_body = &source[source
             .find("let flow: Result<TickFlow")
             .expect("the cycle body is one expression")..];
@@ -2480,6 +2489,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_bad_disk_is_still_recognised_behind_a_post_commit_wrapper() {
         // `foundation::durable` wraps a failure that happens AFTER the rename landed, so the
@@ -2522,13 +2532,19 @@ mod tests {
         // The exact states a candidate agent's boot recovery hits on a full state volume, a
         // read-only remount, a bad disk, and a CDN blip. None of them says anything about these
         // agent bytes, so none of them may end in a rejection by content hash.
-        for error in [
+        let node_local_transients = [
             io::Error::from(io::ErrorKind::StorageFull),
             io::Error::from(io::ErrorKind::ReadOnlyFilesystem),
-            io::Error::from_raw_os_error(libc::EIO),
             io::Error::from(io::ErrorKind::NetworkUnreachable),
             io::Error::from(io::ErrorKind::ConnectionReset),
-        ] {
+        ];
+        // EIO is the Unix raw-code case the production classifier recognises in addition to the
+        // portable ErrorKind cases above. Windows has no libc errno and no corresponding branch.
+        #[cfg(unix)]
+        let bad_disk = Some(io::Error::from_raw_os_error(libc::EIO));
+        #[cfg(not(unix))]
+        let bad_disk: Option<io::Error> = None;
+        for error in node_local_transients.into_iter().chain(bad_disk) {
             assert!(
                 retry_after_transient(&error, now, deadline, &shutdown),
                 "{error:?} is a fault of the node, so it is waited out from behind readiness"

@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 use updated_contracts::dataflow::FileSnapshot;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use updated_contracts::reconciler::FLAGS;
 use updated_contracts::reconciler::{Arguments, Operation, Reason};
 

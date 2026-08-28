@@ -405,9 +405,9 @@ kubectl -n updated-system get upr,updategroups,updategroupsets,updatebackends
 The last command shows the projected status: the repository's `Ready` condition and agent count,
 each group's progress, and each set's rolling/held/halted lists.
 
-Note that the gateway does not open its health listener until its `UpdateRepository` exists, so a
-gateway that is not yet ready on a fresh install is usually waiting for that resource rather than
-failing.
+The gateway opens `/livez` immediately but keeps `/readyz` closed until its `UpdateRepository`
+exists and the authenticated data listener is ready. A gateway that is not yet ready on a fresh
+install is therefore usually waiting for that resource rather than failing.
 
 ## Installing from a checkout
 

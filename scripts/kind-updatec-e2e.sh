@@ -11,6 +11,16 @@ done
 # shellcheck source=scripts/lib/publish-fuzz-plan.sh
 . "$ROOT/scripts/lib/publish-fuzz-plan.sh"
 FUZZ_ROUNDS=${UPDATEC_FUZZ_ROUNDS:-1}
+PRESERVE_REPOSITORY=false
+# Kubernetes, its ingress implementation, and their manifests are one tested platform tuple. Pin
+# all three inputs: Kind's moving default silently advanced this fixture from Kubernetes 1.30 to
+# 1.35 while the old controller only supported 1.30. The URLs are immutable release artifacts and
+# every downloaded byte is verified before kubectl sees it.
+KIND_NODE_IMAGE='kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f'
+INGRESS_MANIFEST_URL='https://raw.githubusercontent.com/kubernetes/ingress-nginx/0a5901f3c64f11e92e487799b8da3f00cca37515/deploy/static/provider/kind/deploy.yaml'
+INGRESS_MANIFEST_SHA256='2a3ae008c8786431115502644e77ab398fdebfb721a5d1195ed3089cde3299df'
+CERT_MANAGER_MANIFEST_URL='https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml'
+CERT_MANAGER_MANIFEST_SHA256='5f6a499b8c1857d57f560f536e0dcc830914b45c420899fe7ad0692c8624e408'
 # Managed repository object keys have one controller-owned namespace/name scope. Keep the fixture's
 # direct MinIO probes on that same identity; the Rust e2e asserts this value against the production
 # prefix constructor.
@@ -22,9 +32,14 @@ while (( $# > 0 )); do
       FUZZ_ROUNDS=$2
       shift 2
       ;;
+    --preserve-repository)
+      PRESERVE_REPOSITORY=true
+      shift
+      ;;
     --help|-h)
-      echo "usage: $0 [--fuzz-rounds N]"
+      echo "usage: $0 [--fuzz-rounds N] [--preserve-repository]"
       echo "  N=0 skips fleet fuzz; default: ${UPDATEC_FUZZ_ROUNDS:-1}"
+      echo "  --preserve-repository leaves the converged fixture available to the fleet E2E"
       exit 0
       ;;
     *)
@@ -147,11 +162,11 @@ finish() {
     echo "Kind E2E succeeded; preserving cluster '$NAME' because UPDATEC_KEEP_KIND_CLUSTER=1" >&2
   else
     echo "Kind E2E failed (exit $status); preserving cluster '$NAME' for diagnosis" >&2
+    "$ROOT/scripts/kind-diagnostics.sh" || true
   fi
   echo "inspect with: kubectl -n updated-system get pods,jobs" >&2
   echo "agent logs:   kubectl -n updated-system logs agent-4" >&2
   echo "remove with:  kind delete cluster --name $NAME" >&2
-  kubectl -n updated-system get pods,jobs >&2 || true
 }
 kubectl_log_contains() {
   local resource=$1
@@ -162,6 +177,21 @@ kubectl_log_contains() {
   # which can SIGPIPE kubectl and falsely fail under `set -o pipefail`.
   log="$(kubectl -n updated-system logs "$resource" "$@" 2>/dev/null || true)"
   [[ "$log" == *"$needle"* ]]
+}
+apply_verified_manifest() {
+  local name=$1
+  local url=$2
+  local expected_sha256=$3
+  local manifest="$WORK/$name.yaml"
+  local actual_sha256
+
+  curl --fail --location --silent --show-error --output "$manifest" "$url"
+  actual_sha256="$(openssl dgst -sha256 "$manifest" | awk '{print $NF}')"
+  [[ "$actual_sha256" == "$expected_sha256" ]] || {
+    echo "FAIL: $name manifest digest is $actual_sha256, expected $expected_sha256" >&2
+    exit 1
+  }
+  kubectl apply -f "$manifest"
 }
 trap finish EXIT
 cleanup
@@ -176,10 +206,7 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
-    # Lets an ingress-nginx controller schedule (its nodeSelector is ingress-ready=true),
-    # so the fleet e2e can front each set's pods with per-set Services.
-    labels:
-      ingress-ready: "true"
+    image: $KIND_NODE_IMAGE
     # Publish the ingress controller on the host's ports, so both the browser AND the
     # co-located out-of-cluster agent reach every endpoint through nginx — the agent resolves
     # updatec-gateway/release-default to 127.0.0.1 (nginx), no socat or LAN-IP needed.
@@ -215,8 +242,9 @@ kubectl -n updated-system wait pod/minio-init --for=jsonpath='{.status.phase}'=S
 # environment built from this script is ingress-capable. The fleet e2e fronts each set's
 # load-balancer Service with a per-set Ingress on this controller, so Kubernetes — not the
 # driver's own routing — guarantees a set is only ever answered by its own pods. Scheduled
-# onto the ingress-ready control-plane node (see the kind config above).
-kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
+# onto the Linux control-plane node. Controller 1.15.1 is the ingress-nginx release tested against
+# Kubernetes 1.35; the manifest itself pins both controller images by digest.
+apply_verified_manifest ingress-nginx "$INGRESS_MANIFEST_URL" "$INGRESS_MANIFEST_SHA256"
 kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=${READY_TIMEOUT}s
 
 # cert-manager itself — the controller only. The fleet's mTLS material (a self-signed root CA, the
@@ -224,7 +252,9 @@ kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --ti
 # declared by the chart below, not here. The gateway, the only externally exposed listener,
 # requires a client cert that CA signed: that mutual TLS is the enrollment identity, so there is no
 # shared secret anywhere.
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.3/cert-manager.yaml
+# cert-manager 1.21 is tested on Kubernetes 1.35. The old 1.15 fixture was EOL and only supported
+# through Kubernetes 1.32, so leaving it in place would merely move this same drift failure later.
+apply_verified_manifest cert-manager "$CERT_MANAGER_MANIFEST_URL" "$CERT_MANAGER_MANIFEST_SHA256"
 kubectl -n cert-manager rollout status deployment/cert-manager-webhook --timeout=${READY_TIMEOUT}s
 kubectl -n cert-manager rollout status deployment/cert-manager --timeout=${READY_TIMEOUT}s
 kubectl -n cert-manager rollout status deployment/cert-manager-cainjector --timeout=${READY_TIMEOUT}s
@@ -259,9 +289,9 @@ helm upgrade --install updatec "$ROOT/deploy/charts/updatec" \
   --set certManager.enabled=true \
   --set certManager.agentCertificate.create=true \
   --set 'certManager.gatewayCertificate.dnsNames={release-default,release-edge,release-batch,localhost}'
-# Deliberately no `--wait`: the gateway does not open its health listener until its
-# UpdateRepository exists, and that resource is applied further down. Readiness is asserted below,
-# after the repository is in place — waiting here would time out on a control plane that is
+# Deliberately no `--wait`: the gateway opens liveness immediately but keeps readiness closed until
+# its UpdateRepository exists, and that resource is applied further down. Readiness is asserted
+# below after the repository is in place; waiting here would time out on a control plane that is
 # behaving exactly as designed.
 
 cat <<'YAML' | kubectl apply -f -
@@ -1171,12 +1201,13 @@ for ordinal in 0 1 2 3 4; do
     echo "FAIL: agent-$ordinal did not persist the reachable in-cluster routing URL" >&2
     exit 1
   }
-  log="$(kubectl -n updated-system logs "agent-$ordinal" -c agent)"
-  [[ "$log" == *"cold-installed application 1.0.0 from the first trusted assignment"* ]] || {
+  poll_until "$NODE_SETTLE_TIMEOUT" kubectl_log_contains "agent-$ordinal" \
+    'cold-installed application 1.0.0 from the first trusted assignment' -c agent || {
     echo "FAIL: agent-$ordinal did not cold-install through online enrollment" >&2
-    echo "$log" >&2
+    kubectl -n updated-system logs "agent-$ordinal" -c agent --tail=200 >&2 || true
     exit 1
   }
+  log="$(kubectl -n updated-system logs "agent-$ordinal" -c agent)"
   [[ "$log" != *"FAIL: agent used the image-baked"* ]] || {
     echo "FAIL: agent-$ordinal executed a masked image-baked application" >&2
     exit 1
@@ -1800,6 +1831,14 @@ kubectl -n updated-system logs -l job-name=observe-fleet-chaos --prefix --all-co
 kubectl -n updated-system delete job observe-fleet-chaos --wait=true >/dev/null
 else
   echo "fleet fuzz skipped (--fuzz-rounds 0)"
+fi
+
+# The Rust fleet E2E uses this exact provisioning and verification path, then adds its larger
+# topology. Its fixture must retain the live repository; the standalone Kind scenario continues
+# below into the intentionally ambiguous generation and destructive repository-finalizer checks.
+if [[ "$PRESERVE_REPOSITORY" == true ]]; then
+  echo "converged Kind fixture preserved for the fleet E2E"
+  exit 0
 fi
 cat <<YAML | kubectl apply -f -
 apiVersion: batch/v1

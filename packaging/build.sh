@@ -69,7 +69,11 @@ for binary in updated-launcher updated-agent; do
   [[ -x "$BINDIR/$binary" ]] || { echo "FAIL: missing binary $BINDIR/$binary" >&2; exit 1; }
 done
 
+# nfpm runs from packaging/ so every path crossing that process boundary must be absolute. Keep
+# one resolved output directory for both formats; otherwise a caller's relative --out is created
+# relative to its shell and then interpreted relative to packaging/ by nfpm.
 mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 export PKG_VERSION="$VERSION" PKG_ARCH="$ARCH" PKG_BINDIR="$BINDIR"
 # Explicit, version-free target names. nfpm's default naming embeds the version, but the installer
 # and Ansible role select an immutable release before choosing its platform artifact, so the

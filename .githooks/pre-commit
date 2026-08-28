@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+SOURCE_TREE="$ROOT/target/pre-commit-source"
+
+cleanup() {
+  rm -rf "$SOURCE_TREE"
+}
+trap cleanup EXIT
+
+cd "$ROOT"
+git diff --cached --check
+
+# Validate the exact tree being committed, not an unstaged working-copy overlay. A stable checkout
+# path and build directory retain Cargo's cache without maintaining a second implementation of the
+# checks themselves.
+rm -rf "$SOURCE_TREE"
+mkdir -p "$SOURCE_TREE"
+git checkout-index --all --prefix="$SOURCE_TREE/"
+CARGO_TARGET_DIR="$ROOT/target" "$SOURCE_TREE/scripts/check-source.sh"
