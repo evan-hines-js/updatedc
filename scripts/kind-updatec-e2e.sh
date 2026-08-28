@@ -1459,18 +1459,29 @@ kubectl -n updated-system logs job/verify-agent-versions
 
 # A workload crash is the release's problem, not the node stack's: the agent runs packages and
 # holds no handle on the process, so a crashed application must leave the agent, the container and
-# the pod exactly where they were. Recovery is the reconciler's `apply` — here through the boot
-# converge the launcher's next agent runs — and it must bring the SAME committed release back.
+# the pod exactly where they were. Continuous convergence is the one recovery path: the next
+# verified steady-state cycle invokes the committed reconciler's `apply`, which must replace the
+# crashed process with the SAME committed release.
 restart_before="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
 agent_before="$(process_pid updated-agent)"
+workload_before="$(process_pid app)"
 kubectl -n updated-system exec agent-4 -c agent -- \
   sh -c 'curl -fsS http://127.0.0.1:8080/crash >/dev/null || true' || true
-workload_stopped_answering() {
-  ! kubectl -n updated-system exec agent-4 -c agent -- \
-    curl -fsS --max-time 2 http://127.0.0.1:8080/version >/dev/null 2>&1
+# A sampled outage is not an invariant: continuous convergence can close the gap between two
+# one-second polls. Process identity is durable evidence that the old workload exited, while the
+# recovered version proves the reconciler restored the committed release.
+recovered_workload=""
+recovered_version=""
+workload_was_replaced_and_recovered() {
+  recovered_workload="$(process_pid app 2>/dev/null || true)"
+  recovered_version="$(kubectl -n updated-system exec agent-4 -c agent -- \
+    curl -fsS --max-time 2 http://127.0.0.1:8080/version 2>/dev/null || true)"
+  [[ -n "$recovered_workload" && "$recovered_workload" != "$workload_before" \
+    && "$recovered_version" == 1.0.0 ]]
 }
-poll_until "$NODE_SETTLE_TIMEOUT" workload_stopped_answering || {
-  echo "FAIL: agent-4's application kept answering after it was told to crash" >&2
+poll_until "$NODE_SETTLE_TIMEOUT" workload_was_replaced_and_recovered || {
+  echo "FAIL: agent-4 did not replace crashed workload $workload_before with committed 1.0.0 (pid=${recovered_workload:-absent}, version=${recovered_version:-unreachable})" >&2
+  kubectl -n updated-system logs agent-4 -c agent --tail=100 >&2 || true
   exit 1
 }
 restart_after="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
@@ -1482,23 +1493,8 @@ restart_after="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status
   echo "FAIL: agent-4's agent process died with the workload it does not own" >&2
   exit 1
 }
-# Restart only the agent. Its boot converge runs the committed release's own `apply`, and the
-# reconciler — the one thing that owns this process — starts the workload again.
-kubectl -n updated-system exec agent-4 -c agent -- kill -TERM "$agent_before"
-recovered_version=""
-workload_answered_again() {
-  recovered_version="$(kubectl -n updated-system exec agent-4 -c agent -- \
-    curl -fsS --max-time 2 http://127.0.0.1:8080/version 2>/dev/null || true)"
-  [[ -n "$recovered_version" ]]
-}
-poll_until "$NODE_SETTLE_TIMEOUT" workload_answered_again || true
-[[ "$recovered_version" == 1.0.0 ]] || {
-  echo "FAIL: agent-4 recovered as '$recovered_version', expected committed 1.0.0" >&2
-  kubectl -n updated-system logs agent-4 -c agent --tail=100 >&2 || true
-  exit 1
-}
 kubectl -n updated-system wait --for=condition=ready pod/agent-4 --timeout=${READY_TIMEOUT}s
-echo "a workload crash left the node stack untouched; the boot converge re-applied committed 1.0.0"
+echo "a workload crash replaced pid $workload_before with $recovered_workload while continuous convergence re-applied committed 1.0.0 without restarting the node stack"
 
 if (( FUZZ_ROUNDS > 0 )); then
 cat <<'YAML' | kubectl apply -f -
