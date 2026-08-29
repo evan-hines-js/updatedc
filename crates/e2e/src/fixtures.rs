@@ -47,9 +47,9 @@ pub struct Node {
     /// Override the agent binary the launcher runs (self-update tests supply a
     /// specific version); defaults to the built one.
     agent_override: Option<PathBuf>,
-    /// Sign `ordered_install_fallback` into the assignment: a cold node whose exact assigned
+    /// Sign `cold_install_fallback` into the assignment: a cold node whose exact assigned
     /// bytes prove unusable may descend to the newest healthy target at or below it.
-    ordered_install_fallback: bool,
+    cold_install_fallback: bool,
 }
 
 /// The mode the reconciler starts in: record the invocation and succeed. There is one reconciler
@@ -101,12 +101,12 @@ impl Node {
             ready_timeout: None,
             seed_application: true,
             agent_override: None,
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
         }
     }
-    /// Sign ordered-install fallback into the assignment (see the struct field).
-    pub fn ordered_install_fallback(mut self) -> Self {
-        self.ordered_install_fallback = true;
+    /// Sign cold-install fallback into the assignment (see the struct field).
+    pub fn cold_install_fallback(mut self) -> Self {
+        self.cold_install_fallback = true;
         self
     }
     /// The reconciler manages the sample application at `address`: its `apply` converges the
@@ -425,8 +425,8 @@ impl Node {
         .map_err(str_err)?;
         // A marker file (like `desired-app`) carries the fallback opt-in to the assignment
         // publisher, which signs it into every republished assignment doc.
-        if self.ordered_install_fallback {
-            std::fs::write(self.dir.join("ordered-install-fallback"), []).map_err(str_err)?;
+        if self.cold_install_fallback {
+            std::fs::write(self.dir.join("cold-install-fallback"), []).map_err(str_err)?;
         }
         republish_assignment(self, "configured")?;
         let state_dir = self.state_dir();
@@ -639,11 +639,11 @@ pub fn publish_assignment(
         .args(["--provider-set-sha256", &set_sha])
         .arg("--runtime")
         .arg(runtime);
-    // The Node builder drops this marker when ordered-install fallback is opted into; it must
+    // The Node builder drops this marker when cold-install fallback is opted into; it must
     // ride the *initial* assignment (this is the doc a cold node resolves), not only later
     // republishes, or the first install pins the assigned head exactly and cannot descend.
-    if dir.join("ordered-install-fallback").exists() {
-        command.arg("--ordered-install-fallback");
+    if dir.join("cold-install-fallback").exists() {
+        command.arg("--cold-install-fallback");
     }
     crate::harness::run(&mut command)
 }

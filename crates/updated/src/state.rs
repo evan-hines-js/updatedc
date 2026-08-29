@@ -149,10 +149,10 @@ pub struct InstalledState {
     /// cold install: a head placed from the first trusted assignment that has never passed a
     /// health gate and has no predecessor to revert to. If a provisional head fails — crashes or
     /// wedges before its first passing gate — the boot rejects its bytes so the next cold install
-    /// descends via ordered fallback past it; passing the gate flips this to `true` and it is then
+    /// descends via cold-install fallback past it; passing the gate flips this to `true` and it is then
     /// a normal steady-state head. Every non-cold-install commit (update, rollback, rebind) writes
     /// `true`: their failure recovery is the update state machine's rollback to a proven
-    /// predecessor, not an ordered-fallback descent. This is the whole "first boot / clean
+    /// predecessor, not a cold-install-fallback descent. This is the whole "first boot / clean
     /// environment" signal, kept atomic with the install record rather than in a side file.
     pub confirmed: bool,
 }

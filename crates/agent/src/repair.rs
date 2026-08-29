@@ -26,7 +26,7 @@ use crate::*;
 ///
 /// The corrupt archive is never *rejected*: a rejection is durable and never expires, and damage to
 /// this disk is evidence about this node, not about the release — rejecting it would permanently
-/// exclude a perfectly good version from this node and walk its ordered fallback downward.
+/// exclude a perfectly good version from this node and walk its cold-install fallback downward.
 /// Returns the trusted repository the repair ran off, when it came from the assignment — the caller
 /// reports against it without a second refresh. The predecessor fallback runs precisely when no
 /// repository could be loaded, so it has none to give.
@@ -106,7 +106,7 @@ pub(crate) async fn repair_from_assignment(
     // A repair re-acquires the release this node is ALREADY committed to, so it must lift the
     // selector's "you already have that version, nothing to do" short-circuit — and nothing else.
     // It used to say `None`, which the selector reads as "nothing is installed": that is the one
-    // stance a signed `orderedInstallFallback` descends under, so a repair on a node whose
+    // stance a signed `coldInstallFallback` descends under, so a repair on a node whose
     // assigned head was rejected walked down to an older release and installed it, past the
     // anti-rollback floor the ordinary update path refuses to cross. `Reacquire` keeps the floor
     // and keeps the exact-pin branch; if the assigned head really is unselectable the repair fails

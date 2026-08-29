@@ -126,7 +126,7 @@ mod tests {
                 path: "application".into(),
                 sha256: "a".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: updated_contracts::artifact::TargetReference {
                 path: "provider".into(),
                 sha256: "b".repeat(64),

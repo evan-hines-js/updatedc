@@ -122,7 +122,7 @@ impl std::error::Error for PrepareError {
 /// identity was previously rejected. Activation and rejection persistence remain front-end policy.
 ///
 /// The decision is deterministic and side-effect free, and it answers two questions at once: which
-/// release to acquire, and — when ordered fallback descended below the assigned head — which signed
+/// release to acquire, and — when cold-install fallback descended below the assigned head — which signed
 /// provider set governs it (app and providers are one signed unit). Every caller needs both, so the
 /// decision is made HERE, once, and its result is handed to [`prepare_assigned_application`] and to
 /// `selection::stage_providers`; asking the repository twice would be one decision with two
@@ -133,7 +133,7 @@ pub(crate) fn select_assigned_application(
 ) -> Result<Option<SelectedRelease>, PrepareError> {
     let policy = DefaultPolicy::current(&request.application.product, &request.application.channel);
     // Rejection filtering now happens inside selection: exact-pin returns None when
-    // the assigned bytes are rejected (hold predecessor), and ordered fallback skips
+    // the assigned bytes are rejected (hold predecessor), and cold-install fallback skips
     // rejected targets as it descends. Diagnostics are dropped here; the agent's
     // own selection path logs skips.
     request

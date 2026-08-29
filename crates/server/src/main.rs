@@ -176,7 +176,7 @@ async fn publish_assignment(args: &[String]) -> R {
     let targets_url = flag(args, "--targets-url").ok_or("--targets-url <url> is required")?;
     let deployment = flag(args, "--deployment").ok_or("--deployment <id> is required")?;
     let application = target_reference(args, "application")?;
-    let ordered_install_fallback = args.iter().any(|arg| arg == "--ordered-install-fallback");
+    let cold_install_fallback = args.iter().any(|arg| arg == "--cold-install-fallback");
     let provider_set = target_reference(args, "provider-set")?;
     // Routing and releases are deliberately different repositories: the former is private and
     // capability-gated, while the latter is fetched directly from the object plane. Requiring the
@@ -203,7 +203,7 @@ async fn publish_assignment(args: &[String]) -> R {
         metadata_url,
         targets_url,
         application,
-        ordered_install_fallback,
+        cold_install_fallback,
         provider_set,
         release_root,
         runtime,
@@ -401,7 +401,7 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
             // `add_release` hashes it, so the published target is signed for its own broken bytes —
             // it passes the client's download sha check and fails only at extract/validate. This is
             // the malformed-but-signed bundle an honest publisher can never emit, used to exercise
-            // the client's ingest-rejection + ordered-fallback descent. Never used by real releases.
+            // the client's ingest-rejection + cold-install-fallback descent. Never used by real releases.
             if let Some(kind) = flag(args, "--corrupt") {
                 corrupt_archive(&archive, &kind, &version)?;
             }

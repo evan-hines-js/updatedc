@@ -55,11 +55,11 @@ impl SelfUpdateState {
         Ok(())
     }
 
-    /// Select the newest signed, non-rejected agent release. If its bytes differ
+    /// Select the signed repository head when it is newer than this agent. If its bytes differ
     /// from the running agent, stage them and hand the path to the launcher; on
     /// acceptance this process exits so the launcher can activate the candidate under a
-    /// readiness gate. The agent's identity is its content hash, not a version, so
-    /// selection is "newest trusted release whose bytes differ from mine".
+    /// readiness gate. A rejected head is held until its exact bytes change; it never causes an
+    /// implicit downgrade to an intermediate release from repository history.
     pub(crate) async fn check(
         &mut self,
         su: &AgentUpdate,
@@ -70,9 +70,10 @@ impl SelfUpdateState {
         let policy = DefaultPolicy::current("agent", su.channel.clone());
         let Some(selected) = repo.select_release(
             &policy,
-            // The running agent is identified by its content hash, not a version, so there is no
-            // installed version to floor against or to short-circuit on.
-            updated_tuf::select::Stance::Nothing,
+            // Keep the running version as the anti-downgrade floor without treating every target
+            // with that version as the bytes already running. Self-update identity is content, so
+            // a corrected same-version republish remains eligible.
+            updated_tuf::select::Stance::Floor(crate::SELF_VERSION),
             |m| log(&format!("self-update: {m}")),
             |t, _| self.rejected.is_rejected(&target_sha(t)),
         ) else {

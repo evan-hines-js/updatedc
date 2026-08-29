@@ -284,12 +284,12 @@ spec:
                     - path
                     - sha256
                     type: object
+                  coldInstallFallback:
+                    default: false
+                    description: Signed opt-in to first-install cold-install fallback (see [`updated_contracts::assignment::RepositoryAssignment::cold_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
+                    type: boolean
                   name:
                     type: string
-                  orderedInstallFallback:
-                    default: false
-                    description: Signed opt-in to first-install ordered fallback (see [`updated_contracts::assignment::RepositoryAssignment::ordered_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
-                    type: boolean
                   providerSet:
                     properties:
                       path:
@@ -1117,12 +1117,12 @@ spec:
                     - path
                     - sha256
                     type: object
+                  coldInstallFallback:
+                    default: false
+                    description: Signed opt-in to first-install cold-install fallback (see [`updated_contracts::assignment::RepositoryAssignment::cold_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
+                    type: boolean
                   name:
                     type: string
-                  orderedInstallFallback:
-                    default: false
-                    description: Signed opt-in to first-install ordered fallback (see [`updated_contracts::assignment::RepositoryAssignment::ordered_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
-                    type: boolean
                   providerSet:
                     properties:
                       path:

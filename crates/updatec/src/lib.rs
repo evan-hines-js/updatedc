@@ -226,11 +226,11 @@ pub struct DeploymentSpec {
     pub name: String,
     pub release_repository: ReleaseRepositorySpec,
     pub application: TargetSpec,
-    /// Signed opt-in to first-install ordered fallback (see
-    /// [`updated_contracts::assignment::RepositoryAssignment::ordered_install_fallback`]). Defaults
+    /// Signed opt-in to first-install cold-install fallback (see
+    /// [`updated_contracts::assignment::RepositoryAssignment::cold_install_fallback`]). Defaults
     /// off so a group only descends versions when the publisher explicitly allows it.
     #[serde(default)]
-    pub ordered_install_fallback: bool,
+    pub cold_install_fallback: bool,
     pub provider_set: TargetSpec,
     pub runtime: RuntimeSpec,
 }
@@ -303,7 +303,7 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                     root_json,
                 },
             application,
-            ordered_install_fallback,
+            cold_install_fallback,
             provider_set,
             runtime:
                 RuntimeSpec {
@@ -323,7 +323,7 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
             metadata_url,
             targets_url,
             application: application.into(),
-            ordered_install_fallback,
+            cold_install_fallback,
             provider_set: provider_set.into(),
             release_root,
             runtime: updated_contracts::assignment::ManagedRuntime {
@@ -1864,7 +1864,7 @@ mod tests {
                 path: "app".into(),
                 sha256: "1".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: ExactTarget {
                 path: "providers".into(),
                 sha256: "2".repeat(64),
@@ -1923,7 +1923,7 @@ mod tests {
                 path: "app".into(),
                 sha256: "1".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: TargetSpec {
                 path: "providers".into(),
                 sha256: "2".repeat(64),

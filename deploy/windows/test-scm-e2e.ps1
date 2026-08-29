@@ -1,7 +1,6 @@
 # Requires an elevated PowerShell. Exercises the native SCM host with the current bundle-only
-# installation model: SCM -> wrapper -> launcher -> agent, a real signed PowerShell reconciler that
-# the agent invokes to converge the release, a clean service stop, and a fresh launch of the
-# committed bundle.
+# installation model: SCM -> wrapper -> launcher -> agent, the same signed native reconciler fixture
+# as the cross-platform E2E suite, a clean service stop, and a fresh launch of the committed bundle.
 #
 # SCOPE, deliberately: this drives the launcher + agent lifecycle and one full reconciler converge.
 # It does NOT have the reconciler start a workload process. The property that matters here is
@@ -37,7 +36,7 @@ $launcherState = Join-Path $work 'launcher-state'
 $install = Join-Path $work 'install'
 $bundle = Join-Path $work 'bundle-1.0.0'
 $providerSource = Join-Path $work 'reconciler-source'
-$receipts = Join-Path $work 'reconciler-operations'
+$fixtureState = Join-Path $work 'reconciler-state'
 $config = Join-Path $work 'config.toml'
 $runtime = Join-Path $work 'runtime.json'
 $repoPort = 21980
@@ -70,13 +69,30 @@ function Wait-ServiceDeleted([int]$seconds = 30) {
     throw "service was still registered ${seconds}s after deletion"
 }
 
-# The reconciler's recorded history: one immutable file per invocation, containing
-# `operation<TAB>attempt-id<TAB>reason`. A shared append-only file makes the hook's write race the
-# harness's polling reads on Windows; publish a complete uniquely named receipt instead.
+# The shared native fixture records `operation<TAB>attempt-id<TAB>reason<TAB>version` in one
+# append-only log. Read it with sharing enabled because the hook may append while this harness polls.
 function Read-Operations() {
-    if (-not (Test-Path $receipts)) { return @() }
-    return @(Get-ChildItem -LiteralPath $receipts -Filter '*.log' | Sort-Object Name |
-        ForEach-Object { [IO.File]::ReadAllText($_.FullName) })
+    $path = Join-Path $fixtureState 'operations.log'
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    try {
+        $stream = [IO.File]::Open(
+            $path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        )
+        try {
+            $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true, 4096, $true)
+            try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } finally {
+            $stream.Dispose()
+        }
+        return @($text -split '\r?\n' | Where-Object { $_ })
+    } catch {
+        # A hook may be appending the next complete line while the harness polls. The caller owns
+        # the bounded retry; an observation race is not evidence that the invocation never ran.
+        return @()
+    }
 }
 
 function Wait-Operation(
@@ -102,9 +118,9 @@ function Wait-Operation(
 # hook result has passed the boot gate and installed.json has been atomically promoted to a
 # confirmed head. Waiting on that state is the single completion barrier before exercising SCM
 # stop/restart; otherwise the test can kill the agent between the healthcheck receipt and commit.
-# This fixture has a four-second health grace and an immediate health hook. The agent enforces that
-# grace on the hook process itself. The outer 45-second deadline also covers the separately bounded
-# initial apply plus service startup before producing diagnostics for a broken first boot.
+# This fixture has a ten-second health grace and an immediate native health hook. The agent enforces
+# that grace on the hook process itself. The outer 45-second deadline also covers the separately
+# bounded initial apply plus service startup before producing diagnostics for a broken first boot.
 function Wait-ConfirmedInstall([string]$version, [int]$seconds = 45) {
     $path = Join-Path $install 'state\installed.json'
     $deadline = (Get-Date).AddSeconds($seconds)
@@ -241,12 +257,14 @@ try {
     New-Item -ItemType Directory -Force (Join-Path $bundle 'bin') | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'config') | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $providerSource 'bin') | Out-Null
-    New-Item -ItemType Directory -Force $receipts | Out-Null
+    New-Item -ItemType Directory -Force $fixtureState | Out-Null
 
     Push-Location $root
     try {
         & cargo build --release -p server -p launcher -p agent -p windows-service -p sampleapp
         if ($LASTEXITCODE) { throw 'building SCM test binaries failed' }
+        & cargo build --release -p e2e --bin lifecycle-fixture
+        if ($LASTEXITCODE) { throw 'building the native reconciler fixture failed' }
     } finally {
         Pop-Location
     }
@@ -261,39 +279,11 @@ try {
     $initialAgent = Join-Path $work 'updated-agent.exe'
     Copy-Item (Join-Path $bin 'updated-agent.exe') $initialAgent
 
-    # The release's own node reconciler: an ordinary PowerShell script, which is the whole point of
-    # the protocol. It records every invocation and converges nothing further, standing in for the
-    # `sc.exe`/config-reload work an operator's script does here.
-    $reconcilerText = @"
-[CmdletBinding()] param([Parameter(ValueFromRemainingArguments = `$true)] [string[]] `$rest)
-`$ErrorActionPreference = 'Stop'
-`$operation = `$rest[0]
-function Value([string] `$name) {
-    for (`$i = 0; `$i -lt `$rest.Count - 1; `$i++) { if (`$rest[`$i] -eq `$name) { return `$rest[`$i + 1] } }
-    return ''
-}
-if ((Value '--protocol') -ne '1') { exit 2 }
-`$line = "`$operation`t`$(Value '--attempt-id')`t`$(Value '--reason')`t`$(Value '--candidate-version')"
-`$token = "`$([DateTime]::UtcNow.Ticks)-`$([Guid]::NewGuid().ToString('N'))"
-`$pendingReceipt = Join-Path '$receipts' "`$token.tmp"
-`$completeReceipt = Join-Path '$receipts' "`$token.log"
-[IO.File]::WriteAllText(`$pendingReceipt, `$line, [Text.UTF8Encoding]::new(`$false))
-Move-Item -LiteralPath `$pendingReceipt -Destination `$completeReceipt
-if (`$operation -eq 'inspect') { Write-Output "candidate-version=`$(Value '--candidate-version')" }
-if (`$operation -eq 'apply' -or `$operation -eq 'rollback') {
-    [IO.File]::WriteAllText(
-        (Value '--result-file'),
-        '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","message":null}',
-        [Text.UTF8Encoding]::new(`$false)
-    )
-}
-exit 0
-"@
-    [IO.File]::WriteAllText(
-        (Join-Path $providerSource 'bin\reconciler.ps1'),
-        $reconcilerText,
-        [Text.UTF8Encoding]::new($false)
-    )
+    # Reuse the one native reconciler fixture exercised by the cross-platform E2E suite. The old
+    # bespoke PowerShell implementation took 26 seconds merely to start under LocalSystem on a
+    # hosted runner, then a second cold PowerShell process exhausted the health grace. That made an
+    # SCM ownership test measure shell startup and duplicated the protocol implementation.
+    Copy-Item (Join-Path $bin 'lifecycle-fixture.exe') (Join-Path $providerSource 'bin\reconciler.exe')
 
     & (Join-Path $bin 'server.exe') init --repo $routingRepo --keys $routingKeys
     if ($LASTEXITCODE) { throw 'routing repository initialization failed' }
@@ -308,13 +298,14 @@ exit 0
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }
     & (Join-Path $bin 'server.exe') publish-provider-artifact --repo $releaseRepo --keys $releaseKeys `
         --product app-lifecycle --version 1.0.0 --bundle "windows-x86_64=$providerSource" `
-        --entrypoint bin/reconciler.ps1
+        --entrypoint bin/reconciler.exe
     if ($LASTEXITCODE) { throw 'publishing the node reconciler failed' }
     $providerTarget = 'products/app-lifecycle/stable/1.0.0/windows-x86_64/app-lifecycle'
     $providerSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $providerTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the reconciler hash failed' }
     & (Join-Path $bin 'server.exe') publish-provider-set --repo $releaseRepo --keys $releaseKeys --id default `
-        --provider-path $providerTarget --provider-sha256 $providerSha --provider-timeout-ms 30000
+        --provider-path $providerTarget --provider-sha256 $providerSha --provider-timeout-ms 10000 `
+        --provider-arg '--lifecycle-fixture' --provider-arg $fixtureState
     if ($LASTEXITCODE) { throw 'publishing provider set failed' }
     $appTarget = 'products/app/stable/1.0.0/windows-x86_64/app'
     $setTarget = 'provider-sets/default.json'
@@ -328,10 +319,10 @@ exit 0
         storage = @{inactiveReleases=2; inactiveProviders=2; inactiveAgents=1; inactiveBytes=1073741824; inactiveRepositoryCaches=2}
         # `checkIntervalSeconds` is capped at MAX_CHECK_INTERVAL_SECONDS (16) — three of a node's
         # report gaps must fit inside the 60s freshness window every reader ages reports against, so
-        # a signed assignment carrying a slower cadence is rejected at publish. The fixture's hook
-        # is immediate and deterministic, so use the same short health/confirmation timing as the
-        # native HAProxy lifecycle test. A long production soak window would only burn CI time here.
-        timeouts = @{checkIntervalSeconds=16; healthGraceSeconds=4; healthSuccesses=1; healthIntervalSeconds=1; refreshRetrySeconds=5; confirmationWindowSeconds=2; agentCheckIntervalSeconds=3600}
+        # a signed assignment carrying a slower cadence is rejected at publish. The native fixture
+        # answers immediately; ten seconds is a deadline for runner variance, not a sleep. A long
+        # production soak window would only burn CI time here.
+        timeouts = @{checkIntervalSeconds=16; healthGraceSeconds=10; healthSuccesses=1; healthIntervalSeconds=1; refreshRetrySeconds=5; confirmationWindowSeconds=2; agentCheckIntervalSeconds=3600}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $routingRepo --keys $routingKeys `

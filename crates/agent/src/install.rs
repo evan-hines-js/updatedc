@@ -112,7 +112,7 @@ pub(crate) async fn ensure_installed(
             // A *provisional* head (`confirmed == false`, never passed a health gate) that has
             // been rejected must not be relaunched into a crash loop. This is the first-install
             // case: a fresh node cold-installs its (broken) assigned head, the boot rejects it on
-            // crash/wedge, and it restarts. Re-run the cold install so ordered fallback descends
+            // crash/wedge, and it restarts. Re-run the cold install so cold-install fallback descends
             // past the rejected head to the newest healthy release. (Storage is persistent, so this
             // only ever happens during a node's initial install, never a mid-life state loss.)
             //
@@ -129,7 +129,7 @@ pub(crate) async fn ensure_installed(
                 )
             {
                 warn(&format!(
-                    "provisional head {} is rejected; re-installing so ordered fallback descends past it",
+                    "provisional head {} is rejected; re-installing so cold-install fallback descends past it",
                     state.release.version
                 ));
                 apply_install(opts, store).await?;
@@ -165,7 +165,7 @@ async fn apply_install(
     // signed archive sha but fails to extract/validate — the update path rejects it and moves on
     // (see `check_application`), and cold install must do the same or a first-install node stalls
     // forever re-downloading a bundle it can never install. Each iteration rejects one malformed
-    // head and re-selects, so ordered fallback monotonically descends to the newest *installable*
+    // head and re-selects, so cold-install fallback monotonically descends to the newest *installable*
     // release; the loop terminates when one installs or nothing selectable remains.
     let (prepared, providers) = loop {
         let request = crate::acquire::ApplicationRequest {
@@ -173,7 +173,7 @@ async fn apply_install(
             application: &opts.application,
             paths: &opts.paths,
             // A cold install: nothing is on this node, so there is no floor and a signed
-            // `orderedInstallFallback` may descend. The one stance that permits a descent.
+            // `coldInstallFallback` may descend. The one stance that permits a descent.
             stance: updated_tuf::select::Stance::Nothing,
         };
         let selected = match crate::acquire::select_assigned_application(
@@ -185,7 +185,7 @@ async fn apply_install(
             Ok(Some(selected)) => selected,
             Ok(None) => {
                 // Enumerate exactly what the repository offered and why nothing was selectable, so
-                // an empty ordered-fallback descent is diagnosable rather than opaque. Rejection
+                // an empty cold-install-fallback descent is diagnosable rather than opaque. Rejection
                 // is never-retry evidence: there is no availability exception that may relaunch
                 // already-rejected bytes, even when this node previously committed them.
                 let policy = updated_tuf::DefaultPolicy::current(
@@ -200,7 +200,7 @@ async fn apply_install(
                     },
                 );
                 return Err(format!(
-                    "the first trusted assignment contains no installable application; ordered \
+                    "the first trusted assignment contains no installable application; cold-install \
                      fallback found nothing selectable at or below the assigned head:\n{diagnostics}"
                 )
                 .into());
@@ -229,7 +229,7 @@ async fn apply_install(
                         if store.is_rejected(&lineage, &provider_set_sha256) {
                             warn(&format!(
                                 "first-install deployed unit for {} has a rejected provider set \
-                                 ({message}); ordered fallback will select the next complete unit",
+                                 ({message}); cold-install fallback will select the next complete unit",
                                 prepared.version
                             ));
                             continue;
@@ -247,7 +247,7 @@ async fn apply_install(
                     }
                     // A network or disk failure says nothing about this release. Rejection is
                     // durable and never expires, so rejecting here would let one CDN blip walk the
-                    // ordered-fallback descent to the bottom and permanently exclude every version
+                    // cold-install-fallback descent to the bottom and permanently exclude every version
                     // on the node. Fail the cold install instead and retry it on the next boot.
                     Err(error @ crate::selection::ProviderStagingError::Transient(_)) => {
                         return Err(format!(
@@ -264,7 +264,7 @@ async fn apply_install(
                 // the boot retries it later rather than treating a transient fetch as a bad release.
                 if let Some((version, archive_sha256)) = error.rejected_archive() {
                     warn(&format!(
-                        "first-install bundle {version} is malformed; rejecting it so ordered \
+                        "first-install bundle {version} is malformed; rejecting it so cold-install \
                          fallback descends past it ({error})"
                     ));
                     store.reject_artifact(&lineage, archive_sha256)?;
@@ -328,7 +328,7 @@ async fn place_and_commit(
     }
     // Commit the head *provisional*: it has never launched, let alone proven healthy. If it turns
     // out to be a broken assigned head (crashes or wedges before its first passing gate) the boot
-    // rejects it from this record and ordered fallback descends past it; the first passing health
+    // rejects it from this record and cold-install fallback descends past it; the first passing health
     // gate flips it to confirmed.
     store.commit_installed(&updated::state::InstalledState::provisional(
         tx.repository_lineage.clone(),

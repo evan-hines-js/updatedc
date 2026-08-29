@@ -110,7 +110,7 @@ fn deployment_with_name(
             path: format!("products/app/stable/{version}/{platform}/app"),
             sha256: app_sha.into(),
         },
-        ordered_install_fallback: false,
+        cold_install_fallback: false,
         provider_set: TargetSpec {
             path: "provider-sets/default.json".into(),
             sha256: provider_sha.into(),

@@ -138,6 +138,7 @@ section() {
 
 run_rust() {
   local e2e_rc killfuzz_pid="" killfuzz_rc=0
+  local killfuzz_log="$WORK/killfuzz.log"
 
   section "Installer guardrails"
   case "$(uname -s)" in
@@ -202,17 +203,25 @@ run_rust() {
 
   section "Portable updater E2E and kill fuzzer"
   if [[ "$(uname -s)" == Linux || "$(uname -s)" == Darwin ]]; then
-    cargo run -p killfuzz &
+    # These suites run concurrently, but their output must not interleave: an immediate E2E
+    # startup failure used to disappear beneath several minutes of kill-fuzzer output. Keep the
+    # foreground E2E live and replay the background suite as one labelled block when it finishes.
+    cargo run -p killfuzz >"$killfuzz_log" 2>&1 &
     killfuzz_pid=$!
     BACKGROUND_PID=$killfuzz_pid
   fi
   set +e
   cargo run -p e2e
   e2e_rc=$?
+  if (( e2e_rc != 0 )); then
+    echo "FAIL: portable E2E exited with status $e2e_rc" >&2
+  fi
   if [[ -n "$killfuzz_pid" ]]; then
     wait "$killfuzz_pid"
     killfuzz_rc=$?
     BACKGROUND_PID=""
+    section "Kill fuzzer output"
+    cat "$killfuzz_log"
   fi
   set -e
   echo "e2e exit=$e2e_rc, killfuzz exit=$killfuzz_rc"

@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     /// The provider set a release pins is signed into the app target and read exactly once —
-    /// during an ordered-fallback descent on a node, mid-rollback. A well-formed but mismatched
+    /// during a cold-install-fallback descent on a node, mid-rollback. A well-formed but mismatched
     /// path/digest pair is therefore resolved against the checked-out signed metadata here, where
     /// the answer is already in hand, instead of stalling a node at recovery time.
     #[tokio::test]

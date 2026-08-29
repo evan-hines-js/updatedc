@@ -139,7 +139,7 @@ pub(crate) async fn stage_providers(
     })?;
     // The set staged here is the one that governs the app version the caller already selected
     // (`acquire::select_assigned_application`, which is where that single decision is made). When
-    // ordered fallback descends below the assigned head (the head bytes are unusable), the
+    // cold-install fallback descends below the assigned head (the head bytes are unusable), the
     // descended app version's own signed provider set governs — app and providers roll back as
     // one signed unit rather than pairing an old app with the head's newer providers. At the
     // assigned head that set is `None` and the assignment's own pointer governs, keeping providers

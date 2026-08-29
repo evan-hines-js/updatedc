@@ -799,7 +799,7 @@ impl Store {
         self.record_install_journal(tx)
     }
 
-    /// A fresh install starts either on a truly empty node or as ordered fallback from the one
+    /// A fresh install starts either on a truly empty node or as cold-install fallback from the one
     /// installed state that has no rollback predecessor: a rejected provisional head. Both use
     /// this same journal and commit grammar; no clearing/reseeding side path exists between them.
     fn install_start_is_authorized(&self, tx: &InstallTransaction) -> io::Result<bool> {

@@ -162,7 +162,7 @@ pub(crate) struct DeployArgs {
 
     /// Target path of the provider set this release ships with. When set (together with
     /// `--provider-set-sha256`), it is signed into the app target's custom metadata, so an
-    /// ordered-fallback descent to this version re-selects exactly these providers — app and
+    /// cold-install-fallback descent to this version re-selects exactly these providers — app and
     /// providers roll back as one unit. Omit to leave provider selection to the assignment head.
     #[arg(
         long,

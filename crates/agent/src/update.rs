@@ -770,7 +770,7 @@ async fn switch_over<T: Reconciler>(
             lifecycle: tx.candidate_lifecycle.clone(),
             pending,
             // An update always has a proven predecessor: its failure recovery is this state machine's
-            // rollback, never an ordered-fallback descent, so the new head commits already confirmed.
+            // rollback, never a cold-install-fallback descent, so the new head commits already confirmed.
             confirmed: true,
         })
     );

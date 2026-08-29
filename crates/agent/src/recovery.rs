@@ -5,7 +5,7 @@
 use crate::*;
 
 /// Reject the exact deployed unit of a *provisional* (never-health-proven) cold-installed head so
-/// the next boot's cold install descends via ordered fallback past it. The application and provider
+/// the next boot's cold install descends via cold-install fallback past it. The application and provider
 /// remain independently reusable because a runtime health failure proves only their combination.
 ///
 /// Called only for a head [`boot::plan_gate_failure`] has already classified provisional: a head
@@ -22,16 +22,16 @@ pub(crate) fn reject_provisional_head(
     )?;
     warn(&format!(
         "provisional head {} never passed a health gate; rejected its exact deployment so the \
-         next cold install descends via ordered fallback",
+         next cold install descends via cold-install fallback",
         state.release.version
     ));
     Ok(())
 }
 
 /// How many consecutive boots may fail to health-gate a crash-recovered rollback's predecessor
-/// before the agent stops retrying it and descends via ordered fallback. More than one so a
+/// before the agent settles on that exact predecessor and reports it unhealthy. More than one so a
 /// merely slow-to-start predecessor is not abandoned on its first miss; small so a genuinely broken
-/// predecessor cannot keep the node down for long.
+/// predecessor cannot keep the node in a launcher restart loop.
 pub(crate) const MAX_ROLLBACK_HEALTH_ATTEMPTS: u32 = 3;
 
 /// What a boot does after a crash-recovered rollback's predecessor fails its health gate.
@@ -40,12 +40,10 @@ pub(crate) enum RollbackHealthOutcome {
     /// Still under the bound: the incremented counter is persisted and the same predecessor is
     /// retried on the next boot. Carries the attempt number for the log.
     Retry(u32),
-    /// The bound was reached: the failed candidate's `rollback` compensation is run first, then the
-    /// predecessor's deployed unit is rejected, it is recorded as a provisional (now-rejected)
-    /// head, and
-    /// the rollback journal is cleared, so the next boot's [`ensure_installed`] descends via ordered
-    /// fallback past it exactly as a cold install does.
-    Descend,
+    /// The bound was reached: the failed candidate's `rollback` compensation has been consumed and
+    /// the transaction is terminal. The caller must finish the ordinary recovery commit, retaining
+    /// the exact previously confirmed predecessor and reporting its current health as unhealthy.
+    SettledUnhealthy,
 }
 
 /// Bound rollback-target health failures so a predecessor deployment that can no longer pass the gate
@@ -53,19 +51,19 @@ pub(crate) enum RollbackHealthOutcome {
 /// re-derives the rollback on each boot, so it survives the launcher relaunch). Once it reaches
 /// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], this compensates the failed candidate through the release's
 /// own `rollback` — the agent promises reconciler authors that every `apply` it drives is
-/// compensated, and abandoning the transaction here would break that promise with the journal
-/// destroyed — and then rejects the predecessor, records it provisional, and drops the journal, so
-/// the next boot descends via the cold-install ordered-fallback path instead of relaunching the
-/// same broken predecessor.
+/// compensated — and marks the rollback terminal. The caller then uses the same commit-and-clear
+/// path as every successful rollback. The exact previously confirmed predecessor remains selected;
+/// its current health is reported as unhealthy. Recovery never turns a failed direct update into an
+/// inferred walk through repository history.
 ///
 /// The compensation is journaled before it is attempted, and the failure tally is the durable
 /// marker that makes it one shot rather than a relaunch loop: the boot that reaches the bound
 /// persists the count at exactly [`MAX_ROLLBACK_HEALTH_ATTEMPTS`] before invoking the hook, so a
 /// boot that finds the count already past the bound knows the previous attempt did not complete and
-/// descends uncompensated instead of relaunching into it forever. Worst case, two boots.
+/// settles without invoking it again instead of relaunching into it forever. Worst case, two boots.
 ///
-/// The phase is deliberately not advanced across this: the predecessor never became healthy, and
-/// [`Transaction::advance`] admits only the true rollback edges.
+/// Settlement advances only across the ordinary `RollbackApplied -> RolledBack` edge. It does not
+/// manufacture a success verdict; the caller carries the failed health gate into telemetry.
 pub(crate) fn bound_unhealthy_rollback(
     store: &mut Store,
     tx: &mut Transaction,
@@ -82,7 +80,7 @@ pub(crate) fn bound_unhealthy_rollback(
         } else {
             warn(
                 "the failed candidate's rollback compensation was already attempted and did not \
-                 complete; descending uncompensated rather than relaunching into it forever",
+                 complete; settling on the exact predecessor without repeating it forever",
             );
             // Record the observation as its own state transition before moving the phase. Keeping
             // one durable mutation per write lets the storage boundary reject skipped history
@@ -94,19 +92,7 @@ pub(crate) fn bound_unhealthy_rollback(
         if tx.recovery_pending(TransactionPhase::RolledBack) {
             update::advance_transaction(store, tx, TransactionPhase::RolledBack)?;
         }
-        store.reject_deployment(
-            &tx.previous_repository_lineage,
-            &tx.previous_archive_sha256,
-            &tx.previous_lifecycle.provider_set_sha256,
-        )?;
-        store.commit_installed(&updated::state::InstalledState::provisional(
-            tx.previous_repository_lineage.clone(),
-            tx.previous_release.clone(),
-            tx.previous_archive_sha256.clone(),
-            tx.previous_lifecycle.clone(),
-        ))?;
-        store.clear_journal()?;
-        Ok(RollbackHealthOutcome::Descend)
+        Ok(RollbackHealthOutcome::SettledUnhealthy)
     } else {
         // Persist the incremented count (phase unchanged) so the next boot resumes the tally.
         persist_transaction(store, tx)?;

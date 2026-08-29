@@ -2306,7 +2306,7 @@ mod tests {
                 path: "app".into(),
                 sha256: DIGEST.into(),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: crate::ExactTarget {
                 path: "prov".into(),
                 sha256: "b".repeat(64),

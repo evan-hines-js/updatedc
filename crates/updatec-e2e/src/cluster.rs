@@ -1054,11 +1054,11 @@ fn apply_resources(
         // patches. The Jenkins groups below keep edge's release-server repo (the default path).
         deployment["releaseRepository"] = minio_release_repository.clone();
         deployment["providerSet"] = provider.clone();
-        // Signed opt-in to first-install ordered fallback: a killed, stateless agent
+        // Signed opt-in to first-install cold-install fallback: a killed, stateless agent
         // pod returns cold and must descend from its assigned version to the newest
         // healthy release rather than stranding on a broken head. This is what makes
         // the pod-kill chaos survivable across every cohort under rollout.
-        deployment["orderedInstallFallback"] = serde_json::json!(true);
+        deployment["coldInstallFallback"] = serde_json::json!(true);
         // Fast test cadence so the fleet reacts within a second or two instead of the
         // production-shaped 5-60s defaults: agents check for new desired state every second,
         // retry and refresh quickly, and don't linger in a long health grace. These are signed
@@ -1119,7 +1119,7 @@ fn apply_resources(
                 "path": jenkins.provider_path,
                 "sha256": jenkins.provider_sha.trim()
             });
-            deployment["orderedInstallFallback"] = serde_json::json!(false);
+            deployment["coldInstallFallback"] = serde_json::json!(false);
             deployment["runtime"]["product"] = "jenkins".into();
             // The Jenkins reconciler backs JENKINS_HOME up before activation and reuses it; the
             // hook owns the process, and rollback restores the backup. Jenkins's first install

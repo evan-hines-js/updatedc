@@ -322,7 +322,7 @@ fn haproxy_group_deployment(
     deployment["providerSet"] =
         serde_json::json!({"path": release.provider_path, "sha256": release.provider_sha});
     deployment["releaseRepository"] = minio_release_repository(release_root);
-    deployment["orderedInstallFallback"] = serde_json::json!(false);
+    deployment["coldInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
     // No install-root override: a node's install root is pinned at enrollment and the agent fails
     // closed on an assignment that would move it. Each node runs exactly one product, so the
@@ -737,7 +737,7 @@ mod tests {
                 path: "app-1.0.0.tar.zst".into(),
                 sha256: "a".repeat(64),
             },
-            ordered_install_fallback: true,
+            cold_install_fallback: true,
             provider_set: updatec::TargetSpec {
                 path: "providers-1.0.0.tar.zst".into(),
                 sha256: "b".repeat(64),

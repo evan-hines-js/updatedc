@@ -11,13 +11,13 @@
     "metadataUrl",
     "targetsUrl",
     "application",
-    "orderedInstallFallback",
+    "coldInstallFallback",
     "providerSet",
     "releaseRoot",
     "runtime"
   ],
   "properties": {
-    "schema": { "const": 3 },
+    "schema": { "const": 4 },
     "deployment": {
       "description": "Bounded deployment identity copied into status and telemetry: 1-128 characters of lowercase ASCII letters, digits, dot, underscore, or dash, beginning and ending with a letter or digit. Uppercase is refused so one identity cannot become two on a case-folding filesystem, and reserved Windows device stems (con, prn, aux, nul, com1-9, lpt1-9), alone or with an extension, are excluded.",
       "type": "string",
@@ -38,8 +38,8 @@
     "application": {
       "$ref": "https://updated.dev/schemas/target-reference.schema.json"
     },
-    "orderedInstallFallback": {
-      "description": "On a first install, allow the node to fall back to an ordered-lower release when the exact assigned target cannot be resolved.",
+    "coldInstallFallback": {
+      "description": "Only when no release has ever been installed, allow descent through signed repository history if the exact assigned head is unusable. This is never an update or rollback policy.",
       "type": "boolean"
     },
     "providerSet": {

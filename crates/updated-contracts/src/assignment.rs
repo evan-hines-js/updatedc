@@ -10,7 +10,7 @@
 //! Every name in this document is camelCase, matching the CRD the operator writes and the fields
 //! the node reads. A value that crosses that boundary must not change spelling on the way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,7 @@ pub struct RepositoryAssignment {
     pub metadata_url: String,
     pub targets_url: String,
     pub application: TargetReference,
-    pub ordered_install_fallback: bool,
+    pub cold_install_fallback: bool,
     pub provider_set: TargetReference,
     pub release_root: serde_json::Value,
     pub runtime: ManagedRuntime,
@@ -81,7 +81,7 @@ pub struct ManagedTimeouts {
 impl RepositoryAssignment {
     /// The one assignment shape this build reads and writes. Every nested struct denies unknown
     /// fields, and validation requires exact schema equality; no compatibility or alias path exists.
-    pub const SCHEMA: u32 = 3;
+    pub const SCHEMA: u32 = 4;
     /// Whole signed configuration ceiling. The bounded input selection is at most one dataflow
     /// document; the additional MiB covers the pinned TUF root and fixed runtime fields.
     pub const MAX_DOCUMENT_BYTES: usize = crate::dataflow::MAX_DATAFLOW_BODY_BYTES + 1024 * 1024;
@@ -170,7 +170,12 @@ impl RepositoryAssignment {
 /// directory-shaped and carries no credentials or bearer query material.
 pub fn canonical_repository_base(value: &str) -> Result<url::Url, String> {
     let url = if PathBuf::from(value).is_absolute() {
-        if !value.ends_with(std::path::MAIN_SEPARATOR) {
+        // Windows accepts both separators in native paths. Requiring only `\\` made a valid
+        // `C:\\repository/` directory fail depending on which path joiner produced the string.
+        // On Unix a trailing backslash is an ordinary filename byte, so it must not be accepted.
+        let has_directory_separator =
+            value.ends_with('/') || (cfg!(windows) && value.ends_with('\\'));
+        if !has_directory_separator {
             return Err("absolute offline directory must end in a path separator".into());
         }
         url::Url::from_directory_path(value)
@@ -227,14 +232,37 @@ pub const MAX_INTERVAL_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub const MAX_REPOSITORY_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_REPOSITORY_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The wire grammar for an install root. Assignments are published for nodes that may run a
+/// different operating system from the publisher, so this may never use the publisher's
+/// `Path::is_absolute`: a Windows control plane must be able to sign `/opt/app` for a Linux node,
+/// and a Linux control plane must be able to sign `C:\\ProgramData\\app` for a Windows node.
+///
+/// Keep this spelling identical to `schemas/desired-deployment.schema.json`; the schema test below
+/// makes a generated/static schema drift fail in CI.
+pub const INSTALL_ROOT_SCHEMA_PATTERN: &str = r"^(/|[A-Za-z]:[\\/])";
+
+fn is_absolute_install_root(path: &Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
 impl ManagedRuntime {
     /// Validate signed runtime policy without consulting node-local state.
     pub fn validate(&self) -> Result<(), String> {
         if !crate::identity::is_segment(&self.product)
             || !crate::identity::is_segment(&self.channel)
-            || !self.install_root.is_absolute()
         {
-            return Err("managed runtime product/channel/install_root is invalid".into());
+            return Err("managed runtime product/channel identity is invalid".into());
+        }
+        if !is_absolute_install_root(&self.install_root) {
+            return Err("managed runtime install_root is not an absolute node path".into());
         }
         if self.repository.metadata_limit == 0
             || self.repository.target_limit == 0
@@ -326,6 +354,17 @@ impl ManagedRuntime {
                 "health_grace_seconds ({}) must be >= (health_successes-1)*health_interval_seconds ({min_grace}); otherwise the health streak can never complete within the grace window",
                 self.timeouts.health_grace_seconds
             ));
+        }
+        Ok(())
+    }
+
+    /// Validate the signed policy at the node boundary where its paths become local filesystem
+    /// authority. Publishers use [`Self::validate`] because they may publish for another OS; the
+    /// node must additionally refuse a root that is not absolute under its own path semantics.
+    pub fn validate_for_current_platform(&self) -> Result<(), String> {
+        self.validate()?;
+        if !self.install_root.is_absolute() {
+            return Err("managed runtime install_root is not absolute on this node".into());
         }
         Ok(())
     }
@@ -435,7 +474,7 @@ mod tests {
                 path: "app".into(),
                 sha256: "a".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: TargetReference {
                 path: "providers".into(),
                 sha256: "b".repeat(64),
@@ -448,6 +487,40 @@ mod tests {
     #[test]
     fn shared_runtime_fixture_is_valid_on_the_host_platform() {
         runtime().validate().expect("shared runtime fixture");
+    }
+
+    #[test]
+    fn install_roots_are_validated_for_the_destination_node_not_the_publisher_host() {
+        for absolute in ["/opt/app", r"C:\ProgramData\app", "D:/apps/app"] {
+            let mut value = runtime();
+            value.install_root = absolute.into();
+            value
+                .validate()
+                .unwrap_or_else(|error| panic!("destination path {absolute:?}: {error}"));
+        }
+        for relative in ["app", "opt/app", r"C:apps\app", ""] {
+            let mut value = runtime();
+            value.install_root = relative.into();
+            assert!(value.validate().is_err(), "relative path {relative:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_accepts_only_its_native_absolute_install_root() {
+        let mut value = runtime();
+        value
+            .validate_for_current_platform()
+            .expect("the shared runtime uses the node's native absolute path");
+
+        value.install_root = if cfg!(windows) {
+            "/opt/app".into()
+        } else {
+            r"C:\ProgramData\app".into()
+        };
+        value
+            .validate()
+            .expect("a publisher may target a node running another OS");
+        assert!(value.validate_for_current_platform().is_err());
     }
 
     #[test]
@@ -483,6 +556,14 @@ mod tests {
         assert!(canonical_repository_base("file:///opt/updated/targets/")
             .unwrap_err()
             .contains("on this platform"));
+
+        #[cfg(windows)]
+        assert_eq!(
+            canonical_repository_base(r"C:\ProgramData\updated\targets/")
+                .expect("Windows accepts either native directory separator")
+                .scheme(),
+            "file"
+        );
     }
 
     #[test]
@@ -708,7 +789,7 @@ mod tests {
     /// document being closed all the way down: the first generation that emits a new optional field
     /// is refused by every not-yet-upgraded node, so nobody may reach for one.
     ///
-    /// The probe this replaces was `{"schema":3,"deployment":"d1","unexpected":true}` — a document
+    /// The probe this replaces was `{"schema":4,"deployment":"d1","unexpected":true}` — a document
     /// missing eight required fields, which serde rejects for the missing fields whether or not the
     /// struct is closed. Removing `deny_unknown_fields` from any of these structs left it green.
     /// Each probe below is a COMPLETE, valid document with exactly one unknown key inserted, so
@@ -795,6 +876,10 @@ mod tests {
 
             let runtime = &schema["$defs"]["runtime"];
             assert_object(runtime, &value.runtime, &["inputs"], "runtime");
+            assert_eq!(
+                runtime["properties"]["installRoot"]["pattern"],
+                Value::from(INSTALL_ROOT_SCHEMA_PATTERN)
+            );
             assert_eq!(
                 runtime["properties"]["product"]["maxLength"],
                 Value::from(crate::identity::MAX_SEGMENT_BYTES)

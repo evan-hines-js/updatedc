@@ -147,7 +147,7 @@ mod fixture {
                 path: "app".into(),
                 sha256: "a".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: updated_contracts::artifact::TargetReference {
                 path: "providers".into(),
                 sha256: "b".repeat(64),
@@ -179,7 +179,10 @@ mod error_tests {
 
         let guard = tempfile::tempdir().unwrap();
         let dir = guard.path().to_path_buf();
-        let install_root = std::path::Path::new("/app");
+        // The signed fixture is portable, but its node-local root must match the platform running
+        // this boot-config test. Derive both sides from the same enrollment/runtime fixture so the
+        // test exercises persisted-assignment identity rather than a Unix path assumption.
+        let install_root = runtime().install_root;
         let path = updated::config::persisted_assignment_path(&dir);
         let usable = || assignment("deployment");
         let plant = |value: serde_json::Value| {
@@ -188,13 +191,13 @@ mod error_tests {
 
         // Absent — the ordinary first boot, and the only case that is not a fault.
         assert!(matches!(
-            persisted_assignment(&dir, install_root),
+            persisted_assignment(&dir, &install_root),
             LiveAssignment::Absent
         ));
 
         plant(serde_json::to_value(usable()).unwrap());
         let persisted_bytes = std::fs::read(&path).unwrap();
-        let resolved = persisted_assignment(&dir, install_root)
+        let resolved = persisted_assignment(&dir, &install_root)
             .usable()
             .unwrap_or_else(|reason| panic!("a valid persisted assignment is usable: {reason}"));
         assert_eq!(
@@ -219,7 +222,7 @@ mod error_tests {
             let mut value = serde_json::to_value(usable()).unwrap();
             mutate(&mut value);
             plant(value);
-            let reason = persisted_assignment(&dir, install_root)
+            let reason = persisted_assignment(&dir, &install_root)
                 .usable()
                 .err()
                 .unwrap_or_else(|| panic!("{expected} must not be usable as a boot config"))
@@ -231,7 +234,7 @@ mod error_tests {
         }
 
         std::fs::write(&path, b"{not json").unwrap();
-        let reason = persisted_assignment(&dir, install_root)
+        let reason = persisted_assignment(&dir, &install_root)
             .usable()
             .expect_err("malformed JSON is never usable")
             .to_string();
@@ -424,7 +427,7 @@ mod error_tests {
                 path: "products/app/stable/1.0.0/linux-x86_64/app".into(),
                 sha256: "a".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: updated_contracts::artifact::TargetReference {
                 path: "provider-sets/web.json".into(),
                 sha256: "b".repeat(64),

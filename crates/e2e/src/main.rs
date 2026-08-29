@@ -73,7 +73,7 @@ fn scenarios() -> Vec<Scenario> {
             cold_install_descends_past_broken_head,
         ),
         (
-            "a cold node fails closed when every ordered-install candidate has been rejected",
+            "a cold node fails closed when every cold-install candidate has been rejected",
             cold_install_fails_closed_when_every_candidate_is_rejected,
         ),
         (

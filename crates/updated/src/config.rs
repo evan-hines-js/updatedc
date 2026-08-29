@@ -143,7 +143,10 @@ impl Config {
         assignment_sha256: &str,
         routing: Routing,
     ) -> Result<Config, String> {
-        runtime.validate()?;
+        // This is the sole boundary where portable signed paths become node-local filesystem
+        // authority. Publication validation deliberately accepts absolute roots for every
+        // supported OS; materialization must additionally require this node's path semantics.
+        runtime.validate_for_current_platform()?;
         if !updated_contracts::is_canonical_sha256(assignment_sha256) {
             return Err("materialized assignment identity is not a canonical SHA-256".into());
         }

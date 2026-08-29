@@ -323,7 +323,7 @@ impl PublishTarget {
     }
 
     /// Bind the provider set this application version was published with into the target's
-    /// signed custom metadata. When an ordered-fallback descent selects this older app
+    /// signed custom metadata. When a cold-install-fallback descent selects this older app
     /// version, it re-selects exactly these providers — so the app and its providers roll
     /// back as one signed unit, never pairing an old app with the head's newer providers.
     /// The assignment's own `provider_set` still governs the assigned *head*, so providers
@@ -1144,7 +1144,7 @@ pub async fn target_sha256_if_present(repo_dir: &Path, name: &str) -> Result<Opt
 /// `ProviderSet::validate` is syntactic: a stale copy-paste that pairs one artifact's path with a
 /// previous build's digest passes every check it makes and is signed into an immutable target. It
 /// then fails once, much later and fleet-wide, when `stage_providers` calls `exact_target` on a
-/// node — a cold install walks ordered fallback down past the version, and an update returns
+/// node — a cold install walks cold-install fallback down past the version, and an update returns
 /// `Unchanged`, so the group stalls with nothing to correct in place. The repository in hand is
 /// the same signed targets metadata every agent verifies against, so resolving it here turns that
 /// into a publish-time refusal with nothing signed.

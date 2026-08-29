@@ -62,7 +62,7 @@ pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
         archive,
     );
     // Bind the resolved provider set into this app version's signed metadata, so a later
-    // ordered-fallback descent rolls providers back with it.
+    // cold-install-fallback descent rolls providers back with it.
     if let Some((path, sha256)) = &provider_set {
         target = target.with_provider_set(path, sha256);
     }
@@ -104,7 +104,7 @@ pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
 /// already holds, returning the normalized reference to sign into the app target.
 ///
 /// The reference is signed into the app version's custom metadata and then read exactly once,
-/// much later: when an ordered-fallback descent picks this version on a node, `stage_providers`
+/// much later: when a cold-install-fallback descent picks this version on a node, `stage_providers`
 /// calls `exact_target` on it. A well-formed but unresolvable reference — a stale copy-paste of a
 /// previous set's path against the new set's digest, or a set published under a different prefix —
 /// is accepted by every syntactic check and only fails there, leaving the node unable to complete

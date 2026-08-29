@@ -649,13 +649,14 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     let gate_passed = matches!(gate, update::Health::Ready);
     if !gate_passed {
+        let mut gate_failure_state: &updated::state::InstalledState = installed_state.as_ref();
         // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
         // dangerous case: the still-deferred `store.installed()` holds the CONFIRMED candidate, not
         // the predecessor, so without a bound the launcher relaunches, the journal re-derives the
         // identical rollback, and it runs forever with nothing converged. Bound it: count failures
         // durably in the journal (which is what survives the relaunch) and, once the limit is hit,
-        // reject the predecessor's bytes and descend via the same ordered-fallback path a cold
-        // install uses.
+        // finish the rollback onto the exact previously confirmed predecessor and report its current
+        // health as unhealthy. Repository history is not a recovery policy.
         if let Some(tx) = recovery_transaction.as_mut().filter(|tx| tx.is_rollback()) {
             let predecessor = tx.previous_release.version.clone();
             let opts = &opts;
@@ -679,28 +680,37 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .map(drop)
             }) {
-                Ok(RollbackHealthOutcome::Descend) => error(&format!(
-                    "rollback target {predecessor} is unhealthy after {MAX_ROLLBACK_HEALTH_ATTEMPTS} \
-                     attempts; compensated the failed candidate, rejected the predecessor's bytes \
-                     and cleared the rollback so the next boot descends via ordered fallback past it"
-                )),
-                Ok(RollbackHealthOutcome::Retry(attempt)) => warn(&format!(
-                    "rollback target {predecessor} unhealthy (attempt {attempt} of \
-                     {MAX_ROLLBACK_HEALTH_ATTEMPTS}); retrying the same predecessor on the next boot"
-                )),
+                Ok(RollbackHealthOutcome::SettledUnhealthy) => {
+                    gate_failure_state = plan.commit.as_ref().ok_or(
+                        "a bounded rollback settlement has no predecessor state to commit",
+                    )?;
+                    warn(&format!(
+                        "rollback target {predecessor} is unhealthy after \
+                         {MAX_ROLLBACK_HEALTH_ATTEMPTS} attempts; settling on that exact previously \
+                         confirmed release and reporting it unhealthy"
+                    ));
+                }
+                Ok(RollbackHealthOutcome::Retry(attempt)) => {
+                    warn(&format!(
+                        "rollback target {predecessor} unhealthy (attempt {attempt} of \
+                         {MAX_ROLLBACK_HEALTH_ATTEMPTS}); retrying the same predecessor on the next boot"
+                    ));
+                    return Err("the rollback target failed its health gate".into());
+                }
                 Err(error) => {
                     return Err(exit_for_relaunch(
-                        "rollback compensation before descending",
+                        "rollback compensation before settling on the predecessor",
                         &error,
                     ));
                 }
             }
-            return Err("the rollback target failed its health gate".into());
         }
-        // Otherwise the answer is the committed record's alone: revert inside a confirmation
-        // window, reject a never-proven provisional head, or merely report. See
-        // [`boot::plan_gate_failure`].
-        match boot::plan_gate_failure(&installed_state) {
+        // Classify every failed gate through the same policy. During a bounded rollback settlement
+        // the installed file intentionally still names the failed candidate until the common
+        // recovery commit below, so use the exact confirmed predecessor state that commit will
+        // make authoritative. It classifies as report-only and cannot start a second rollback from
+        // the already-terminal journal.
+        match boot::plan_gate_failure(gate_failure_state) {
             GateFailure::Revert => {
                 if let Err(error) =
                     revert_unconfirmed_head(&mut store, &installed_state, bytes_repaired)
@@ -708,8 +718,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     return Err(exit_for_relaunch("recording the revert", &error));
                 }
                 return Err(
-                    "the unconfirmed release failed its boot health gate; reverting on the \
-                         next boot"
+                    "the unconfirmed release failed its boot health gate; reverting on the next \
+                     boot"
                         .into(),
                 );
             }
@@ -723,18 +733,19 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("the provisional head failed its boot health gate".into());
             }
             // A confirmed release that is unhealthy is REPORTED, never reverted locally: the
-            // reconciler owns the workload and may converge it later, and there is no
-            // predecessor image left to revert to. Exiting instead would hand the node to the
-            // init system's restart loop with nothing to fix on the next boot.
+            // reconciler owns the workload and may converge it later, and there is no predecessor
+            // image left to revert to. Exiting instead would hand the node to the init system's
+            // restart loop with nothing to fix on the next boot.
             GateFailure::Report => warn(&format!(
                 "the committed release {} is unhealthy; reporting it and continuing to \
                      reconcile",
-                installed_state.release.version
+                gate_failure_state.release.version
             )),
         }
     }
-    // The head has now proven healthy this boot: confirm it so a later transient unhealth of this
-    // (proven) head is reported and reconciled, not rejected as a broken head.
+    // A head that proved healthy this boot can now be confirmed, so a later transient unhealth of
+    // that proven head is reported and reconciled rather than rejected as a broken head. A bounded
+    // unhealthy rollback settlement deliberately continues below without confirming anything.
     if gate_passed {
         // Confirmation is one store operation so both of its installed-state reads remain inside
         // the same Windows sharing/lock retry boundary.
@@ -1980,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn a_persistently_unhealthy_rollback_target_descends_instead_of_looping() {
+    fn a_persistently_unhealthy_rollback_target_settles_without_inventing_a_release() {
         let lineage = crate::test_support::lineage();
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
@@ -2028,13 +2039,12 @@ mod tests {
             .unwrap();
 
         // Each iteration models one boot that re-derives the rollback from the durable journal and
-        // fails the predecessor's health gate. The loop must terminate (descend), never spin.
+        // fails the predecessor's health gate. The loop must terminate on the exact predecessor,
+        // never spin and never reinterpret repository history as a recovery plan.
         let mut compensations = Vec::new();
         let mut outcomes = Vec::new();
         for _ in 0..MAX_ROLLBACK_HEALTH_ATTEMPTS + 5 {
-            let Some(mut derived) = store.journal().unwrap() else {
-                break; // journal cleared: we descended, so the next boot no longer rolls back.
-            };
+            let mut derived = store.journal().unwrap().expect("the rollback journal");
             assert!(derived.is_rollback());
             let outcome =
                 bound_unhealthy_rollback(&mut store, &mut derived, &mut |tx: &Transaction| {
@@ -2046,7 +2056,7 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            let done = outcome == RollbackHealthOutcome::Descend;
+            let done = outcome == RollbackHealthOutcome::SettledUnhealthy;
             outcomes.push(outcome);
             if done {
                 break;
@@ -2058,11 +2068,11 @@ mod tests {
             vec![
                 RollbackHealthOutcome::Retry(1),
                 RollbackHealthOutcome::Retry(2),
-                RollbackHealthOutcome::Descend,
+                RollbackHealthOutcome::SettledUnhealthy,
             ],
-            "the rollback must be bounded at {MAX_ROLLBACK_HEALTH_ATTEMPTS} attempts, then descend"
+            "the rollback must be bounded at {MAX_ROLLBACK_HEALTH_ATTEMPTS} attempts, then settle"
         );
-        // The descend is not an abandonment: the failed candidate's `apply` is compensated by the
+        // Settlement is not an abandonment: the failed candidate's `apply` is compensated by the
         // release's own `rollback` — once, under the transaction's compensating identity, with the
         // restored predecessor as the candidate — before the journal that carries the evidence is
         // destroyed.
@@ -2071,36 +2081,37 @@ mod tests {
             vec![(
                 format!("{}r", digest("attempt")),
                 predecessor.clone(),
-                candidate
+                candidate.clone()
             )],
-            "the descend compensates exactly once, with the rollback direction's arguments"
+            "settlement compensates exactly once, with the rollback direction's arguments"
         );
-        // On descent the exact predecessor deployment is rejected and it is recorded provisional
-        // with the journal cleared — exactly the state `ensure_installed` treats as "descend via
-        // ordered fallback past this head" on the next boot. Neither reusable artifact is poisoned.
+        // The bounded helper leaves finalization to the one ordinary recovery path. It must not
+        // reject or rewrite the predecessor, because that would turn a failed direct update into a
+        // hidden search for an intermediate release on the next boot.
         let predecessor_rejection =
             deployment_rejection(&digest("archive-one"), &provider().provider_set_sha256);
-        assert!(store.is_rejected(&lineage, &predecessor_rejection));
+        assert!(!store.is_rejected(&lineage, &predecessor_rejection));
         assert!(!store.is_rejected(&lineage, &digest("archive-one")));
-        assert!(store.journal().unwrap().is_none());
+        let terminal = store
+            .journal()
+            .unwrap()
+            .expect("finalization still owns the journal");
+        assert_eq!(terminal.phase, Phase::RolledBack);
         match store.installed().unwrap() {
             Installed::Present(state) => {
-                assert_eq!(state.release, predecessor);
-                assert!(
-                    !state.confirmed,
-                    "the descended-from predecessor is recorded provisional so cold install re-descends"
-                );
+                assert_eq!(state.release, candidate);
+                assert!(state.confirmed, "the helper never rewrites committed state");
             }
-            _ => panic!("expected a provisional predecessor record"),
+            _ => panic!("expected the pre-finalization candidate record"),
         }
     }
 
     #[test]
-    fn a_failing_compensation_holds_the_descend_for_exactly_one_more_boot() {
+    fn a_failing_compensation_delays_settlement_for_exactly_one_more_boot() {
         // The compensation must be durable-intent-first and one-shot: the boot that reaches the
         // bound journals the tally, invokes the hook, and — if the hook fails — exits with the
         // journal intact so the launcher relaunches. The next boot must NOT re-invoke it forever;
-        // it descends uncompensated, which is what bounds the whole thing at two boots.
+        // it settles without repeating the hook, which is what bounds the whole thing at two boots.
         let lineage = crate::test_support::lineage();
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
@@ -2147,41 +2158,48 @@ mod tests {
             invocations += 1;
             Err(io::Error::other("the rollback hook exited non-zero"))
         });
-        assert!(failed.is_err(), "a failed compensation is not a descend");
+        assert!(failed.is_err(), "a failed compensation is not a settlement");
         assert_eq!(invocations, 1);
         let held = store
             .journal()
             .unwrap()
-            .expect("the journal survives so the next boot still owes the descend");
+            .expect("the journal survives so the next boot still owes settlement");
         assert_eq!(held.rollback_health_failures, MAX_ROLLBACK_HEALTH_ATTEMPTS);
         assert!(
             !store.is_rejected(&lineage, &digest("archive-one")),
-            "nothing is decided until the descend actually runs"
+            "nothing is decided until settlement actually runs"
         );
 
-        // The next boot descends without a second invocation.
+        // The next boot settles without a second invocation.
         let mut derived = store.journal().unwrap().expect("the rollback journal");
         let outcome = bound_unhealthy_rollback(&mut store, &mut derived, &mut |_| {
             invocations += 1;
             Ok(())
         })
         .unwrap();
-        assert_eq!(outcome, RollbackHealthOutcome::Descend);
+        assert_eq!(outcome, RollbackHealthOutcome::SettledUnhealthy);
         assert_eq!(
             invocations, 1,
             "the durable tally makes the compensation one-shot, never a relaunch loop"
         );
         let predecessor_rejection =
             deployment_rejection(&digest("archive-one"), &provider().provider_set_sha256);
-        assert!(store.is_rejected(&lineage, &predecessor_rejection));
+        assert!(!store.is_rejected(&lineage, &predecessor_rejection));
         assert!(!store.is_rejected(&lineage, &digest("archive-one")));
-        assert!(store.journal().unwrap().is_none());
+        assert_eq!(
+            store
+                .journal()
+                .unwrap()
+                .expect("finalization owns the journal")
+                .phase,
+            Phase::RolledBack
+        );
         match store.installed().unwrap() {
             Installed::Present(state) => {
-                assert_eq!(state.release, predecessor);
-                assert!(!state.confirmed);
+                assert_eq!(state.release.version, "2.0.0");
+                assert!(state.confirmed);
             }
-            _ => panic!("expected a provisional predecessor record"),
+            _ => panic!("expected the pre-finalization candidate record"),
         }
     }
 
@@ -2407,7 +2425,7 @@ mod tests {
                 path: "releases/app/2/app.bundle".into(),
                 sha256: "a".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: TargetReference {
                 path: "provider-sets/default.json".into(),
                 sha256: "b".repeat(64),

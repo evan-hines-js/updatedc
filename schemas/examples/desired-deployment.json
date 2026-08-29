@@ -1,5 +1,5 @@
 {
-  "schema": 3,
+  "schema": 4,
   "deployment": "production-web-2026-07-18.1",
   "metadataUrl": "https://cdn.example.com/tuf/metadata/",
   "targetsUrl": "https://cdn.example.com/tuf/targets/",
@@ -7,7 +7,7 @@
     "path": "products/web/stable/2.7.1/linux-x86_64/app",
     "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
   },
-  "orderedInstallFallback": false,
+  "coldInstallFallback": false,
   "providerSet": {
     "path": "provider-sets/web-linux-v4.json",
     "sha256": "2222222222222222222222222222222222222222222222222222222222222222"

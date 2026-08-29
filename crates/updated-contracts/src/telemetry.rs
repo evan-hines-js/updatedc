@@ -294,7 +294,7 @@ pub struct NodeReport {
     /// first assignment.
     pub assignment_sha256: String,
     /// The semantic version the node is *actually running* right now, independent of what it
-    /// was assigned — after a rollback or ordered-fallback descent this is the version that
+    /// was assigned — after a rollback or cold-install-fallback descent this is the version that
     /// really answered, not the desired one. It is the control plane's authoritative source
     /// of a node's running version, so no consumer ever has to probe the managed app (which
     /// may speak any protocol, or none). Empty only before the first install completes.
@@ -306,7 +306,7 @@ pub struct NodeReport {
     /// bytes are executing, so a reader can join a running node straight to whatever it knows
     /// about that digest (provenance, an attestation, a policy decision) without trusting a
     /// version string or re-deriving the assignment the node was given. It is the running
-    /// digest, not the assigned one: after a rollback or an ordered-fallback descent it names
+    /// digest, not the assigned one: after a rollback or a cold-install-fallback descent it names
     /// the predecessor that really answered.
     ///
     /// Empty only before the first install completes, matching [`NodeReport::version`]. Any

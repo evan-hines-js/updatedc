@@ -91,7 +91,7 @@ async fn preplaced_enrollment_resolves_offline_through_the_live_repository() {
             path: "products/offline-app/stable/1/linux-x86_64/app".into(),
             sha256: "a".repeat(64),
         },
-        ordered_install_fallback: false,
+        cold_install_fallback: false,
         provider_set: updated_contracts::artifact::TargetReference {
             path: "provider-sets/default.json".into(),
             sha256: "b".repeat(64),
@@ -200,7 +200,7 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
                 path: "products/app/stable/1/linux-x86_64/app".into(),
                 sha256: "a".repeat(64),
             },
-            ordered_install_fallback: false,
+            cold_install_fallback: false,
             provider_set: updated_contracts::artifact::TargetReference {
                 path: "provider-sets/default.json".into(),
                 sha256: "b".repeat(64),

@@ -1,6 +1,9 @@
-//! Choosing the newest installable target from verified TUF metadata — the single
-//! selection path shared by the agent (both the application and its own
-//! self-update) and the one-shot updater.
+//! Choosing a release from verified TUF metadata.
+//!
+//! Ordinary updates inspect only the repository head: if that exact release is
+//! rejected or cannot be authorized, the node holds its last confirmed release.
+//! Walking backward through repository history is a separate operation, admitted
+//! only for a stateless first install by a signed `coldInstallFallback`.
 //!
 //! It operates only on already-[`VerifiedTarget`]s and the signed custom metadata a
 //! [`DefaultPolicy`] authorizes. The caller injects the rejection predicate (which
@@ -40,21 +43,25 @@ fn matching_targets(
 /// The two questions a selector asks about an installed release are NOT one question, and
 /// collapsing them into a single `Option<&str>` is what let a repair silently downgrade a node.
 /// Passing `None` to mean "re-acquire the version I already have" also said "there is no
-/// anti-rollback floor" — which is the exact condition a signed `orderedInstallFallback` descends
+/// anti-rollback floor" — which is the exact condition a signed `coldInstallFallback` descends
 /// below the assigned head under. So `repair.rs`, running on a node with a release installed, took
 /// the branch reserved for stateless first installs: with the head's bytes rejected it would
 /// descend to an older release and install it, past the floor `selection.rs` refuses to cross.
 ///
 /// Spelling the stance out is what makes that unrepresentable. A caller can lift the "already
-/// installed, nothing to do" short-circuit ([`Stance::Reacquire`]) without lifting the floor, and
-/// it cannot lift the floor without saying, in as many words, that nothing is installed.
+/// installed, nothing to do" short-circuit ([`Stance::Floor`]) without lifting the floor, and it
+/// cannot lift the floor without saying, in as many words, that nothing is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stance<'a> {
     /// Nothing is installed. There is no anti-rollback floor, and this is the ONLY stance under
-    /// which a signed `orderedInstallFallback` may descend below the assigned head.
+    /// which a signed `coldInstallFallback` may descend below the assigned head.
     Nothing,
     /// `version` is installed: it is the anti-rollback floor, and re-selecting it is a no-op.
     Installed(&'a str),
+    /// `version` is the anti-rollback floor, but content identity decides whether a candidate is
+    /// already present. Used by self-update, where corrected bytes may intentionally retain the
+    /// same version and the caller compares the selected digest with the running executable.
+    Floor(&'a str),
     /// These exact installed bytes must be re-acquired — a repair republishing a drifted tree over
     /// the release the node is already committed to. Both version and digest are required: a
     /// version-only repair followed the assignment when it moved and became an unjournaled second
@@ -68,7 +75,9 @@ impl<'a> Stance<'a> {
     pub fn floor(self) -> Option<&'a str> {
         match self {
             Self::Nothing => None,
-            Self::Installed(version) | Self::Reacquire { version, .. } => Some(version),
+            Self::Installed(version) | Self::Floor(version) | Self::Reacquire { version, .. } => {
+                Some(version)
+            }
         }
     }
 
@@ -77,11 +86,11 @@ impl<'a> Stance<'a> {
     fn already_have(self) -> Option<&'a str> {
         match self {
             Self::Installed(version) => Some(version),
-            Self::Nothing | Self::Reacquire { .. } => None,
+            Self::Nothing | Self::Floor(_) | Self::Reacquire { .. } => None,
         }
     }
 
-    /// Whether a signed `orderedInstallFallback` may descend below the assigned head.
+    /// Whether a signed `coldInstallFallback` may descend below the assigned head.
     fn may_descend(self) -> bool {
         matches!(self, Self::Nothing)
     }
@@ -91,6 +100,7 @@ impl<'a> Stance<'a> {
         match self {
             Self::Nothing => "<none>".into(),
             Self::Installed(version) => version.to_string(),
+            Self::Floor(version) => format!("{version} (content-addressed floor)"),
             Self::Reacquire { version, .. } => format!("{version} (re-acquiring exact bytes)"),
         }
     }
@@ -102,14 +112,14 @@ impl<'a> Stance<'a> {
 /// cannot disagree about a release. Diagnostics used to re-derive its own three facts — rejected,
 /// above-ceiling, authorized — and simply did not know about two of the gates the selector applies:
 /// the assigned-head-bytes pin and the downgrade watermark. An operator debugging why
-/// `orderedInstallFallback` refused a release was shown a candidate that looked eligible in every
+/// `coldInstallFallback` refused a release was shown a candidate that looked eligible in every
 /// column the tool printed, with nothing naming the gate that actually stopped it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CandidateVerdict {
     /// Install this one.
     Eligible,
     /// Newer than the version the control plane assigned. The shared targets metadata holds other
-    /// groups' higher releases; ordered fallback must never climb into them.
+    /// groups' higher releases; cold-install fallback must never climb into them.
     AboveCeiling,
     /// At the assigned head version but not the assigned bytes. Two TUF-authentic targets can share
     /// a version, so without this pin fallback could install a sibling the control plane never
@@ -232,15 +242,14 @@ fn judge_candidate(
     }
 }
 
-/// The newest eligible target in `targets` (already newest-first): not `current`,
-/// not `rejected`, and authorized by `policy`. Scanning newest-first means a
-/// rejected or policy-ineligible head release never hides a good intermediate one.
+/// The first eligible target in `targets` (already newest-first): not `current`,
+/// not `rejected`, and authorized by `policy`.
 ///
 /// Rejection is keyed by content hash — the exact bytes that failed — not the
 /// version string, so a corrected republish is eligible at once and the same bad
 /// bytes stay blocked even under a different label. Each policy-skipped candidate is
 /// reported to `note_skip` for diagnostics.
-fn select_update_from(
+fn select_first_eligible_from(
     targets: impl IntoIterator<Item = (VerifiedTarget, Version)>,
     policy: &DefaultPolicy,
     stance: Stance<'_>,
@@ -287,12 +296,36 @@ fn select_update_from(
     None
 }
 
+/// Select only from the newest version in repository metadata.
+///
+/// Multiple targets at that version are considered so a corrected content-addressed
+/// republish is immediately usable, but an unhealthy head can never turn an update
+/// into an implicit walk through older releases.
+fn select_head_from(
+    targets: impl IntoIterator<Item = (VerifiedTarget, Version)>,
+    policy: &DefaultPolicy,
+    stance: Stance<'_>,
+    note_skip: impl FnMut(&str),
+    rejected: impl FnMut(&VerifiedTarget, &str) -> bool,
+) -> Option<(VerifiedTarget, String)> {
+    let mut targets = targets.into_iter().peekable();
+    let head = targets.peek()?.1.clone();
+    select_first_eligible_from(
+        targets.take_while(|(_, version)| version == &head),
+        policy,
+        stance,
+        None,
+        note_skip,
+        rejected,
+    )
+}
+
 /// An authenticated release selected by policy but not downloaded yet.
 pub struct SelectedRelease {
     pub target: VerifiedTarget,
     pub version: String,
     pub sha256: String,
-    /// The provider set signed *into this app version* — populated only when ordered
+    /// The provider set signed *into this app version* — populated only when cold-install
     /// fallback descended below the assigned head. `None` at the assigned head, where the
     /// assignment's own `provider_set` governs (so providers stay independently revisable).
     pub provider_set: Option<updated_contracts::artifact::TargetReference>,
@@ -346,7 +379,7 @@ impl TrustedRepository {
     ///
     /// By default this pins the exact assigned bytes and never substitutes a
     /// different target when they are unavailable or rejected. When the signed
-    /// assignment sets `ordered_install_fallback` *and* this is a first install
+    /// assignment sets `cold_install_fallback` *and* this is a first install
     /// ([`Stance::Nothing`], so there is no anti-rollback floor), it instead
     /// descends from the assigned version — the ceiling — to the newest healthy,
     /// non-rejected, policy-authorized target at or below it. That lets a stateless
@@ -413,12 +446,13 @@ impl TrustedRepository {
             .candidate_version(&target)
             .map_err(|error| crate::Error::Trust(error.to_string()))?;
 
-        if assignment.ordered_install_fallback && stance.may_descend() {
+        if assignment.cold_install_fallback && stance.may_descend() {
             let head_sha = assignment.application.sha256.as_str();
             let mut note_skip = note_skip;
-            // Reported after the walk: `select_update_from` holds `note_skip` for its duration.
+            // Reported after the walk: `select_first_eligible_from` holds `note_skip` for its
+            // duration.
             let mut unbindable = Vec::new();
-            let selected = select_update_from(
+            let selected = select_first_eligible_from(
                 matching_targets(self, policy),
                 policy,
                 stance,
@@ -499,7 +533,7 @@ impl TrustedRepository {
         }))
     }
 
-    /// A human-readable audit of every candidate ordered fallback could descend to and why each
+    /// A human-readable audit of every candidate cold-install fallback could descend to and why each
     /// is or isn't selectable — for diagnosing an empty selection ("no installable application").
     /// `is_rejected` mirrors the selector's deployed-unit rejection check. The provider argument
     /// is absent only for a `Reacquire`, whose contract is to reproduce the already-committed
@@ -519,9 +553,9 @@ impl TrustedRepository {
             .ok()
             .and_then(|target| policy.candidate_version(&target).ok());
         let mut lines = vec![format!(
-            "assigned={} ordered_install_fallback={} ceiling={} current={}",
+            "assigned={} cold_install_fallback={} ceiling={} current={}",
             assignment.application.path,
-            assignment.ordered_install_fallback,
+            assignment.cold_install_fallback,
             ceiling
                 .as_ref()
                 .map_or_else(|| "<none>".to_string(), |v| v.to_string()),
@@ -586,11 +620,10 @@ impl TrustedRepository {
         note_skip: impl FnMut(&str),
         rejected: impl FnMut(&VerifiedTarget, &str) -> bool,
     ) -> Option<SelectedRelease> {
-        let (target, version) = select_update_from(
+        let (target, version) = select_head_from(
             matching_targets(self, policy),
             policy,
             stance,
-            None,
             note_skip,
             rejected,
         )?;
@@ -736,13 +769,13 @@ mod tests {
     }
 
     #[test]
-    fn skips_current_and_rejected_head_for_healthy_intermediate() {
+    fn explicit_cold_install_walk_skips_a_rejected_head_for_a_healthy_intermediate() {
         let targets = vec![
             candidate("4.0.0", 4),
             candidate("3.0.0", 3),
             candidate("2.0.0", 2),
         ];
-        let selected = select_update_from(
+        let selected = select_first_eligible_from(
             targets,
             &policy(),
             Stance::Installed("2.0.0"),
@@ -758,7 +791,7 @@ mod tests {
     fn refuses_downgrades() {
         let targets = vec![candidate("2.0.0", 2), candidate("1.0.0", 1)];
         let mut diagnostics = Vec::new();
-        assert!(select_update_from(
+        assert!(select_first_eligible_from(
             targets.clone(),
             &policy(),
             Stance::Installed("3.0.0"),
@@ -782,7 +815,7 @@ mod tests {
             candidate("2.0.0", 2),
         ];
         let mut diagnostics = Vec::new();
-        assert!(select_update_from(
+        assert!(select_first_eligible_from(
             targets,
             &policy(),
             Stance::Installed("4.0.0"),
@@ -798,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_fallback_pins_the_assigned_sha_at_the_head_version() {
+    fn cold_install_fallback_pins_the_assigned_sha_at_the_head_version() {
         let ceiling = Version::parse("2.0.0").unwrap();
         let assigned_head_sha = target_sha(&candidate("2.0.0", 2).0);
 
@@ -807,7 +840,7 @@ mod tests {
         // fallback descends to the well-defined predecessor rather than installing foreign
         // head bytes.
         let foreign_head = vec![candidate("2.0.0", 9), candidate("1.0.0", 1)];
-        let selected = select_update_from(
+        let selected = select_first_eligible_from(
             foreign_head,
             &policy(),
             Stance::Nothing,
@@ -823,7 +856,7 @@ mod tests {
 
         // When the exact assigned bytes are present at the head, they are selected.
         let with_assigned_head = vec![candidate("2.0.0", 2), candidate("1.0.0", 1)];
-        let selected = select_update_from(
+        let selected = select_first_eligible_from(
             with_assigned_head,
             &policy(),
             Stance::Nothing,
@@ -843,16 +876,69 @@ mod tests {
     fn rejects_by_hash_and_accepts_corrected_republish() {
         let rejected_hash = target_sha(&candidate("2.0.0", 1).0);
         let targets = vec![candidate("2.0.0", 1), candidate("2.0.0", 2)];
-        let selected = select_update_from(
+        let selected = select_head_from(
             targets,
             &policy(),
             Stance::Installed("1.0.0"),
-            None,
             |_| {},
             |t, _| target_sha(t) == rejected_hash,
         )
         .unwrap();
         assert_eq!(target_sha(&selected.0), hex::encode(vec![2; 32]));
+    }
+
+    #[test]
+    fn reacquire_keeps_the_floor_but_allows_corrected_bytes_at_the_running_version() {
+        let targets = vec![candidate("2.0.0", 2), candidate("1.0.0", 1)];
+        let selected = select_head_from(
+            targets,
+            &policy(),
+            Stance::Floor("2.0.0"),
+            |_| {},
+            |_, _| false,
+        )
+        .expect("content identity, not the shared version label, decides a reacquire");
+
+        assert_eq!(selected.1, "2.0.0");
+        assert_eq!(target_sha(&selected.0), hex::encode(vec![2; 32]));
+    }
+
+    #[test]
+    fn a_rejected_head_never_turns_an_upgrade_into_an_intermediate_release() {
+        let rejected_hash = target_sha(&candidate("0.7.0", 7).0);
+        let targets = vec![
+            candidate("0.7.0", 7),
+            candidate("0.6.0", 6),
+            candidate("0.1.0", 1),
+        ];
+        assert!(select_head_from(
+            targets,
+            &policy(),
+            Stance::Installed("0.1.0"),
+            |_| {},
+            |target, _| target_sha(target) == rejected_hash,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_upgrade_jumps_directly_from_the_confirmed_release_to_the_repository_head() {
+        let targets = vec![
+            candidate("0.7.0", 7),
+            candidate("0.6.0", 6),
+            candidate("0.1.0", 1),
+        ];
+        let selected = select_head_from(
+            targets,
+            &policy(),
+            Stance::Installed("0.1.0"),
+            |_| {},
+            |_, _| false,
+        )
+        .expect("the repository head is the one desired transition");
+
+        assert_eq!(selected.1, "0.7.0");
+        assert_eq!(target_sha(&selected.0), hex::encode(vec![7; 32]));
     }
 }
 
@@ -874,7 +960,7 @@ mod provider_binding {
     }
 
     /// Author the repo and return a repository loaded with an assignment that pins app 2.0.0
-    /// as the head (its provider set B), with ordered fallback opted in.
+    /// as the head (its provider set B), with cold-install fallback opted in.
     async fn repo_with_assignment(fallback: bool) -> (tempfile::TempDir, TrustedRepository) {
         repo_with_assignment_where(fallback, false).await
     }
@@ -940,7 +1026,7 @@ mod provider_binding {
                 path: app_path("2.0.0"),
                 sha256: head_sha,
             },
-            ordered_install_fallback: fallback,
+            cold_install_fallback: fallback,
             provider_set: updated_contracts::artifact::TargetReference {
                 path: "provider-sets/b.json".into(),
                 sha256: "b".repeat(64),
@@ -1020,7 +1106,7 @@ mod provider_binding {
 
     // A descent must never hand back "no bound provider set" for a version that HAS one it could
     // not read: that answer means "use the assignment's set", pairing this older app with the
-    // head's newer reconciler — the mispairing ordered fallback exists to prevent. So 1.0.0 is
+    // head's newer reconciler — the mispairing cold-install fallback exists to prevent. So 1.0.0 is
     // uninstallable here and the descent continues to 0.9.0 and its own set.
     #[tokio::test]
     async fn a_descent_skips_a_version_whose_signed_provider_set_it_cannot_read() {
@@ -1051,11 +1137,11 @@ mod provider_binding {
         );
     }
 
-    // The head assignment (2.0.0) is broken, so a first-install node with ordered fallback
+    // The head assignment (2.0.0) is broken, so a first-install node with cold-install fallback
     // descends to 1.0.0 — and must roll back to the provider set signed with 1.0.0 (A), not
     // the assignment head's B. This is the app+provider-as-one-unit rollback.
     #[tokio::test]
-    async fn ordered_fallback_descends_to_the_app_versions_own_provider_set() {
+    async fn cold_install_fallback_descends_to_the_app_versions_own_provider_set() {
         let (_tmp, repo) = repo_with_assignment(true).await;
         let selected = repo
             .assigned_application(
@@ -1091,7 +1177,7 @@ mod provider_binding {
         assert_eq!(selected.version, "2.0.0");
         assert!(
             selected.provider_set.is_none(),
-            "ordered fallback binds a provider set only where it descended BELOW the assigned \
+            "cold-install fallback binds a provider set only where it descended BELOW the assigned \
              head; at the head the assignment governs, so a provider-set-only revision reaches \
              newly enrolled and long-enrolled nodes alike"
         );
@@ -1118,7 +1204,7 @@ mod provider_binding {
                 },
             )
             .unwrap()
-            .expect("ordered fallback can descend past a rejected provider set");
+            .expect("cold-install fallback can descend past a rejected provider set");
 
         assert_eq!(selected.version, "1.0.0");
         assert_eq!(
@@ -1149,7 +1235,7 @@ mod provider_binding {
     /// `repair.rs` re-acquires the release the node is ALREADY committed to, so it has to lift the
     /// "you already have that version" short-circuit. It used to do that by passing `None`, which
     /// is the selector's word for "nothing is installed" — the one stance a signed
-    /// `orderedInstallFallback` descends under. On a node whose assigned head was rejected, that
+    /// `coldInstallFallback` descends under. On a node whose assigned head was rejected, that
     /// walked a repair down to an older release and installed it, past the anti-rollback floor the
     /// ordinary update path refuses to cross.
     ///
@@ -1195,7 +1281,7 @@ mod provider_binding {
         );
 
         // The head is rejected. `Nothing` — a genuine cold install — descends to 1.0.0, which is
-        // the whole point of ordered fallback. A repair on a node holding 2.0.0 must NOT: that
+        // the whole point of cold-install fallback. A repair on a node holding 2.0.0 must NOT: that
         // would be a downgrade past the floor, so it selects nothing instead.
         let head_rejected =
             |_: &VerifiedTarget,

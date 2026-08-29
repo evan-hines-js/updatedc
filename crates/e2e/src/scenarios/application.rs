@@ -394,7 +394,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
 /// A stateless node whose *first* (cold) assignment is a broken head must not strand crash-looping
 /// it. This is the pod-kill-onto-a-broken-rollout case: an emptyDir node returns cold with no
 /// rejection history, cold-installs its assigned head, the release's own `apply` cannot start it —
-/// and, because ordered-install fallback is signed in — rejects it and descends to the newest
+/// and, because cold-install fallback is signed in — rejects it and descends to the newest
 /// healthy release below it. Two broken heads are stacked above the good 1.0.0, so recovery must
 /// descend past BOTH. Run under the init model so the reject → descend cycle plays out exactly as it
 /// would in a container whose state dir survives container restarts.
@@ -416,7 +416,7 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
-        .ordered_install_fallback()
+        .cold_install_fallback()
         .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
@@ -446,7 +446,7 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     Ok(())
 }
 
-/// Rejection is a fail-closed invariant even when ordered fallback has no lower release left.
+/// Rejection is a fail-closed invariant even when cold-install fallback has no lower release left.
 /// Once the only signed deployment has failed its first health gate, later boots must stop with
 /// diagnostics; they may never relaunch the rejected provisional head as an availability escape.
 pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &Ctx) -> R {
@@ -461,7 +461,7 @@ pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &C
     let _server = ctx.serve(&dir, srv)?;
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
-        .ordered_install_fallback()
+        .cold_install_fallback()
         .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
@@ -491,7 +491,7 @@ pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &C
 /// A cold node whose assigned head is a *malformed* bundle — one that verifies its signed archive
 /// hash but cannot be extracted or validated (a corrupt or truncated tar.zst, not merely a bad
 /// entrypoint) — must reject it at ingest and descend, exactly like a head whose apply fails. Two
-/// distinct corruption kinds are stacked above the healthy 1.0.0, so ordered fallback must reject
+/// distinct corruption kinds are stacked above the healthy 1.0.0, so cold-install fallback must reject
 /// two independent malformed hashes *before any hook runs* and land on 1.0.0. This guards the
 /// cold-install analogue of the update path's malformed-bundle rejection, which previously did not
 /// exist — a cold node re-downloaded a malformed head forever instead of descending past it.
@@ -512,7 +512,7 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
-        .ordered_install_fallback()
+        .cold_install_fallback()
         .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
@@ -541,7 +541,7 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
             "expected both malformed heads recorded rejected; saw {rejected_count}:\n{rejected}"
         ));
     }
-    ok("cold node rejected two malformed-but-signed assigned bundles at ingest and ordered fallback descended to the healthy 1.0.0");
+    ok("cold node rejected two malformed-but-signed assigned bundles at ingest and cold-install fallback descended to the healthy 1.0.0");
     Ok(())
 }
 

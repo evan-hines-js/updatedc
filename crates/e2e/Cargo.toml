@@ -3,12 +3,18 @@ name = "e2e"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autobins = false
+default-run = "e2e"
 
 # End-to-end test/demo harness. One cross-platform Rust binary replacing the old
 # bash + PowerShell scripts, so the two can never drift. Run: `cargo run -p e2e`.
 [[bin]]
 name = "e2e"
 path = "src/main.rs"
+
+[[bin]]
+name = "lifecycle-fixture"
+path = "src/bin/lifecycle-fixture.rs"
 
 [lib]
 name = "e2e"

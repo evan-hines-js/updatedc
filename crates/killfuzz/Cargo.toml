@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Standalone arbitrary-SIGKILL fuzzer for the cold-install / ordered-fallback-descent crash-safety
+# Standalone arbitrary-SIGKILL fuzzer for the cold-install / cold-install-fallback-descent crash-safety
 # paths. It runs in its OWN process (never inside the e2e concurrent scenario pool), so its
 # aggressive whole-tree kills cannot starve or collide with other scenarios. It reuses the e2e
 # harness library for the (fragile, single-source-of-truth) TUF + launcher setup, and adds only the

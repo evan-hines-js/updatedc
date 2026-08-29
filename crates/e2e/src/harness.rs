@@ -1012,7 +1012,7 @@ pub fn dump_install_state(work: &Path) -> String {
             })
             .unwrap_or_else(|| "none".into());
         // `confirmed=false` marks a provisional cold-install head still awaiting its first passing
-        // health gate — the state that drives the ordered-fallback descent.
+        // health gate — the state that drives the cold-install-fallback descent.
         let confirmed = installed_doc
             .as_ref()
             .and_then(|doc| doc.get("confirmed")?.as_bool())
@@ -1144,22 +1144,38 @@ pub fn str_err(e: impl std::fmt::Display) -> String {
 /// group/other users. Bundle installation intentionally removes write access, and several
 /// corruption/repair scenarios need to model a deliberate local edit afterward.
 pub fn make_owner_writable(path: &Path) -> R {
-    let mut permissions = std::fs::metadata(path).map_err(str_err)?.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).map_err(str_err)?.permissions();
         permissions.set_mode(permissions.mode() | 0o200);
+        std::fs::set_permissions(path, permissions).map_err(str_err)
     }
     #[cfg(windows)]
     {
-        // `Permissions::set_readonly(false)` IS the clear of `FILE_ATTRIBUTE_READONLY` on Windows,
-        // and it is stable — the `attributes()`/`set_attributes()` pair that reads the same bit
-        // directly is still unstable (`windows_permissions_ext`), so reaching for it does not
-        // compile on stable at all. Windows has no group/other bits to widen, so this grants
-        // exactly the owner write the Unix arm above does and nothing more.
-        permissions.set_readonly(false);
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+            INVALID_FILE_ATTRIBUTES,
+        };
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `wide` is a live, NUL-terminated Windows path for both calls. Neither API keeps
+        // the pointer. We preserve every attribute except READONLY instead of translating the
+        // file through Unix permission semantics.
+        let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attributes == INVALID_FILE_ATTRIBUTES {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if attributes & FILE_ATTRIBUTE_READONLY == 0 {
+            return Ok(());
+        }
+        if unsafe { SetFileAttributesW(wide.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
     }
-    std::fs::set_permissions(path, permissions).map_err(str_err)
 }
 
 #[cfg(test)]

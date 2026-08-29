@@ -114,6 +114,31 @@ await_job() {
   fi
 }
 
+# A Job and its first Pod are created by different controllers. `kubectl wait pod -l ...` resolves
+# its selection once and fails immediately when the Job controller has not created the Pod yet, so
+# every call site that must interact with a running Job goes through this creation barrier first.
+job_pod_exists() {
+  local job="$1"
+  [[ -n "$(kubectl -n updated-system get pod -l "job-name=$job" -o name 2>/dev/null)" ]]
+}
+
+await_job_pod_ready() {
+  local job="$1"
+  if ! poll_until "$READY_TIMEOUT" job_pod_exists "$job"; then
+    echo "FAIL: job/$job did not create a pod within ${READY_TIMEOUT}s" >&2
+    kubectl -n updated-system get "job/$job" -o wide >&2 || true
+    kubectl -n updated-system get pod -l "job-name=$job" -o wide >&2 || true
+    return 1
+  fi
+  if ! kubectl -n updated-system wait --for=condition=ready pod -l "job-name=$job" \
+    --timeout="${READY_TIMEOUT}s"; then
+    kubectl -n updated-system get "job/$job" -o wide >&2 || true
+    kubectl -n updated-system get pod -l "job-name=$job" -o wide >&2 || true
+    kubectl -n updated-system logs "job/$job" >&2 || true
+    return 1
+  fi
+}
+
 NAME="${UPDATEC_KIND_CLUSTER:-updatec-e2e}"
 # These values become destructive-operation names and literal YAML scalars below. Validate them
 # before the first `kind delete` or `rm -rf`: quoting prevents shell expansion, but it does not stop
@@ -1327,8 +1352,7 @@ spec:
               }
               echo "application stayed available throughout certificate renewal"
 YAML
-kubectl -n updated-system wait --for=condition=ready \
-  pod -l job-name=observe-certificate-rotation --timeout=${READY_TIMEOUT}s
+await_job_pod_ready observe-certificate-rotation
 
 # Install the near-expiry leaf completely before signalling the agent. Existing clients keep
 # using their in-memory identity until the launcher relaunches the agent.

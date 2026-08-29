@@ -31,15 +31,16 @@ pub(super) const ALERT_PORT: u16 = 8080;
 /// larger is not one, and a receiver that will read any length is a way to hang the test.
 const MAX_BODY: usize = 64 * 1024;
 
-/// How long one connection may hold the receiver, from accept to response. `MAX_BODY` bounds a
-/// delivery's SIZE; this bounds its TIME, and the loop below needs both because it serves inline:
+/// How long one connection may hold the receiver before sending one complete request. `MAX_BODY`
+/// bounds a delivery's SIZE; this bounds the untrusted network read's TIME, and the loop below
+/// needs both because it serves inline:
 /// any peer that completes the handshake and then stops — a port scan, a probe that never closes,
 /// a delivery `updatec` already abandoned at its own 10s `DELIVERY_TIMEOUT` whose FIN is delayed —
 /// parks every later delivery behind it for as long as it keeps the socket open. The sink listens
 /// on `0.0.0.0`, so the peer is not necessarily the controller the serialization below reasons
 /// about. Generous against that 10s delivery deadline: a POST the controller has already given up
 /// on is not one this sink has any reason to keep waiting for.
-const SERVE_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The pause after a failed `accept`, as in this workspace's other accept loops
 /// (`updatec::gateway`, `updated_healthproxy::metrics`): a persistent error — fd exhaustion, a
@@ -54,7 +55,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("0.0.0.0", ALERT_PORT)).await?;
     println!("[alert-sink] recording deliveries to {ALERT_RECORD}");
-    accept_forever(listener, PathBuf::from(ALERT_RECORD), SERVE_TIMEOUT).await;
+    accept_forever(listener, PathBuf::from(ALERT_RECORD), REQUEST_TIMEOUT).await;
     Ok(())
 }
 
@@ -72,20 +73,31 @@ async fn accept_forever(listener: TcpListener, record: PathBuf, deadline: Durati
         };
         // Serialized on purpose: deliveries are one in flight by construction (the sink drains its
         // queue one event at a time), and appending from one task keeps the record's lines whole.
-        // Bounded because that construction describes the CONTROLLER, not every peer that can
-        // reach this port.
-        match tokio::time::timeout(deadline, serve(stream, &record)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => println!("[alert-sink] dropped a connection: {error}"),
-            Err(_) => println!(
-                "[alert-sink] abandoned a connection that sent no complete request within {}s",
-                deadline.as_secs()
-            ),
+        // Only the untrusted network read is bounded. Once a complete request is in memory, its
+        // durable append and response must not be cancelled by that peer deadline: sync_data can
+        // legitimately outlive a short test deadline on a loaded or emulated runner.
+        let (stream, body) = match tokio::time::timeout(deadline, read_request(stream)).await {
+            Ok(Ok(request)) => request,
+            Ok(Err(error)) => {
+                println!("[alert-sink] dropped an incomplete request: {error}");
+                continue;
+            }
+            Err(_) => {
+                println!(
+                    "[alert-sink] abandoned a connection that sent no complete request within {deadline:?}"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = commit_delivery(stream, &record, &body).await {
+            println!("[alert-sink] failed to commit a complete delivery: {error}");
         }
     }
 }
 
-async fn serve(mut stream: TcpStream, record: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn read_request(
+    mut stream: TcpStream,
+) -> Result<(TcpStream, Vec<u8>), Box<dyn std::error::Error>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     // Read until the headers are complete, then until `Content-Length` bytes of body have arrived.
@@ -114,7 +126,16 @@ async fn serve(mut stream: TcpStream, record: &Path) -> Result<(), Box<dyn std::
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
-    append_record(record, &buffer[header_end..header_end + length]).await?;
+    let body = buffer[header_end..header_end + length].to_vec();
+    Ok((stream, body))
+}
+
+async fn commit_delivery(
+    mut stream: TcpStream,
+    record: &Path,
+    body: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    append_record(record, body).await?;
     stream
         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
         .await?;
@@ -180,10 +201,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let path = record.clone();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            serve(stream, &path).await.unwrap();
-        });
+        let server = tokio::spawn(accept_forever(listener, path, REQUEST_TIMEOUT));
         let document =
             r#"{"resource":"UpdateGroupSet/fleet-set-00","condition":"DeploymentHalted"}"#;
         let response = reqwest::Client::new()
@@ -193,11 +211,11 @@ mod tests {
             .await
             .unwrap();
         assert!(response.status().is_success());
-        server.await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&record).unwrap(),
             format!("{document}\n")
         );
+        server.abort();
     }
 
     #[cfg(unix)]

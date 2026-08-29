@@ -39,10 +39,10 @@ pub struct Transaction {
     pub candidate_lifecycle: Box<ProviderRelease>,
     /// How many consecutive boots have failed to health-gate the restored predecessor during a
     /// crash-recovered rollback. The agent's boot health gate bounds this: once it reaches its
-    /// limit, a predecessor whose bytes can no longer pass the gate stops looping the node and
-    /// instead descends via ordered fallback past it. Zero for a forward update; only the rollback
-    /// recovery path increments it. It survives the agent relaunch precisely because it rides the
-    /// journal, which is what re-derives the rollback on each boot.
+    /// limit, the rollback settles on that exact historically confirmed predecessor and reports
+    /// its current health as unhealthy. Zero for a forward update; only the rollback recovery path
+    /// increments it. It survives the agent relaunch precisely because it rides the journal, which
+    /// is what re-derives the rollback on each boot.
     pub rollback_health_failures: u32,
     /// Last state-machine operation known to have completed durably. Recovery replays
     /// the next operation; adapters are idempotent across the action/journal-write gap.
@@ -280,8 +280,8 @@ impl Transaction {
             (Phase::RollbackActivating, Phase::RollbackApplied)
                 | (Phase::RollbackApplied, Phase::RollbackVerified)
                 | (Phase::RollbackVerified, Phase::RolledBack)
-                // A bounded unhealthy rollback compensates once and settles without claiming the
-                // predecessor passed its gate.
+                // A bounded unhealthy rollback compensates once and settles on the exact
+                // historically confirmed predecessor without claiming it passed this boot's gate.
                 | (Phase::RollbackApplied, Phase::RolledBack)
         );
         if !(forward || begin_rollback || rollback) {

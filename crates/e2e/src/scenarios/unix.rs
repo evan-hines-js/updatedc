@@ -25,7 +25,7 @@ pub(crate) fn cold_install_descends_past_unhealthy_head(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
-        .ordered_install_fallback()
+        .cold_install_fallback()
         .workload(svc)
         .check_interval("1s")
         // A short grace keeps the per-head wedge detection quick; the head never becomes healthy,
