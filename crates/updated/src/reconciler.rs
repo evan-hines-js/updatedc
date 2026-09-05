@@ -142,6 +142,14 @@ pub fn capture_output(mut input: impl io::Read + Send + 'static) -> OutputCaptur
 pub fn configure_environment(command: &mut Command) {
     command.env_clear();
 
+    // Instrumented helpers otherwise write default.profraw into their working directory,
+    // corrupting the signed release tree. Only coverage builds inherit the collector's path;
+    // production invocations keep the same minimal environment.
+    #[cfg(coverage_nightly)]
+    if let Some(path) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", path);
+    }
+
     #[cfg(unix)]
     command.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
 
@@ -359,6 +367,7 @@ mod tests {
             .env("AMBIENT", "leaked")
             .env("PATH", "/opt/ambient")
             .env("PSModulePath", "/opt/ambient/modules")
+            .env("LLVM_PROFILE_FILE", "default.profraw")
             .env("TOKEN", "ambient");
         configure_environment(&mut command);
         let environment: BTreeMap<String, String> = command
@@ -376,6 +385,13 @@ mod tests {
             "the agent's own environment must not reach a hook: {environment:?}"
         );
         assert!(!environment.contains_key("TOKEN"));
+        #[cfg(not(coverage_nightly))]
+        assert!(!environment.contains_key("LLVM_PROFILE_FILE"));
+        #[cfg(coverage_nightly)]
+        assert_eq!(
+            environment.get("LLVM_PROFILE_FILE"),
+            std::env::var("LLVM_PROFILE_FILE").ok().as_ref()
+        );
         let path = environment
             .get("PATH")
             .expect("a hook can find an interpreter");

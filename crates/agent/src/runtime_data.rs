@@ -647,8 +647,10 @@ mod tests {
             updated::config::Paths::resolve(directory.path(), &directory.path().join("identity"));
         opts.application.install_root = directory.path().to_path_buf();
         opts.timeouts = crate::BoundedTimeouts::new(updated::config::Timeouts {
-            health_grace: std::time::Duration::from_millis(100),
-            health_interval: std::time::Duration::from_millis(10),
+            // This gate launches real helper and shell processes, including with coverage and
+            // FIPS enabled in CI. Its deadline must allow process startup on a busy runner.
+            health_grace: std::time::Duration::from_secs(5),
+            health_interval: std::time::Duration::from_millis(50),
             ..updated::config::Timeouts::default()
         });
         let snapshot = FileSnapshot {

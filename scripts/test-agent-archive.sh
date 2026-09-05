@@ -31,8 +31,27 @@ tar -czf "$scratch/foreign.tar.gz" -C "$scratch/files" updated-agent "$unit" for
 refuse "$scratch/foreign.tar.gz"
 tar -czf "$scratch/missing.tar.gz" -C "$scratch/files" "$unit" "$library"
 refuse "$scratch/missing.tar.gz"
-rm "$scratch/files/$library"
-ln -s foreign.dylib "$scratch/files/$library"
-tar -czf "$scratch/link.tar.gz" -C "$scratch/files" updated-agent "$unit" "$library"
+# Write link headers directly: Git Bash can implement `ln -s` by copying the target,
+# which silently turns this attack fixture into a valid archive of regular files.
+python3 - "$scratch" "$library" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+scratch = pathlib.Path(sys.argv[1])
+library = sys.argv[2]
+for name, kind in (("link", tarfile.SYMTYPE), ("hardlink", tarfile.LNKTYPE)):
+    with tarfile.open(scratch / "fips.tar.gz", "r:gz") as source:
+        with tarfile.open(scratch / f"{name}.tar.gz", "w:gz") as target:
+            for member in source:
+                if member.name == library:
+                    member.type = kind
+                    member.linkname = "updated-agent"
+                    member.size = 0
+                    target.addfile(member)
+                else:
+                    target.addfile(member, source.extractfile(member))
+PY
 refuse "$scratch/link.tar.gz"
+refuse "$scratch/hardlink.tar.gz"
 echo 'ok: bootstrap accepts bundled FIPS modules and refuses foreign, duplicate, missing, and linked members'

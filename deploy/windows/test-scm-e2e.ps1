@@ -380,13 +380,14 @@ ca = '$(Join-Path $certs 'ca.crt')'
     Wait-ServiceState 'Stopped'
     Wait-ProcessExit $tree
 
-    # A fresh launch re-converges the committed bundle through the same reconciler, this time as a
-    # restart.
+    # A fresh launch verifies the committed bundle through its health command with reason restart.
+    # Completed, healthy execution is reused; requiring another deploy would contradict the
+    # adapter's replay contract and turn an agent restart into needless application mutation.
     $before = @(Read-Operations).Count
     & sc.exe start $service | Out-Null
     Wait-ServiceState 'Running'
-    $restart = Wait-Operation 'converge' 'restart' $before
-    Write-Host "SUCCESS: SCM stop ended the agent tree cleanly and a fresh start re-converged committed bundle 1.0.0 through its own reconciler" -ForegroundColor Green
+    $null = Wait-Operation 'healthcheck' 'restart' $before
+    Write-Host "SUCCESS: SCM stop ended the agent tree cleanly and a fresh start verified committed bundle 1.0.0 through its own health command" -ForegroundColor Green
 }
 finally {
     if (Get-Service -Name $service -ErrorAction SilentlyContinue) {
