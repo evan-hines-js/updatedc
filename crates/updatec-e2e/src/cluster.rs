@@ -30,7 +30,10 @@ pub(crate) fn agent_exec(pod: &str) -> Command {
     command
 }
 
-const LIFECYCLE_STATE: &str = "/var/lib/updated/providers/state/demo-enterprise-lifecycle";
+fn lifecycle_state() -> PathBuf {
+    let install = std::path::Path::new("/var/lib/updated");
+    updated::config::Paths::resolve(install, install).reconciler_state_dir("app")
+}
 
 /// The enterprise sub-phases the lifecycle reconciler runs, in order, inside one `apply`. Each one
 /// requires its predecessor's completion marker, so finding every marker in an attempt's effects
@@ -137,60 +140,40 @@ pub(crate) async fn bring_up_cluster() -> Result<(), Box<dyn std::error::Error>>
 #[derive(Clone)]
 pub(crate) struct FleetLayout {
     pub(crate) platform: String,
-    pub(crate) provider_path: String,
-    pub(crate) provider_sha: String,
 }
 
-/// The two signed targets that make the optional Jenkins tier complete. Absence means the tier is
-/// not published for this platform; there is no half-enabled state made from booleans and empty
-/// path/hash sentinels.
+/// The signed package that the Jenkins tier installs.
 struct JenkinsResources {
     application_path: String,
     application_sha: String,
-    provider_path: String,
-    provider_sha: String,
 }
 
-/// Apply the fleet layout onto the provisioned, scaled cluster: detect the platform and whether
-/// Jenkins is published for it, deploy the Jenkins fleet when it is, assign every enrolled node
+/// Apply the fleet layout onto the provisioned, scaled cluster: detect the platform,
+/// deploy the required Jenkins fleet, assign every enrolled node
 /// its labels, apply the per-set/per-cohort resources, wait for the StatefulSet to roll out,
 /// bring up the HAProxy tier, and deploy the healthproxy that fronts the out-of-cluster slice.
 pub(crate) async fn prepare_fleet() -> Result<FleetLayout, Box<dyn std::error::Error>> {
-    // Jenkins is only published for linux-x86_64 (its install provider fetches an x86_64 JRE),
-    // so on any other platform — e.g. an arm64 kind cluster on Apple Silicon — its bundle is
-    // absent. Detect that from the repo and skip the Jenkins nodes entirely, running the rest.
-    // Run the full test (with Jenkins) on an x86_64 box.
     let platform = repository_platform()?.trim().to_string();
-    let jenkins_path = format!("products/jenkins/stable/1.0.0/{platform}/app");
-    let jenkins = match repository_target_sha(&jenkins_path) {
-        Ok(application_sha) => {
-            let provider_path = "provider-sets/jenkins.json".to_string();
-            Some(JenkinsResources {
-                application_path: jenkins_path,
-                application_sha,
-                provider_sha: repository_target_sha(&provider_path)?,
-                provider_path,
-            })
-        }
-        Err(_) => None,
+    let (os, arch) = platform
+        .split_once('-')
+        .ok_or("invalid repository platform")?;
+    let jenkins_path = updated_tuf::repo::PublishTarget::application_name(
+        "jenkins", "stable", "1.0.0", os, arch, "jenkins",
+    );
+    let jenkins = JenkinsResources {
+        application_sha: repository_target_sha(&jenkins_path)?,
+        application_path: jenkins_path,
     };
-    if jenkins.is_some() {
-        println!("[e2e] deploying {JENKINS_TOTAL} Jenkins nodes (ci + release controller pairs)");
-        apply_jenkins_fleet()?;
-    } else {
-        println!("[e2e] Jenkins is not published for {platform} (x86_64 only) — skipping the Jenkins nodes");
-    }
+    // Publish the product assignment and reserve identities before these machines enroll.
+    // Otherwise they first install the repository's default sample app on Jenkins's port.
+    println!("[e2e] applying the RBAC, per-set services, and per-cohort groups");
+    apply_resources(&jenkins)?;
+    reserve_jenkins_agents()?;
+    println!("[e2e] deploying {JENKINS_TOTAL} Jenkins nodes (ci + release controller pairs)");
+    apply_jenkins_fleet()?;
     println!("[e2e] waiting for enrollment and assigning every new node");
     label_cohort_agents()?;
-    if jenkins.is_some() {
-        label_jenkins_agents()?;
-    }
     label_external_agents()?;
-    // The sample-app cohorts resolve their provider set from MinIO; its sha is published and
-    // returned by `bootstrap_minio_release_repo`, not read from the release-server repo here.
-    let provider_path = "provider-sets/rube-goldberg.json".to_owned();
-    println!("[e2e] applying the RBAC, per-set services, and per-cohort groups");
-    let provider_sha = apply_resources(&provider_path, jenkins.as_ref())?;
     println!("[e2e] waiting for all assigned agents to become ready");
     run(kubectl().args([
         "-n",
@@ -214,11 +197,47 @@ pub(crate) async fn prepare_fleet() -> Result<FleetLayout, Box<dyn std::error::E
     println!("[e2e] deploying the healthproxy reconciler for the out-of-cluster slice");
     deploy_external_reconciler().await?;
     deploy_alert_sink().await?;
-    Ok(FleetLayout {
-        platform,
-        provider_path,
-        provider_sha,
-    })
+    Ok(FleetLayout { platform })
+}
+
+/// A deployed JVM is not proof that Jenkins initialized. Require every expected identity's
+/// signed health/version report as well as the workload's own HTTP readiness probe.
+pub(crate) async fn assert_jenkins_installed(
+    fleet: &Fleet,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (role, _) in JENKINS_COHORTS {
+        run(kubectl().args([
+            "-n",
+            NAMESPACE,
+            "rollout",
+            "status",
+            &format!("statefulset/jenkins-{role}"),
+            "--timeout=480s",
+        ]))?;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let nodes = fleet.nodes().await?;
+        let installed = JENKINS_COHORTS.iter().all(|(role, replicas)| {
+            (0..*replicas).all(|ordinal| {
+                nodes.iter().any(|node| {
+                    node.node == format!("jenkins-{role}-{ordinal}")
+                        && node.selected_group.as_deref() == Some(&format!("jenkins-{role}"))
+                        && node_converged(node, "1.0.0")
+                })
+            })
+        });
+        if installed {
+            println!("[e2e] all {JENKINS_TOTAL} Jenkins controllers are serving and confirmed healthy at 1.0.0");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "Jenkins did not confirm healthy installation on every reserved node".into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Stand up the webhook receiver and point the controller's alert sink at it.
@@ -476,10 +495,14 @@ pub(crate) async fn assert_lifecycle_transaction() -> Result<(), Box<dyn std::er
         )
         .into());
     }
-    let receipt = output(agent_exec(LIFECYCLE_NODE).args([
-        "cat",
-        &format!("{LIFECYCLE_STATE}/legacy-java-home/change-ticket.receipt"),
-    ]))?;
+    let receipt = output(
+        agent_exec(LIFECYCLE_NODE).args([
+            "cat",
+            &lifecycle_state()
+                .join("legacy-java-home/change-ticket.receipt")
+                .to_string_lossy(),
+        ]),
+    )?;
     if !receipt.contains(&format!("green release {BASELINE_VERSION}")) {
         return Err(format!("missing lifecycle audit receipt: {receipt:?}").into());
     }
@@ -489,21 +512,26 @@ pub(crate) async fn assert_lifecycle_transaction() -> Result<(), Box<dyn std::er
 
 fn lifecycle_audit() -> Result<String, Box<dyn std::error::Error>> {
     output(
-        agent_exec(LIFECYCLE_NODE).args(["cat", &format!("{LIFECYCLE_STATE}/audit/lifecycle.tsv")]),
+        agent_exec(LIFECYCLE_NODE).args([
+            "cat",
+            &lifecycle_state()
+                .join("audit/lifecycle.tsv")
+                .to_string_lossy(),
+        ]),
     )
 }
 
 /// The attempt id of the newest completed update transaction in the reconciler's audit log.
 ///
 /// The reconciler appends one `<operation>\t<attempt>\t<event>` row per invocation. An update
-/// transaction is exactly one [`Operation::Apply`] under a deployment attempt id; the reserved
+/// transaction is exactly one [`Operation::Converge`] under a deployment attempt id; the reserved
 /// ids (`boot`, `converge`, `periodic`, `fingerprint`) name operations that belong to no transaction and
 /// must never be mistaken for one.
 fn latest_completed_transaction(audit: &str) -> Option<String> {
     audit.lines().rev().find_map(|line| {
         let mut fields = line.split('\t');
         let (operation, attempt, event) = (fields.next()?, fields.next()?, fields.next()?);
-        (operation == Operation::Apply.as_str()
+        (operation == Operation::Converge.as_str()
             && event == "completed"
             && !attempt::is_reserved(attempt))
         .then(|| attempt.to_owned())
@@ -524,11 +552,16 @@ fn missing_sub_phase_markers(markers: &[String]) -> Vec<&'static str> {
 
 /// The completion markers the reconciler left in one attempt's effects directory.
 fn lifecycle_attempt_markers(attempt: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(output(agent_exec(LIFECYCLE_NODE).args([
-        "ls",
-        "-1",
-        &format!("{LIFECYCLE_STATE}/attempts/{attempt}"),
-    ]))?
+    Ok(output(
+        agent_exec(LIFECYCLE_NODE).args([
+            "ls",
+            "-1",
+            &lifecycle_state()
+                .join("attempts")
+                .join(attempt)
+                .to_string_lossy(),
+        ]),
+    )?
     .lines()
     .map(|name| name.trim().to_owned())
     .filter(|name| !name.is_empty())
@@ -616,18 +649,19 @@ fn label_cohort_agents() -> Result<(), Box<dyn std::error::Error>> {
 /// role its UpdateGroup selects on), and their node name. No cohort/set/fleet labels, so they sit
 /// entirely outside the convergence state machine and pod-kill chaos — their slow ~4-minute
 /// installs never gate the fast sample-app cohorts.
-fn label_jenkins_agents() -> Result<(), Box<dyn std::error::Error>> {
+fn reserve_jenkins_agents() -> Result<(), Box<dyn std::error::Error>> {
     for (role, replicas) in JENKINS_COHORTS {
         for ordinal in 0..replicas {
             let node = format!("jenkins-{role}-{ordinal}");
-            patch_agent_labels(
-                &resource_name(&node),
-                serde_json::json!({
-                    NODE_LABEL: node,
-                    KIND_LABEL: "jenkins",
-                    ROLE_LABEL: role
-                }),
-            )?;
+            apply_json(&serde_json::json!({
+                "apiVersion": "updated.dev/v1alpha1", "kind": "UpdateAgent",
+                "metadata": {"name": resource_name(&node), "namespace": NAMESPACE},
+                "spec": {
+                    "repositoryRef": {"name": fixture::REPOSITORY_NAME},
+                    "identity": {"kind": "reserved"},
+                    "labels": {NODE_LABEL: node, KIND_LABEL: "jenkins", ROLE_LABEL: role}
+                }
+            }))?;
         }
     }
     Ok(())
@@ -870,7 +904,7 @@ async fn deploy_external_reconciler() -> Result<(), Box<dyn std::error::Error>> 
 
 /// `(release_root, baseline_path, baseline_sha, provider_sha)` — the signed identities
 /// [`bootstrap_minio_release_repo`] mints and republishes onto the shared release PVC.
-type ReleaseBootstrap = (String, String, String, String);
+type ReleaseBootstrap = (String, String, String);
 
 /// The MinIO release repository every cohort group resolves its bundles from, pinned to the root
 /// [`bootstrap_minio_release_repo`] minted onto the shared release PVC. Built from the same
@@ -887,7 +921,7 @@ pub(crate) fn minio_release_repository(release_root: &str) -> serde_json::Value 
 /// A seed group's deployment: a full clone of the fully-valid `edge` deployment (so every
 /// CRD-required field is present) with only its release repository pointed at MinIO. Its selector
 /// matches nothing, so no node adopts it; `updatectl deploy` overwrites its `application` and the
-/// published bundle's product/entrypoint come from the deploy flags, so the runtime here is unused.
+/// published payload's product comes from the deploy flags, so the runtime here is unused.
 pub(crate) fn seed_deployment(edge: &serde_json::Value, release_root: &str) -> serde_json::Value {
     let mut deployment = edge["spec"]["deployment"].clone();
     deployment["releaseRepository"] = minio_release_repository(release_root);
@@ -908,6 +942,7 @@ fn bootstrap_minio_release_repo(
     // Every `updatectl` below addresses the one release repository the groups resolve from.
     let repository = release_repository_flags();
     // 1. Mint keys + initialize the repo once, onto the shared PVC (skip if already there).
+    let execution = demo_execution_flags();
     run(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
@@ -946,11 +981,11 @@ fn bootstrap_minio_release_repo(
         &format!(
             "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
              rm -rf /tmp/seed && mkdir -p /tmp/seed/bin /tmp/seed/config; \
-             cp /usr/local/bin/sampleapp /tmp/seed/bin/app; \
+             cp /usr/local/bin/sampleapp /tmp/seed/bin/app; cp /usr/local/bin/demo-lifecycle /tmp/seed/bin/lifecycle; \
              printf 'version = \"{BASELINE_VERSION}\"\\n' >/tmp/seed/config/release.toml; \
              updatectl deploy --keys-dir /data/release-keys {repository} \
              --namespace {NAMESPACE} --group release-seed --product app --channel stable \
-             --version {BASELINE_VERSION} --entrypoint bin/app --platform {platform} --source /tmp/seed"
+             --version {BASELINE_VERSION} --platform {platform} --source /tmp/seed {execution}"
         ),
     ]))?;
     let baseline_path = kubectl_value(
@@ -971,46 +1006,16 @@ fn bootstrap_minio_release_repo(
         "release-seed",
         "--ignore-not-found",
     ]))?;
-    // 3. Publish the lifecycle reconciler into MinIO. The sample-app cohorts resolve both the
-    //    application and reconciler from this repository.
-    let provider_timeout_ms = demo_lifecycle::PROVIDER_TIMEOUT_MS;
-    let provider_sets = output(kubectl().args(RELEASE_SERVER_EXEC).args([
-        "--",
-        "sh",
-        "-c",
-        &format!(
-            "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
-             rm -rf /tmp/rube && mkdir -p /tmp/rube/bin; \
-             cp /usr/local/bin/demo-lifecycle /tmp/rube/bin/lifecycle; \
-             chmod 0755 /tmp/rube/bin/lifecycle; \
-             art=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
-               {repository} --product demo-enterprise-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
-               --source /tmp/rube --platform {platform}); \
-             set -- $art; \
-             reconciler=$(updatectl publish-provider-set --keys-dir /data/release-keys \
-               {repository} --id rube-goldberg --provider-path \"$1\" --provider-sha256 \"$2\" \
-               --provider-timeout-ms {provider_timeout_ms}); \
-             echo \"$reconciler\" | awk '{{print $NF}}'"
-        ),
-    ]))?;
-    let provider_sha = provider_sets.trim().to_owned();
-    if provider_sha.is_empty() {
-        return Err("publish-provider-set printed no set sha".into());
-    }
     Ok((
         release_root,
         baseline_path.trim().to_owned(),
         baseline_sha.trim().to_owned(),
-        provider_sha,
     ))
 }
 
 /// Apply every resource the fleet layout needs and return the published reconciler set's sha —
 /// the identity each cohort release is signed with.
-fn apply_resources(
-    provider_path: &str,
-    jenkins: Option<&JenkinsResources>,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn apply_resources(jenkins: &JenkinsResources) -> Result<(), Box<dyn std::error::Error>> {
     let edge: serde_json::Value = serde_json::from_str(&output(kubectl().args([
         "-n",
         NAMESPACE,
@@ -1039,9 +1044,8 @@ fn apply_resources(
         ]
     }))?;
     let platform = repository_platform()?;
-    let (release_root, baseline_path, baseline_sha, provider_sha) =
+    let (release_root, baseline_path, baseline_sha) =
         bootstrap_minio_release_repo(&edge, &platform)?;
-    let provider = serde_json::json!({"path": provider_path, "sha256": provider_sha});
     let minio_release_repository = minio_release_repository(&release_root);
     // The sample-app cohorts (and the external slice) start on the MinIO-published baseline the
     // chaos then rolls with `updatectl deploy`.
@@ -1053,7 +1057,6 @@ fn apply_resources(
         // Point the cohort at MinIO: this is the repository `updatectl deploy` publishes to and
         // patches. The Jenkins groups below keep edge's release-server repo (the default path).
         deployment["releaseRepository"] = minio_release_repository.clone();
-        deployment["providerSet"] = provider.clone();
         // Signed opt-in to first-install cold-install fallback: a killed, stateless agent
         // pod returns cold and must descend from its assigned version to the newest
         // healthy release rather than stranding on a broken head. This is what makes
@@ -1070,8 +1073,7 @@ fn apply_resources(
             "healthSuccesses": 1,
             "healthIntervalSeconds": 1,
             "refreshRetrySeconds": 1,
-            "confirmationWindowSeconds": 3,
-            "agentCheckIntervalSeconds": 3600
+            "confirmationWindowSeconds": 3
         });
         // Every group carries the fleet label (its single throttle set) and its set label.
         let mut labels = serde_json::Map::new();
@@ -1106,45 +1108,39 @@ fn apply_resources(
     // they are upgraded one node at a time by the same agent mechanism (zero downtime across each
     // pair) yet sit entirely outside the convergence throttling and pod-kill chaos that drive the
     // sample-app cohorts.
-    if let Some(jenkins) = jenkins {
-        for (role, _replicas) in JENKINS_COHORTS {
-            let name = format!("jenkins-{role}");
-            let mut deployment = edge["spec"]["deployment"].clone();
-            deployment["name"] = name.clone().into();
-            deployment["application"] = serde_json::json!({
-                "path": jenkins.application_path,
-                "sha256": jenkins.application_sha.trim()
-            });
-            deployment["providerSet"] = serde_json::json!({
-                "path": jenkins.provider_path,
-                "sha256": jenkins.provider_sha.trim()
-            });
-            deployment["coldInstallFallback"] = serde_json::json!(false);
-            deployment["runtime"]["product"] = "jenkins".into();
-            // The Jenkins reconciler backs JENKINS_HOME up before activation and reuses it; the
-            // hook owns the process, and rollback restores the backup. Jenkins's first install
-            // runs for minutes; give it a boot-sized health grace and a relaxed cadence rather
-            // than the fleet's sub-second timings.
-            deployment["runtime"]["timeouts"] = serde_json::json!({
-                "checkIntervalSeconds": 5,
-                "healthGraceSeconds": 360,
-                "healthSuccesses": 1,
-                "healthIntervalSeconds": 3,
-                "refreshRetrySeconds": 5,
-                "confirmationWindowSeconds": 10,
-                "agentCheckIntervalSeconds": 3600
-            });
-            items.push(serde_json::json!({
-                "apiVersion":"updated.dev/v1alpha1",
-                "kind":"UpdateGroup",
-                "metadata":{"name": name, "namespace":NAMESPACE},
-                "spec":{
-                    "repositoryRef":{"name":fixture::REPOSITORY_NAME},
-                    "selector": {"matchLabels":{KIND_LABEL:"jenkins", ROLE_LABEL: role}},
-                    "deployment": deployment
-                }
-            }));
-        }
+    for (role, _replicas) in JENKINS_COHORTS {
+        let name = format!("jenkins-{role}");
+        let mut deployment = edge["spec"]["deployment"].clone();
+        deployment["name"] = name.clone().into();
+        deployment["application"] = serde_json::json!({
+            "path": jenkins.application_path,
+            "sha256": jenkins.application_sha.trim()
+        });
+
+        deployment["coldInstallFallback"] = serde_json::json!(false);
+        deployment["runtime"]["product"] = "jenkins".into();
+        // The Jenkins reconciler backs JENKINS_HOME up before activation and reuses it; the
+        // hook owns the process, and rollback restores the backup. Jenkins's first install
+        // runs for minutes; give it a boot-sized health grace and a relaxed cadence rather
+        // than the fleet's sub-second timings.
+        deployment["runtime"]["timeouts"] = serde_json::json!({
+            "checkIntervalSeconds": 5,
+            "healthGraceSeconds": 360,
+            "healthSuccesses": 1,
+            "healthIntervalSeconds": 3,
+            "refreshRetrySeconds": 5,
+            "confirmationWindowSeconds": 10
+        });
+        items.push(serde_json::json!({
+            "apiVersion":"updated.dev/v1alpha1",
+            "kind":"UpdateGroup",
+            "metadata":{"name": name, "namespace":NAMESPACE},
+            "spec":{
+                "repositoryRef":{"name":fixture::REPOSITORY_NAME},
+                "selector": {"matchLabels":{KIND_LABEL:"jenkins", ROLE_LABEL: role}},
+                "deployment": deployment
+            }
+        }));
     }
     // Per-set UpdateGroupSet (default maxConcurrent = members-1): never both groups of a
     // set roll at once, so every set always keeps a group serving.
@@ -1177,7 +1173,7 @@ fn apply_resources(
         .expect("group metadata is an object")
         .remove("labels");
     items.push(external_group);
-    // No healthproxy RBAC here: the operator mints it. `runtime::reconcile_backend_access` applies
+    // No healthproxy RBAC here: the operator mints it. `runtime::reconcile_backend_access` converges
     // the ServiceAccount, the Role from `runtime::backend_role`, and the RoleBinding per
     // UpdateBackend, owner-referenced to the CR — so there is exactly one definition of what that
     // reconciler is allowed to do, and this run exercises the shipping one rather than a copy.
@@ -1210,7 +1206,7 @@ fn apply_resources(
         "kind": "List",
         "items": items
     }))?;
-    Ok(provider_sha)
+    Ok(())
 }
 
 /// Pipe a JSON resource (typically a `List`) into `kubectl apply -f -`. The one path every
@@ -1252,4 +1248,9 @@ pub(crate) fn output(command: &mut Command) -> Result<String, Box<dyn std::error
             .into());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+/// The demo has one command implementation selected by ordinary runtime context.
+pub(crate) fn demo_execution_flags() -> String {
+    format!("--entrypoint bin/lifecycle --healthcheck bin/lifecycle --inspect bin/lifecycle --recover bin/lifecycle --replay safe --recovery-replay safe --timeout-seconds {}", demo_lifecycle::PROVIDER_TIMEOUT_MS.div_ceil(1000))
 }

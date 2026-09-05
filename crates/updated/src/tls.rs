@@ -179,25 +179,6 @@ pub fn verify_client_chain(leaf: CertificateDer<'_>, ca: &Path) -> io::Result<()
     Ok(())
 }
 
-/// Build an aws-lc-rs rustls server config for an externally-exposed listener: it presents
-/// `cert`/`key` and REQUIRES every client to present a certificate the fleet `client_ca` signed.
-/// This is the production gateway's mTLS boundary: no unauthenticated client is ever admitted.
-/// Fail-closed on any unreadable or invalid PEM.
-pub fn server_config(
-    cert: &Path,
-    key: &Path,
-    client_ca: &Path,
-) -> io::Result<rustls::ServerConfig> {
-    let provider = Arc::new(crypto_provider());
-    let roots = load_roots(client_ca, "client CA")?;
-    let verifier = required_client_verifier(
-        roots,
-        provider.clone(),
-        "building the client-certificate verifier",
-    )?;
-    server_config_with_verifier(cert, key, provider, verifier)
-}
-
 /// Build the production mTLS server config and prove that `issued_client` is admitted by its
 /// verifier before returning it. The proof and the returned config share the exact verifier built
 /// from one read of `client_ca`, so a Secret rotation between two file reads cannot install an
@@ -261,7 +242,7 @@ fn server_config_with_verifier(
 /// receive the bearer URL's second hop. Application routing must still reject every anonymous
 /// request that does not carry an exact, live capability.
 ///
-/// Production gateways use [`server_config`] and therefore remain mTLS-only at the handshake.
+/// Production gateways use [`server_config_accepting_issued_client`] and remain mTLS-only.
 pub fn capability_fixture_server_config(
     cert: &Path,
     key: &Path,
@@ -317,7 +298,7 @@ fn pem_err<E: std::fmt::Display>(label: &'static str, path: &Path) -> impl Fn(E)
 
 /// Read mounted TLS material through the same bounded opened-handle path everywhere. Kubernetes
 /// Secret keys are final symlinks by construction, so following that one component is explicit;
-/// the opened target must still be a regular file and the byte limit applies to the handle.
+/// the opened target must still be a regular file and the byte limit converges to the handle.
 fn read_tls_material(path: &Path, label: &'static str) -> io::Result<Vec<u8>> {
     foundation::file::read_bounded_regular(
         path,

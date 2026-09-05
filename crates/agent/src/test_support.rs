@@ -3,12 +3,12 @@
 //! `release`, `lineage` and `provider` describe the same three nominal values in every one of this
 //! crate's test modules, and each module used to spell them itself — `release` three times,
 //! `provider` twice, `lineage` twice. Identical copies are the ones that quietly stop being
-//! identical: a field added to `ProviderRelease` gets a considered value in the copy the author was
+//! identical: a field added to `ReconcilerRelease` gets a considered value in the copy the author was
 //! looking at and a filler in the others, and the tests then disagree about what a nominal install
 //! looks like. One definition each, so they cannot.
 
 use updated::bundle::ReleaseId;
-use updated::state::{ProviderRelease, RepositoryLineage};
+use updated::state::{ReconcilerRelease, RepositoryLineage};
 
 /// An absolute path that is deliberately absent, portable across every host in the CI matrix.
 ///
@@ -43,8 +43,8 @@ pub(crate) fn digest(identity: &str) -> String {
 }
 
 /// The runtime verdict identity shared by every nominal test transaction.
-pub(crate) fn deployment_rejection(application_sha256: &str, provider_set_sha256: &str) -> String {
-    updated_contracts::digest::deployment_rejection_sha256(application_sha256, provider_set_sha256)
+pub(crate) fn deployment_rejection(application_sha256: &str) -> String {
+    updated_contracts::digest::deployment_rejection_sha256(application_sha256)
         .expect("fixture deployment identities are canonical")
 }
 
@@ -64,13 +64,11 @@ pub(crate) fn lineage() -> RepositoryLineage {
 }
 
 /// The node reconciler a fixture release is installed with.
-pub(crate) fn provider() -> Box<ProviderRelease> {
-    Box::new(ProviderRelease {
-        provider_set_sha256: "f".repeat(64),
+pub(crate) fn provider() -> Box<ReconcilerRelease> {
+    Box::new(ReconcilerRelease {
+        definition_sha256: "f".repeat(64),
         product: "reconciler".into(),
-        release: release("1.0.0", "reconciler-manifest"),
-        archive_sha256: digest("reconciler-archive"),
-        args: Vec::new(),
+        api: 1,
         timeout_millis: 1_000,
     })
 }

@@ -281,7 +281,7 @@ pub(crate) async fn serve_tls(
         let Ok(permit) = budget.clone().acquire_owned().await else {
             return;
         };
-        // Take the current identity per connection, so a rotated certificate applies to the next
+        // Take the current identity per connection, so a rotated certificate converges to the next
         // handshake rather than to the next process.
         let materials = materials.get();
         let acceptor = TlsAcceptor::from(materials.server_config.clone());

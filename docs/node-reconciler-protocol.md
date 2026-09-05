@@ -1,260 +1,216 @@
-# Node reconciler protocol
+# Internal node execution protocol
 
-Status: implemented. The shared vocabulary and argv builder live in
-`updated-contracts::reconciler`; the agent invocation is
-`agent::update::prepare_lifecycle_command`.
+Protocol version: `2`.
 
-Every release carries one signed reconciler: a script, native binary, or other executable. The
-agent verifies and invokes it without interpreting application semantics. The reconciler is the
-only component that starts, stops, drains, configures, or restarts a workload.
+The agent automatically supplies a native, language-independent [reconciler helper](reconciler-helper.md)
+for invocation context, structured results, file convergence, verified migration progress, and
+boot identity. It ships with the agent; customers do not install a separate SDK or helper package.
+
+Customers use `updatectl deploy --entrypoint` with arbitrary scripts or executables. The
+[native runtime](command-adapter.md) implements this protocol for them, generates results, and
+handles replay policies; the entrypoint receives only its own arguments, never the protocol flags.
+
+A deployment is one signed immutable package, including its execution metadata. The native runtime
+is embedded in the agent. Durable state and signed reports bind its execution definition to the
+package; unsupported APIs require an agent upgrade.
+
+This grammar is a platform implementation detail. Customer entrypoints do not implement it.
+Each invocation identifies one payload; recovery code keeps its own verified restoration evidence.
 
 ## Operations
 
-The interface has exactly four operations:
+- `converge` idempotently makes machine state match the supplied payload.
+- `healthcheck` makes one bounded observation of that payload's readiness.
+- `rollback` idempotently compensates changes made while converging the supplied failed payload.
+- `inspect` emits deterministic measured-state bytes on stdout.
 
-- `apply` idempotently converges the machine to `--candidate` and emits that state's output files.
-- `healthcheck` makes one bounded readiness observation. Exit zero means healthy.
-- `rollback` idempotently restores `--candidate` and emits the restored state's output files.
-- `inspect` makes one bounded steady-state observation. Non-empty stdout is opaque fingerprint
-  material.
+The package recovery procedure restores the previous application and compatible data explicitly.
+After it succeeds, the agent activates the predecessor and invokes the runtime with `converge` under
+the compensating identity. In that direction the runtime verifies health and restores recorded
+outputs; it never implicitly runs the predecessor entrypoint. Failed health requires attention.
 
-`--candidate` always names the release to converge onto. During rollback it is the release being
-restored; `--predecessor` is the failed release being left. The same rule in both directions keeps
-direction-specific behavior out of ordinary reconcilers.
+## Invocation grammar
 
-The agent owns verification, artifact placement, retries, deadlines, durable transaction state,
-crash recovery, and rollout reporting. None of those is a reconciler operation.
-
-## Invocation
+The reconciler entrypoint is invoked with the operation as its first argument, followed by every
+protocol flag in this exact order:
 
 ```text
-reconciler OPERATION
-  --protocol 1
+ENTRYPOINT OPERATION
+  --protocol 2
   --attempt-id ID
-  --reason install|restart|update
+  --reason REASON
   --install-root PATH
   --state-dir PATH
-  --candidate PATH
-  --candidate-version VERSION
+  --payload-root PATH
+  --payload-version VERSION
   --output-dir PATH
   --result-file PATH
   --input-dir PATH
-  --predecessor PATH
-  --predecessor-version VERSION
-  [-- PUBLISHER_ARGUMENTS...]
 ```
 
-`--reason` is exactly one of `install`, `restart`, or `update`.
+The paths have these meanings:
 
-Arguments are direct argv, never shell text. Stdin is null. The environment is cleared and then
-given only a small platform resolution baseline (`PATH` on Unix; system and temporary-directory
-variables on Windows). Configuration, credentials, and secret material have one application-facing
-representation: ordinary files in `--input-dir`. They are never injected as environment variables.
+- `--install-root`: the agent installation root; do not mutate agent-owned files beneath it.
+- `--state-dir`: private durable reconciler state, stable across releases and retries.
+- `--payload-root`: the verified immutable payload tree for this invocation. Never write to it.
+- `--output-dir`: a fresh empty directory for this invocation's complete advertised outputs.
+- `--result-file`: a fresh agent-owned path for the mutation result document.
+- `--input-dir`: immutable files selected by the signed assignment for this invocation.
 
-Each invocation receives new private `--input-dir` and `--output-dir` directories plus a dedicated
-`--result-file` path. They do not survive the invocation. `--state-dir` is the reconciler's durable
-private state and does survive replays, releases, and boots.
+Unknown operations and unsupported protocol versions must be rejected. Customer arguments are
+contained in the signed execution metadata, separate from this internal invocation grammar.
 
-The process runs as a contained tree (a Unix process group or Windows job object). The tree is torn
-down when the hook returns, including on success. A workload that must outlive `apply` has to move
-out of the tree first (`setsid` on Unix, or the corresponding detached/breakaway flags on Windows)
-and durably record its service or process handle before accepting traffic.
+`REASON` is one of `install`, `restart`, or `update`. The valid operation/reason/attempt combinations
+are:
 
-`--attempt-id` is the deployment transaction token or one of four recurring reserved identities:
-
-- `boot` for boot/restart convergence and its readiness gate;
-- `converge` for steady-state desired-state convergence and its readiness gate;
-- `periodic` for steady-state healthchecks;
-- `fingerprint` for steady-state inspection.
-
-Reserved identities are not idempotency keys because they are deliberately reused. A transaction
-token is exactly 64 lowercase hexadecimal characters, is stable across crash replay, and is never
-reused with different arguments. Its compensating direction appends `r` to that token.
-
-The operation, reason, and attempt identity are one grammar, not independent options:
-
-| Operation | Reason | Accepted attempt identity |
+| Operation | Reason | Attempt ID |
 | --- | --- | --- |
-| `apply` | `install` | `boot` |
-| `apply` | `restart` | `boot` or `converge` |
-| `apply` | `update` | transaction token or its compensating form |
-| `rollback` | `update` | compensating transaction token |
+| `converge` | `install` | `boot` |
+| `converge` | `restart` | `boot` or `converge` |
+| `converge` | `update` | transaction token or its compensating form |
 | `healthcheck` | `install` | `boot` |
 | `healthcheck` | `restart` | `boot`, `converge`, or `periodic` |
 | `healthcheck` | `update` | transaction token or its compensating form |
+| `rollback` | `update` | compensating transaction token |
 | `inspect` | `restart` | `fingerprint` |
 
-Every other combination is invalid and is refused before the hook is started.
+The compensating token is deterministically derived from the forward transaction token. A
+reconciler must treat the attempt ID together with the operation as its idempotency scope.
 
-## File dataflow
+## Mutation results
 
-The reconciler sees files, not JSON, base64, secret references, object-store URLs, or provider-
-specific values. This is the only configuration path.
+`converge` and `rollback` must atomically publish one bounded JSON result to `--result-file` before
+exiting zero. Observations must not create that file.
 
-`--input-dir` is immutable for the invocation and contains exactly the files selected by the signed
-assignment. A missing or extra file makes the snapshot unusable before the reconciler is invoked.
-The directory may be empty.
-
-`--output-dir` starts empty on every invocation. A successful `apply` or `rollback` publishes
-exactly the files left there as the release's new atomic output snapshot. The reconciler must emit
-the complete snapshot on every replay; it cannot rely on files left by an earlier invocation.
-`healthcheck` and `inspect` never publish outputs, even if they write into their disposable output
-directories.
-
-Snapshots are deliberately small and flat:
-
-- at most 64 files;
-- each name is one safe path component of at most 128 bytes;
-- only regular files are accepted—no directories, symlinks, devices, or non-UTF-8 names;
-- each file is at most 64 KiB;
-- the serialized snapshot is at most 512 KiB.
-
-An invalid output snapshot fails the otherwise-successful operation. The previous durable snapshot
-remains authoritative. Inputs and outputs may contain secrets; reconcilers must not copy their
-contents to stdout, stderr, argv, logs, or process-wide environment variables.
-
-The agent serializes these files only at its private S3 boundary. A producer's successful snapshot
-is bound to its signed health report, and a consumer receives a controller-built snapshot named by
-an opaque keyed generation in its signed assignment. Changes cascade by republishing the affected
-assignment and reapplying the consumer's last known release with `--reason restart`.
-
-## Structured mutation result
-
-Every successful `apply` and `rollback` must write one bounded JSON document to
-`--result-file` before exiting zero. `healthcheck` and `inspect` must not create that file. A
-missing, malformed, oversized, or contradictory document fails the invocation.
+Successful mutation:
 
 ```json
 {
-  "schema": 1,
   "status": "succeeded",
+  "schema": 1,
   "changed": true,
   "hostAction": "none",
-  "message": "optional one-line diagnostic"
+  "message": null
 }
 ```
 
-- `status` is `succeeded` or `retry`.
-- A `succeeded` result carries `changed` and `hostAction` (`none` or `reboot`) and never carries a
-  retry delay.
-- A `retry` result carries only `retryAfterSeconds` (from 1 through 3600) and `message`; it cannot
-  claim completion, changed state, or a host action.
-- `message` is optional, control-character-free, and at most 4 KiB.
+`hostAction` is `none` or `reboot`. A zero-exit invocation may instead request a bounded retry:
 
-The agent owns retry policy: it repeats the same operation, attempt id, and arguments up to five
-times, sleeping the requested bounded delay. Retry exhaustion is an inconclusive node condition,
-not evidence that the candidate bytes are bad.
+```json
+{
+  "status": "retry",
+  "schema": 1,
+  "retryAfterSeconds": 5,
+  "message": "waiting for the service manager"
+}
+```
 
-The agent also owns reboot policy. After a successful mutation requests `reboot`, it durably
-commits the transaction with its predecessor retained, invokes the fixed operating-system reboot
-command, and does not ask the pre-reboot machine for a health verdict. On the next boot the ordinary
-boot `apply` and `healthcheck` confirm the new state; failure restores the predecessor. A script
-must request reboot whenever its desired state has not yet crossed the required reboot boundary.
+When application state requires a decision, exit zero with:
 
-For every successful mutation the agent durably records the operation, reason, attempt id, both
-immutable release identities, structured result, and completion time before accepting success. The
-latest record is included in the node's signed report.
+```json
+{"status":"needs-attention","schema":1,"message":"verify migration completion before recovery"}
+```
 
-## Replay and concurrency
+This is neither success nor a request to retry. The platform records a durable installation hold,
+stops subsequent mutations across restarts, and reports the hold as unhealthy in signed telemetry.
+It carries no changed, host-action, output, or successful reconciliation claim. The
+[command adapter](command-adapter.md) supplies receipt-bound operator resolution for its procedures.
+Resume commands require a matching durable execution receipt.
 
-There is no exactly-once invocation. An operation can be interrupted after any prefix of its work
-and invoked again with the same arguments. Therefore:
+Retries receive the identical operation, attempt ID, payload, and arguments. The agent bounds the
+number of retries. Exit zero without a valid result, a malformed result, a non-zero exit, or a
+timeout is a failed invocation.
 
-- `apply` and `rollback` must be idempotent and must re-emit their complete output snapshot;
-- durable multi-step progress belongs under `--state-dir`, keyed by transaction attempt id;
-- a completion marker written after a non-atomic side effect does not make that effect exactly
-  once—use an atomic effect, a transaction, or a downstream idempotency token;
-- `healthcheck` and `inspect` are read-only observations and may overlap each other;
-- `apply` and `rollback` do not overlap another operation on the same install root.
+A crash replay that finds the mutation already complete must return `changed: false`. Return
+`hostAction: reboot` while that mutation still requires an OS reboot, and `hostAction: none` once
+the reboot has actually occurred. Checkpointing the mutation or returning a reboot request does
+not establish that the host rebooted. The reconciler must inspect actual state or retain the boot
+identity with its progress so a crash before the agent accepts the result cannot lose the request.
+The agent durably records an accepted reboot request before publishing outputs or advancing its
+transaction, retries it across service restarts, and clears it only after the OS boot identity
+changes. The conformance harness never reboots the host; it allows the same outstanding request
+on replay.
 
-The last completed state-changing invocation wins. A rejected candidate is not retried under a new
-attempt token.
+## Outputs and inputs
 
-## Exit and output
+A successful `converge` or `rollback` publishes the complete bounded set of regular files left in
+`--output-dir`. The agent atomically replaces the prior snapshot; a retry or replay must therefore
+re-emit every output, including when `changed` is false. Observations cannot replace outputs.
 
-For `apply` and `rollback`, exit zero means the process produced an answer and `--result-file`
-contains its semantic outcome. Any nonzero status means the reconciler could not answer. For
-`healthcheck`, exit zero means healthy and nonzero means unhealthy. `inspect` must exit zero and
-write a non-empty, stable measurement to stdout; the agent hashes the exact bytes. Other operations
-must keep stdout empty. All stderr is diagnostic and bounded. The agent enforces structure and
-limits but cannot prove the domain behavior is safe or correct.
+`--input-dir` is recreated for each invocation from authenticated assignment data. It is not a
+durable cache. Secrets must not be copied into outputs, stdout, stderr, result messages, or payload
+content.
 
-## Conformance harness
+The agent privately caches authenticated inputs before exposing a changed selection and pins the
+transaction's inputs before its first mutation. Recovery consumes that pin without fetching inputs
+from the network, even if the current assignment has changed. The pin remains until the transaction
+and rollback guard have settled; unchanged selections use the in-memory snapshot.
+
+## Health and process lifetime
+
+`healthcheck` is a single observation: exit zero means healthy and non-zero means unhealthy. The
+agent owns grace periods, consecutive-success requirements, intervals, and per-probe deadlines.
+
+The agent contains and reaps the reconciler process tree when an invocation finishes or times out.
+A workload that must outlive the invocation must be handed to a real service manager or otherwise
+detached according to the platform contract.
+
+## Durable update and rollback order
+
+Forward update barriers record completed effects:
 
 ```text
-updatectl reconciler-check ./reconciler [--scratch DIR] [-- PUBLISHER_ARGUMENTS...]
+Prepared
+  -> verify candidate bytes and atomically activate candidate
+Activated
+  -> candidate reconciler converge(payload=candidate)
+Converged
+  -> immediate candidate health gate
+Verified
+  -> commit candidate with exact predecessor rollback guard
+Committed
+  -> clear journal
 ```
 
-The harness uses the shared argv builder, cleared environment, null stdin, fresh exchange
-directories, and production snapshot validator. It checks:
+If a successful converge requires a reboot, the candidate may commit directly from `Converged` with
+its rollback guard armed; the boot health gate supplies the authoritative post-reboot verdict.
 
-- replayed `apply` and `rollback` succeed, report `changed: false`, and independently re-emit
-  identical output files;
-- every successful mutation publishes a valid result and observations publish none;
-- replayed observations return consistent status without changing `--state-dir`;
-- `inspect` emits identical non-empty stdout;
-- unknown operations and protocols fail;
-- every emitted output snapshot satisfies the production bounds.
+While rollback protection is armed, a failed bounded health gate journals a revert to the exact
+predecessor. Confirmation requires both an elapsed confirmation window and a fresh passing health
+gate. An inconclusive probe retains the guard and retries without rejecting the release.
 
-It needs no repository, keys, object store, or Kubernetes access.
+Rollback barriers are:
 
-## Minimal Bash reconciler
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-operation=${1:?missing operation}
-shift
-protocol= reason= candidate= predecessor= input_dir= output_dir= result_file=
-
-while (($#)); do
-  case "$1" in
-    --protocol) protocol=$2; shift 2 ;;
-    --reason) reason=$2; shift 2 ;;
-    --candidate) candidate=$2; shift 2 ;;
-    --predecessor) predecessor=$2; shift 2 ;;
-    --input-dir) input_dir=$2; shift 2 ;;
-    --output-dir) output_dir=$2; shift 2 ;;
-    --result-file) result_file=$2; shift 2 ;;
-    --attempt-id|--install-root|--state-dir|--candidate-version|--predecessor-version)
-      shift 2 ;;
-    --) shift; break ;;
-    *) echo "unknown argument: $1" >&2; exit 2 ;;
-  esac
-done
-[[ $protocol == 1 ]] || exit 2
-
-emit_outputs() {
-  # Re-emit the complete snapshot on every apply/rollback invocation.
-  printf '%s\n' "https://database.internal:5432" >"$output_dir/endpoint"
-}
-
-publish_success() {
-  local changed=$1 host_action=${2:-none}
-  printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"%s","message":null}' \
-    "$changed" "$host_action" >"$result_file"
-}
-
-case "$operation" in
-  apply)
-    ./existing-installer --source "$candidate" --config "$input_dir/application.conf"
-    setsid ./existing-start-command --source "$candidate" </dev/null >>/var/log/app.log 2>&1 &
-    emit_outputs
-    publish_success true
-    ;;
-  healthcheck) ./existing-status-command ;;
-  rollback)
-    ./existing-restore-command --source "$candidate"
-    emit_outputs
-    publish_success true
-    ;;
-  inspect)
-    ./existing-status-command
-    printf 'state=ready\n'
-    ;;
-  *) echo "unknown operation: $operation" >&2; exit 2 ;;
-esac
+```text
+RollbackPlanned
+  -> candidate reconciler rollback(payload=failed candidate)
+CandidateCompensated
+  -> verify and activate exact predecessor
+  -> predecessor reconciler converge(payload=predecessor)
+Restored
+  -> predecessor health gate
+RollbackVerified
+  -> commit predecessor
+RolledBack
+  -> clear journal
 ```
 
-`protocol 1` is the only protocol. There is no legacy manifest or environment-secret path.
+Each external effect is idempotent. A crash between an effect and its following journal write
+replays that effect with the same attempt identity. Journal phases never claim an effect merely
+started; they mean the named barrier completed.
+
+## Reconciler requirements
+
+- Treat the payload as immutable and opaque to the agent.
+- Derive desired state from `--payload-root`, not from repository history or an active-pointer file.
+- Make `converge` and `rollback` idempotent under crash replay.
+- Keep sub-progress needed for safe replay in `--state-dir`.
+- Make rollback compensate only the supplied failed payload; never guess a predecessor.
+- Refuse unsupported protocol versions and invalid invocation combinations.
+
+Idempotency and transition compatibility are separate obligations. Inspect actual files, services,
+and data before choosing work; neither `--reason` nor a stored version marker proves completion.
+Refuse an unsupported starting state before an incompatible mutation. Compensation must account
+for persistent data changes: restoring predecessor files does not reverse a database migration.
+See [installation and ordered upgrades](install-and-upgrade.md) for the checked sequence helper,
+application-owned compatibility, and transition tests around this contract.

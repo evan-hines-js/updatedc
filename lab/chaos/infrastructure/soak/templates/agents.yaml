@@ -58,10 +58,10 @@ spec:
           args:
             - |
               uid={{ include "soak.runtimeUid" . }}
-              install -d -o "$uid" -g "$uid" -m 0700 /var/lib/updated /var/lib/updated/launcher /prepared-tls
+              install -d -o "$uid" -g "$uid" -m 0700 /var/lib/updated /var/lib/updated/state /prepared-tls
               chown -R "$uid:$uid" /var/lib/updated
-              if [ -e /var/lib/updated/launcher/agent.key ]; then
-                chmod 0600 /var/lib/updated/launcher/agent.key
+              if [ -e /var/lib/updated/state/agent.key ]; then
+                chmod 0600 /var/lib/updated/state/agent.key
               fi
               cp /source-tls/ca.crt /source-tls/tls.crt /source-tls/tls.key /prepared-tls/
               chown "$uid:$uid" /prepared-tls/*
@@ -89,7 +89,7 @@ spec:
           command: [/usr/local/bin/run-agent]
           ports: [{name: workload, containerPort: 8080}]
           # IOChaos temporarily replaces this mount with its own FUSE mount. Both are valid
-          # mountpoints. If toda cleanup instead loses the nested PVC mount, the launcher can no
+          # mountpoints. If toda cleanup instead loses the nested PVC mount, the agent can no
           # longer read its durable authority and cannot repair the container from inside it.
           # Recycling the pod is the one recovery path that remounts the same PVC.
           livenessProbe:

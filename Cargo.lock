@@ -6,11 +6,11 @@ version = 4
 name = "agent"
 version = "0.1.0"
 dependencies = [
- "control",
  "foundation",
  "libc",
  "rcgen",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -527,13 +527,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "control"
-version = "0.1.0"
-dependencies = [
- "foundation",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -771,6 +764,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "updated",
  "updated-contracts",
  "ureq",
@@ -1789,17 +1783,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "launcher"
-version = "0.1.0"
-dependencies = [
- "control",
- "foundation",
- "libc",
- "tempfile",
- "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -426,7 +426,9 @@ impl PublicationTransaction<'_> {
 
                 // Signing can starve lease renewal. Recheck immediately before the irreversible
                 // external write; object-version CAS fences the remaining network gap.
-                if !holds_lease(client, namespace, "updatec-publisher", identity).await? {
+                if !holds_publisher_lease(client, namespace, &repository.name_any(), identity)
+                    .await?
+                {
                     return Err(Box::new(StorageError(
                         "publisher lease lost during reconcile; skipping publish to avoid a split-brain write"
                             .into(),
@@ -1819,10 +1821,15 @@ pub(crate) mod wiring_tests {
                 (Method::GET, [.., "updatesubscriptions"]) => {
                     (StatusCode::OK, kube_list(Vec::new()))
                 }
-                (Method::GET, [.., "leases", "updatec-publisher"]) => {
+                (Method::GET, [.., "leases", name])
+                    if *name
+                        == publisher_lease_name(
+                            &cluster.repository.as_ref().unwrap().name_any(),
+                        ) =>
+                {
                     let lease = Lease {
                         metadata: kube::api::ObjectMeta {
-                            name: Some("updatec-publisher".into()),
+                            name: Some((*name).into()),
                             namespace: Some("default".into()),
                             ..Default::default()
                         },
@@ -1830,6 +1837,7 @@ pub(crate) mod wiring_tests {
                     };
                     (StatusCode::OK, serde_json::to_value(&lease).unwrap())
                 }
+                (Method::GET, [.., "leases", "updatec-publisher"]) => not_found(),
                 (Method::GET, [.., "secrets", name]) => match cluster.secrets.get(*name) {
                     Some(secret) => (StatusCode::OK, serde_json::to_value(secret).unwrap()),
                     None => not_found(),
@@ -2240,7 +2248,7 @@ pub(crate) mod wiring_tests {
     }
 
     /// The mock apiserver records status patches rather than applying them, so a test that needs
-    /// the NEXT pass to see the cluster this one left behind applies them by hand. Returns how many
+    /// the NEXT pass to see the cluster this one left behind converges them by hand. Returns how many
     /// were applied.
     fn apply_status_patches(cluster: &StdMutex<Cluster>) -> usize {
         let mut cluster = cluster.lock().expect("cluster");

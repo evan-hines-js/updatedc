@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Shared helpers for the updated-managed HAProxy lifecycle provider.
+# Shared helpers for the updated-managed HAProxy reconciler.
 #
 # Sourced by `lifecycle`; carries the primitives the phases share. The only process left behind is
 # the HAProxy master itself (started by the release's own launcher — never a background helper of
@@ -207,12 +207,12 @@ start_master() {
   live_master "$runtime" || die "launching HAProxy from $release left no running master behind"
 }
 
-# Converge the machine onto `release`: the whole of what `apply` and `rollback` do, which differ
+# Converge the machine onto `release`: the whole of what `converge` and `rollback` do, which differ
 # only in the release they name.
 #
 # A master of ours that is already running takes the new bytes in place — that re-exec is the point
 # of this provider. If that master already carries this exact immutable release, convergence is a
-# real no-op: at-least-once apply/rollback replay must not manufacture a second reload. Where
+# real no-op: at-least-once converge/rollback replay must not manufacture a second reload. Where
 # nothing of ours is running the release is started instead: the agent launches no workload
 # process, so the first deployment on a node (and any later operation that finds the master gone)
 # has no other way into service.

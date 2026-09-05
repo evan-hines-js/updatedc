@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "updatedc internal entrypoint execution metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "deploy",
+    "replay",
+    "recovery"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "deploy": {
+      "$ref": "#/$defs/procedure"
+    },
+    "health": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/procedure"
+        },
+        {
+          "properties": {
+            "timeoutSeconds": {
+              "maximum": 20
+            }
+          }
+        }
+      ]
+    },
+    "replay": {
+      "$ref": "#/$defs/replay"
+    },
+    "recovery": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy"
+          ],
+          "properties": {
+            "policy": {
+              "const": "manual"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy",
+            "command",
+            "replay"
+          ],
+          "properties": {
+            "policy": {
+              "const": "command"
+            },
+            "command": {
+              "$ref": "#/$defs/procedure"
+            },
+            "replay": {
+              "$ref": "#/$defs/replay"
+            }
+          }
+        }
+      ]
+    },
+    "inspect": {
+      "$ref": "#/$defs/procedure"
+    }
+  },
+  "$defs": {
+    "procedure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "timeoutSeconds"
+      ],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "maxLength": 16384
+          },
+          "prefixItems": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16384
+            }
+          ]
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        }
+      }
+    },
+    "replay": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy"
+          ],
+          "properties": {
+            "policy": {
+              "const": "safe"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy"
+          ],
+          "properties": {
+            "policy": {
+              "const": "manual"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy",
+            "command"
+          ],
+          "properties": {
+            "policy": {
+              "const": "check"
+            },
+            "command": {
+              "$ref": "#/$defs/procedure"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

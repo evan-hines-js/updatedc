@@ -585,7 +585,7 @@ mod tests {
         };
         assert!(w.validate().is_err());
         assert!(!w.is_active(at("2026-07-19T12:00:00Z")));
-        // Six days later the week IS representable, so the ordinary rule applies and nothing is
+        // Six days later the week IS representable, so the ordinary rule converges and nothing is
         // rejected — the bound is exactly where the arithmetic stops working.
         let usable = RolloutWindow {
             anchor_week: Some("-262143-01-05".into()),
@@ -841,7 +841,7 @@ mod tests {
             !calendar_exhausted(calendar, at("2026-08-25T07:00:00Z")),
             "and never counts as run out either"
         );
-        // A minute earlier the span IS representable, so the ordinary rule applies and nothing is
+        // A minute earlier the span IS representable, so the ordinary rule converges and nothing is
         // rejected — the bound is exactly where the arithmetic stops working.
         assert!(entry("+262142-12-31", "00:00", "23:59").validate().is_ok());
     }

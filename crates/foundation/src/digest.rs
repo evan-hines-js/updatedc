@@ -1,4 +1,4 @@
-//! Lexical digest invariants shared across the permanent-launcher boundary.
+//! Lexical digest invariants shared across runtime and control-plane boundaries.
 //!
 //! This module does not hash bytes or choose cryptographic policy. It only prevents one digest
 //! from acquiring multiple filesystem or wire identities through hexadecimal case aliases.

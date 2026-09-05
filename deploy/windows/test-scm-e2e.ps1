@@ -1,11 +1,11 @@
 # Requires an elevated PowerShell. Exercises the native SCM host with the current bundle-only
-# installation model: SCM -> wrapper -> launcher -> agent, the same signed native reconciler fixture
+# installation model: SCM -> wrapper -> agent, the same signed native reconciler fixture
 # as the cross-platform E2E suite, a clean service stop, and a fresh launch of the committed bundle.
 #
-# SCOPE, deliberately: this drives the launcher + agent lifecycle and one full reconciler converge.
+# SCOPE, deliberately: this drives the agent lifecycle and one full reconciler converge.
 # It does NOT have the reconciler start a workload process. The property that matters here is
 # ownership, and it is asserted directly: an SCM stop must cleanly end the tree the service owns —
-# the wrapper, the launcher and the agent — and a workload is provably not part of that tree,
+# the wrapper and the agent — and a workload is provably not part of that tree,
 # because the agent never launches, holds, or stops one. What runs the workload is the operator's
 # own mechanism, driven from the reconciler (`sc.exe`, a container runtime, a config reload); a
 # reconciler that instead forks a workload directly must create it with CREATE_BREAKAWAY_FROM_JOB,
@@ -16,7 +16,8 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-$service = 'SelfUpdateAgent'
+$testId = [Guid]::NewGuid().ToString('N')
+$service = "UpdatedAgentE2E-$testId"
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 # Runtime state must never live below Cargo's cached target directory. Restoring that directory
 # can otherwise turn this cold-install test into a restart while still leaving the binary build
@@ -26,17 +27,16 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $machineData = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::CommonApplicationData
 )
-$work = Join-Path $machineData "updated-scm-e2e-$([Guid]::NewGuid().ToString('N'))"
+$work = Join-Path $machineData "updated-scm-e2e-$testId"
 $routingRepo = Join-Path $work 'routing-repo'
 $routingKeys = Join-Path $work 'routing-keys'
 $releaseRepo = Join-Path $work 'release-repo'
 $releaseKeys = Join-Path $work 'release-keys'
 $certs = Join-Path $work 'certs'
-$launcherState = Join-Path $work 'launcher-state'
+$agentState = Join-Path $work 'agent-state'
 $install = Join-Path $work 'install'
 $bundle = Join-Path $work 'bundle-1.0.0'
-$providerSource = Join-Path $work 'reconciler-source'
-$fixtureState = Join-Path $work 'reconciler-state'
+$fixtureState = Join-Path $work 'lifecycle-fixture'
 $config = Join-Path $work 'config.toml'
 $runtime = Join-Path $work 'runtime.json'
 $repoPort = 21980
@@ -120,7 +120,7 @@ function Wait-Operation(
 # stop/restart; otherwise the test can kill the agent between the healthcheck receipt and commit.
 # This fixture has a ten-second health grace and an immediate native health hook. The agent enforces
 # that grace on the hook process itself. The outer 45-second deadline also covers the separately
-# bounded initial apply plus service startup before producing diagnostics for a broken first boot.
+# bounded initial converge plus service startup before producing diagnostics for a broken first boot.
 function Wait-ConfirmedInstall([string]$version, [int]$seconds = 45) {
     $path = Join-Path $install 'state\installed.json'
     $deadline = (Get-Date).AddSeconds($seconds)
@@ -147,8 +147,8 @@ function Wait-ConfirmedInstall([string]$version, [int]$seconds = 45) {
                 $lastReadError = '<none>'
                 $state = $json | ConvertFrom-Json
                 if ($state.release.version -eq $version -and
-                    $state.confirmed -eq $true -and
-                    $null -eq $state.pending) {
+                    $state.maturity -eq 'proven' -and
+                    $null -eq $state.rollback_guard) {
                     return $state
                 }
             } catch {
@@ -171,7 +171,7 @@ function Wait-ConfirmedInstall([string]$version, [int]$seconds = 45) {
     }
     $tree = @(Get-TreeProcessDetails)
     $operations = @(Read-Operations)
-    $launcherLog = Join-Path $launcherState 'launcher.log'
+    $agentLog = Join-Path $agentState 'agent.log'
     $reconciliationPath = Join-Path $install 'state\reconciliation.json'
     $lastReconciliation = if (Test-Path -LiteralPath $reconciliationPath) {
         try { [IO.File]::ReadAllText($reconciliationPath) }
@@ -183,31 +183,28 @@ function Wait-ConfirmedInstall([string]$version, [int]$seconds = 45) {
         "process-tree=[$($tree -join ' | ')]; operations=[$($operations -join ' | ')]; " +
         "installed.json=[$lastJson]; last-read-error=[$lastReadError]; " +
         "reconciliation.json=[$lastReconciliation]; " +
-        "launcher-log=[$launcherLog]"
+        "agent-log=[$agentLog]"
 }
 
-function Get-TreeProcessIds() {
-    $ids = @()
-    foreach ($name in @('updated-launcher', 'updated-agent', 'selfupdate-service')) {
-        $ids += (Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-    }
-    return $ids
-}
-
-function Get-TreeProcessDetails() {
-    # Every process under the service host, not only the three binaries this test owns: a
-    # reconciler hook (powershell.exe) that never returned is the interesting one, and its threads'
-    # wait reasons say whether it is suspended, blocked on the console, or still starting up.
+function Get-ServiceProcessTree() {
+    # Scope both diagnostics and stop assertions to this test's SCM-owned tree. Other running
+    # installations may use the same executable names and must never become test subjects.
+    $ownedService = Get-CimInstance Win32_Service -Filter "Name='$service'"
+    if (-not $ownedService -or $ownedService.ProcessId -eq 0) { return @() }
     $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
     $tree = @()
-    $frontier = @($all | Where-Object { $_.Name -eq 'selfupdate-service.exe' } | ForEach-Object { $_.ProcessId })
+    $frontier = @($ownedService.ProcessId)
     while ($frontier.Count -gt 0) {
         $tree += $frontier
         $frontier = @($all |
             Where-Object { $frontier -contains $_.ParentProcessId -and $tree -notcontains $_.ProcessId } |
             ForEach-Object { $_.ProcessId })
     }
-    return @($all | Where-Object { $tree -contains $_.ProcessId } | Sort-Object CreationDate | ForEach-Object {
+    return @($all | Where-Object { $tree -contains $_.ProcessId })
+}
+
+function Get-TreeProcessDetails() {
+    return @(Get-ServiceProcessTree | Sort-Object CreationDate | ForEach-Object {
         $threads = '<gone>'
         $live = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
         if ($live) {
@@ -232,36 +229,16 @@ function Wait-ProcessExit([int[]]$ids, [int]$seconds = 30) {
     throw "the service tree left processes running after a clean stop: $($alive -join ', ')"
 }
 
-function Read-DesiredAgent() {
-    $pointer = Join-Path $launcherState 'desired-agent'
-    $lines = [IO.File]::ReadAllLines($pointer)
-    if ($lines.Count -ne 2 -or $lines[0] -ne 'agent-v1' -or -not $lines[1]) {
-        throw "invalid desired-agent pointer: $($lines -join ' | ')"
-    }
-    return [IO.Path]::GetFullPath($lines[1])
-}
-
 try {
-    $existingService = Get-Service -Name $service -ErrorAction SilentlyContinue
-    if ($existingService) {
-        if ($existingService.Status.ToString() -ne 'Stopped') {
-            & sc.exe stop $service 2>$null | Out-Null
-            Wait-ServiceState 'Stopped'
-        }
-        & sc.exe delete $service 2>$null | Out-Null
-        if ($LASTEXITCODE) { throw "deleting the previous service failed with exit code $LASTEXITCODE" }
-        Wait-ServiceDeleted
-    }
     New-Item -ItemType Directory -Force $work | Out-Null
-    New-Item -ItemType Directory -Force $launcherState | Out-Null
+    New-Item -ItemType Directory -Force $agentState | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'bin') | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'config') | Out-Null
-    New-Item -ItemType Directory -Force (Join-Path $providerSource 'bin') | Out-Null
     New-Item -ItemType Directory -Force $fixtureState | Out-Null
 
     Push-Location $root
     try {
-        & cargo build --release -p server -p launcher -p agent -p windows-service -p sampleapp
+        & cargo build --release -p server -p agent -p windows-service -p sampleapp
         if ($LASTEXITCODE) { throw 'building SCM test binaries failed' }
         & cargo build --release -p e2e --bin lifecycle-fixture
         if ($LASTEXITCODE) { throw 'building the native reconciler fixture failed' }
@@ -283,7 +260,7 @@ try {
     # bespoke PowerShell implementation took 26 seconds merely to start under LocalSystem on a
     # hosted runner, then a second cold PowerShell process exhausted the health grace. That made an
     # SCM ownership test measure shell startup and duplicated the protocol implementation.
-    Copy-Item (Join-Path $bin 'lifecycle-fixture.exe') (Join-Path $providerSource 'bin\reconciler.exe')
+    Copy-Item (Join-Path $bin 'lifecycle-fixture.exe') (Join-Path $bundle 'bin\fixture.exe')
 
     & (Join-Path $bin 'server.exe') init --repo $routingRepo --keys $routingKeys
     if ($LASTEXITCODE) { throw 'routing repository initialization failed' }
@@ -293,36 +270,26 @@ try {
     # before minting an exact bearer; the release origin never receives the node identity.
     & (Join-Path $bin 'server.exe') gen-certs --dir $certs --san 127.0.0.1 --san localhost
     if ($LASTEXITCODE) { throw 'minting the fleet mTLS material failed' }
+    $procedure = @{argv=@('./bin/fixture.exe', '--lifecycle-fixture'); timeoutSeconds=10}
+    $execution = @{schema=1; deploy=$procedure; health=$procedure; inspect=$procedure;
+        replay=@{policy='safe'}; recovery=@{policy='command'; command=$procedure; replay=@{policy='safe'}}} | ConvertTo-Json -Depth 6 -Compress
+    [IO.File]::WriteAllText((Join-Path $bundle '.updated-execution.json'), $execution, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-app --repo $releaseRepo --keys $releaseKeys --product app `
-        --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
+        --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle"
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }
-    & (Join-Path $bin 'server.exe') publish-provider-artifact --repo $releaseRepo --keys $releaseKeys `
-        --product app-lifecycle --version 1.0.0 --bundle "windows-x86_64=$providerSource" `
-        --entrypoint bin/reconciler.exe
-    if ($LASTEXITCODE) { throw 'publishing the node reconciler failed' }
-    $providerTarget = 'products/app-lifecycle/stable/1.0.0/windows-x86_64/app-lifecycle'
-    $providerSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $providerTarget).Trim()
-    if ($LASTEXITCODE) { throw 'resolving the reconciler hash failed' }
-    & (Join-Path $bin 'server.exe') publish-provider-set --repo $releaseRepo --keys $releaseKeys --id default `
-        --provider-path $providerTarget --provider-sha256 $providerSha --provider-timeout-ms 10000 `
-        --provider-arg '--lifecycle-fixture' --provider-arg $fixtureState
-    if ($LASTEXITCODE) { throw 'publishing provider set failed' }
     $appTarget = 'products/app/stable/1.0.0/windows-x86_64/app'
-    $setTarget = 'provider-sets/default.json'
     $appSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $appTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published application hash failed' }
-    $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $setTarget).Trim()
-    if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
     $runtimeJson = @{
         product = 'app'; channel = 'stable'; installRoot = $install
         repository = @{metadataLimit=1048576; targetLimit=536870912; transportTimeoutSeconds=30}
-        storage = @{inactiveReleases=2; inactiveProviders=2; inactiveAgents=1; inactiveBytes=1073741824; inactiveRepositoryCaches=2}
+        storage = @{inactiveReleases=2; inactiveBytes=1073741824; inactiveRepositoryCaches=2}
         # `checkIntervalSeconds` is capped at MAX_CHECK_INTERVAL_SECONDS (16) — three of a node's
         # report gaps must fit inside the 60s freshness window every reader ages reports against, so
         # a signed assignment carrying a slower cadence is rejected at publish. The native fixture
         # answers immediately; ten seconds is a deadline for runner variance, not a sleep. A long
         # production soak window would only burn CI time here.
-        timeouts = @{checkIntervalSeconds=16; healthGraceSeconds=10; healthSuccesses=1; healthIntervalSeconds=1; refreshRetrySeconds=5; confirmationWindowSeconds=2; agentCheckIntervalSeconds=3600}
+        timeouts = @{checkIntervalSeconds=16; healthGraceSeconds=10; healthSuccesses=1; healthIntervalSeconds=1; refreshRetrySeconds=5; confirmationWindowSeconds=2}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $routingRepo --keys $routingKeys `
@@ -330,7 +297,7 @@ try {
         --name assignments/agents/agent.json --metadata-url "https://127.0.0.1:$objectPort/metadata/" `
         --targets-url "https://127.0.0.1:$objectPort/targets/" --deployment initial `
         --application-path $appTarget --application-sha256 $appSha `
-        --provider-set-path $setTarget --provider-set-sha256 $setSha --runtime $runtime
+        --runtime $runtime
     if ($LASTEXITCODE) { throw 'publishing routing assignment failed' }
 
     $gatewayProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
@@ -346,7 +313,7 @@ try {
     & (Join-Path $bin 'server.exe') export-enrollment --repo $routingRepo `
         --assignment assignments/agents/agent.json --agent-id agent `
         --routing-base-url "https://127.0.0.1:$repoPort/" `
-        --output (Join-Path $launcherState 'enrollment.json')
+        --output (Join-Path $agentState 'enrollment.json')
     if ($LASTEXITCODE) { throw 'exporting enrollment bundle failed' }
     # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never
     # calls /enroll — but only because its steady-state identity is preplaced too. A preplaced
@@ -354,8 +321,8 @@ try {
     # first boot unless agent.crt/agent.key already exist in the state dir, and that mint reads the
     # config's identity paths for real. Seed them with this fixture node's named client leaf,
     # exactly as an offline installer would; the repository verifies it against the same CA.
-    Copy-Item (Join-Path $certs 'client.crt') (Join-Path $launcherState 'agent.crt')
-    Copy-Item (Join-Path $certs 'client.key') (Join-Path $launcherState 'agent.key')
+    Copy-Item (Join-Path $certs 'client.crt') (Join-Path $agentState 'agent.crt')
+    Copy-Item (Join-Path $certs 'client.key') (Join-Path $agentState 'agent.key')
     # The node identity is presented only to the routing capability origin. Release bytes are
     # downloaded through the anonymous object client, which trusts the same local CA.
     $configText = @"
@@ -366,13 +333,11 @@ ca = '$(Join-Path $certs 'ca.crt')'
 "@
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
 
-    $wrapper = Join-Path $bin 'selfupdate-service.exe'
-    $launcher = Join-Path $bin 'updated-launcher.exe'
+    $wrapper = Join-Path $bin 'updated-agent-service.exe'
     $installerVariables = @{
         UPDATED_WINDOWS_SERVICE = $service
         UPDATED_WINDOWS_WRAPPER = $wrapper
-        UPDATED_WINDOWS_LAUNCHER = $launcher
-        UPDATED_WINDOWS_STATE_DIR = $launcherState
+        UPDATED_WINDOWS_STATE_DIR = $agentState
         UPDATED_WINDOWS_CONFIG = $config
         UPDATED_WINDOWS_AGENT = $initialAgent
         UPDATED_WINDOWS_START = 'demand'
@@ -393,41 +358,35 @@ ca = '$(Join-Path $certs 'ca.crt')'
     Wait-ServiceState 'Running'
 
     # The agent converged the release the only way it can: through the release's own hooks. The
-    # first boot's apply carries `install`. The authoritative completion barrier is installed.json:
-    # it cannot become confirmed until the boot health gate has passed and the state transition has
+    # first boot's converge carries `install`. The authoritative completion barrier is installed.json:
+    # it cannot become proven until the boot health gate has passed and the state transition has
     # committed. Do not maintain a second, receipt-derived definition of "healthy installation".
     $installed = Wait-ConfirmedInstall '1.0.0'
     # The installed record is the authoritative completion barrier. Keep the receipt assertion as
     # proof of the path taken, but check it only after completion so its narrower diagnostic cannot
     # hide the service/process/state evidence emitted by Wait-ConfirmedInstall on a failed boot.
-    $null = Wait-Operation 'apply' 'install' 0 1
+    $null = Wait-Operation 'converge' 'install' 0 1
 
-    $desired = Read-DesiredAgent
-    if (-not $desired.Equals([IO.Path]::GetFullPath($initialAgent), [StringComparison]::OrdinalIgnoreCase)) {
-        throw "the launcher pointer does not name the initial agent: $desired"
-    }
     $active = Get-Content (Join-Path $install 'active-release') -Raw | ConvertFrom-Json
     if ($active.version -ne $installed.release.version -or $active.manifest_sha256 -ne $installed.release.manifest_sha256) {
         throw 'active-release does not name the committed bundle'
     }
 
-    # A clean stop must end the tree the service owns — wrapper, launcher and agent — with no
+    # A clean stop must end the tree the service owns — wrapper and agent — with no
     # external reaper. Nothing else is in that tree: the agent holds no workload process.
-    $tree = Get-TreeProcessIds
-    if (-not $tree) { throw 'the running service exposed no launcher/agent processes to stop' }
+    $tree = @(Get-ServiceProcessTree | ForEach-Object { $_.ProcessId })
+    if (-not $tree) { throw 'the running service exposed no agent processes to stop' }
     & sc.exe stop $service | Out-Null
     Wait-ServiceState 'Stopped'
     Wait-ProcessExit $tree
 
     # A fresh launch re-converges the committed bundle through the same reconciler, this time as a
-    # restart, and never moves the agent pointer.
+    # restart.
     $before = @(Read-Operations).Count
     & sc.exe start $service | Out-Null
     Wait-ServiceState 'Running'
-    $restart = Wait-Operation 'apply' 'restart' $before
-    if ((Read-DesiredAgent) -ne $desired) { throw 'the SCM restart changed the agent pointer' }
-
-    Write-Host "SUCCESS: SCM stop ended the launcher+agent tree cleanly and a fresh start re-converged committed bundle 1.0.0 through its own reconciler" -ForegroundColor Green
+    $restart = Wait-Operation 'converge' 'restart' $before
+    Write-Host "SUCCESS: SCM stop ended the agent tree cleanly and a fresh start re-converged committed bundle 1.0.0 through its own reconciler" -ForegroundColor Green
 }
 finally {
     if (Get-Service -Name $service -ErrorAction SilentlyContinue) {
@@ -435,17 +394,18 @@ finally {
         try { Wait-ServiceState 'Stopped' 10 } catch { }
     }
     & sc.exe delete $service 2>$null | Out-Null
-    # The service host appends the launcher's and agent's output here. Always surface a bounded
+    # The service host appends the agent's output here. Always surface a bounded
     # tail so both CI and an operator can see the fatal boundary without flooding the job log.
-    foreach ($name in @('launcher.previous.log', 'launcher.log')) {
-        $launcherLog = Join-Path $launcherState $name
-        if (Test-Path -LiteralPath $launcherLog) {
-            Write-Host "--- $name (last 200 launcher + agent lines) ---"
-            Get-Content -LiteralPath $launcherLog -Tail 200 |
+    foreach ($name in @('agent.previous.log', 'agent.log')) {
+        $agentLog = Join-Path $agentState $name
+        if (Test-Path -LiteralPath $agentLog) {
+            Write-Host "--- $name (last 200 agent lines) ---"
+            Get-Content -LiteralPath $agentLog -Tail 200 |
                 ForEach-Object { Write-Host $_ }
             Write-Host "--- end $name ---"
         }
     }
     if ($gatewayProcess) { Stop-Process -Id $gatewayProcess.Id -Force -ErrorAction SilentlyContinue }
     if ($objectProcess) { Stop-Process -Id $objectProcess.Id -Force -ErrorAction SilentlyContinue }
+    Wait-ServiceDeleted
 }

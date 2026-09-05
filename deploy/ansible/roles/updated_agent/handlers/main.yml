@@ -3,7 +3,7 @@
   ansible.builtin.systemd_service:
     daemon_reload: true
 
-# Restarting the launcher never disturbs a workload: workload processes belong to each release's
+# Restarting the agent never disturbs a host-managed workload: workload processes belong to each release's
 # own reconciler hooks and their own units, never to this one. Skipped when the play deliberately
 # staged the fleet without starting it.
 - name: Restart the updated agent

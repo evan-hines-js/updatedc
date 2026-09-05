@@ -17,12 +17,12 @@ use crate::*;
 ///     caller's local verification deliberately runs *in front of*.
 ///  2. Failing that — an unreachable control plane, an assignment with nothing installable — fall
 ///     back to the predecessor the committed record already holds for exactly this purpose
-///     (`pending.previous_release`, which [`garbage_collect`] keeps on disk). This needs no
+///     (`rollback_guard.previous_release`, which [`garbage_collect`] keeps on disk). This needs no
 ///     network at all. Its bytes are verified first, so a second corrupt tree is not converged onto
 ///     either, and then the revert is *journaled* rather than performed: boot recovery is the one
-///     rollback implementation, and it is what moves the pointer, runs the predecessor's `apply`,
-///     gates it, and replays the candidate's compensating `rollback`. The update loop converges the
-///     node forward again from there.
+///     rollback implementation: it compensates the failed candidate first, then moves the pointer,
+///     converges and gates the predecessor. The update loop converges the node forward again from
+///     there.
 ///
 /// The corrupt archive is never *rejected*: a rejection is durable and never expires, and damage to
 /// this disk is evidence about this node, not about the release — rejecting it would permanently
@@ -50,7 +50,7 @@ pub(crate) async fn repair_committed_bundle(
     let Installed::Present(installed) = store.installed()? else {
         return Err(assignment_error);
     };
-    let Some(pending) = &installed.pending else {
+    let Some(pending) = &installed.rollback_guard else {
         return Err(assignment_error);
     };
     warn(&format!(
@@ -80,13 +80,16 @@ pub(crate) async fn repair_committed_bundle(
 /// Record the revert the committed record already owes, in the one shape every other revert
 /// produces, so a revert decided here and driven by boot recovery cannot describe two different
 /// things. The candidate is not rejected: the same reasoning that forbids rejecting the corrupt
-/// archive applies to the release whose tree this disk damaged.
+/// archive converges to the release whose tree this disk damaged.
 pub(crate) fn journal_predecessor_fallback(
     store: &mut Store,
     installed: &updated::state::InstalledState,
-    pending: &Pending,
+    rollback_guard: &RollbackGuard,
 ) -> io::Result<()> {
-    persist_transaction(store, &rollback_of_unconfirmed(installed, pending, false))
+    persist_transaction(
+        store,
+        &rollback_of_guarded(installed, rollback_guard, false),
+    )
 }
 
 /// Re-acquire and re-commit the exact application already named by durable state. Repair shares
@@ -122,12 +125,11 @@ pub(crate) async fn repair_from_assignment(
         paths: &opts.paths,
         stance,
     };
-    let selected =
-        crate::acquire::select_assigned_application(&request, |application, provider| {
-            store.rejects_selection(&installed.repository_lineage, application, provider)
-        })
-        .map_err(|error| format!("preparing the signed repair: {error}"))?
-        .ok_or("the signed assignment contains no installable application")?;
+    let selected = crate::acquire::select_assigned_application(&request, |application| {
+        store.is_rejected(&installed.repository_lineage, application)
+    })
+    .map_err(|error| format!("preparing the signed repair: {error}"))?
+    .ok_or("the signed assignment contains no installable application")?;
     let prepared = crate::acquire::prepare_assigned_application(&request, selected)
         .await
         .map_err(|error| format!("preparing the signed repair: {error}"))?;

@@ -5,9 +5,7 @@ members = [
     "crates/updated",
     "crates/updated-contracts",
     "crates/updated-tuf",
-    "crates/control",
     "crates/server",
-    "crates/launcher",
     "crates/agent",
     "crates/sampleapp",
     "crates/e2e",
@@ -83,6 +81,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 x509-parser = "0.16"
 windows-sys = { version = "0.59", features = [
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     # CreateJobObjectW (e2e harness) takes a SECURITY_ATTRIBUTES pointer, so its
     # signature — hence the whole function — lives behind Win32_Security.
@@ -93,7 +92,7 @@ windows-sys = { version = "0.59", features = [
     # CreateFileW: the durable writer creates its temp WITH that DACL, never widened-then-
     # narrowed, so no other user can be holding a handle when the secret is written.
     "Win32_Storage_FileSystem",
-    # SetConsoleCtrlHandler: the launcher's stop-signal handling.
+    # SetConsoleCtrlHandler: the Windows service adapter's stop-signal handling.
     "Win32_System_Console",
     # A CREATE_SUSPENDED child is resumed only after job assignment; ToolHelp recovers the
     # primary thread handle that std::process::Child deliberately does not expose.

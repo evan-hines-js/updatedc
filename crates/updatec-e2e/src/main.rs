@@ -86,6 +86,7 @@ async fn run_e2e() -> Result<(), Box<dyn std::error::Error>> {
     // its set's Service.
     let fleet = Fleet::connect().await?;
     let layout = prepare_fleet().await?;
+    assert_jenkins_installed(&fleet).await?;
     fleet
         .wait_for_convergence(BASELINE_VERSION, FLEET_ROLLOUT_TIMEOUT_SECS)
         .await?;

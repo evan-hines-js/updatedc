@@ -50,7 +50,6 @@ fn small_runtime(
             health_interval_seconds: 1,
             refresh_retry_seconds: 5,
             confirmation_window_seconds: 5,
-            agent_check_interval_seconds: 5,
         },
         ..nominal
     }
@@ -92,10 +91,6 @@ async fn preplaced_enrollment_resolves_offline_through_the_live_repository() {
             sha256: "a".repeat(64),
         },
         cold_install_fallback: false,
-        provider_set: updated_contracts::artifact::TargetReference {
-            path: "provider-sets/default.json".into(),
-            sha256: "b".repeat(64),
-        },
         release_root: root.clone(),
         runtime,
     };
@@ -201,10 +196,6 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
                 sha256: "a".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: updated_contracts::artifact::TargetReference {
-                path: "provider-sets/default.json".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: root.clone(),
             runtime: small_runtime("app", install.to_path_buf()),
         }
@@ -565,7 +556,7 @@ async fn publish_then_verify_and_download() {
     assert_eq!(current[0].path, "assignments/agents/current.json");
 }
 
-/// A download killed mid-stream — SIGKILL from the launcher, a reboot, power loss — leaves its
+/// A download killed mid-stream — SIGKILL from the service manager, a reboot, power loss — leaves its
 /// full-size staging temp behind, and nothing outside this crate reclaims it: the staging roots
 /// hold fixed destination files rather than per-attempt directories, so the bundle sweep and the
 /// directory pruner never see them. Without the sweep here a crash-looping node accumulates one

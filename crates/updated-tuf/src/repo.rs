@@ -295,6 +295,18 @@ pub struct PublishTarget {
 }
 
 impl PublishTarget {
+    /// The canonical logical name used by publication and consumers referring to its target.
+    pub fn application_name(
+        product: &str,
+        channel: &str,
+        version: &str,
+        os: &str,
+        arch: &str,
+        component: &str,
+    ) -> String {
+        format!("products/{product}/{channel}/{version}/{os}-{arch}/{component}")
+    }
+
     /// Build a target using the standard path convention
     /// `products/<product>/<channel>/<version>/<os>-<arch>/<component>` and the
     /// matching signed custom metadata.
@@ -307,7 +319,7 @@ impl PublishTarget {
         component: &str,
         source: PathBuf,
     ) -> Self {
-        let name = format!("products/{product}/{channel}/{version}/{os}-{arch}/{component}");
+        let name = Self::application_name(product, channel, version, os, arch, component);
         let mut custom = HashMap::new();
         custom.insert("product".into(), product.into());
         custom.insert("channel".into(), channel.into());
@@ -320,20 +332,6 @@ impl PublishTarget {
             source,
             custom,
         }
-    }
-
-    /// Bind the provider set this application version was published with into the target's
-    /// signed custom metadata. When a cold-install-fallback descent selects this older app
-    /// version, it re-selects exactly these providers — so the app and its providers roll
-    /// back as one signed unit, never pairing an old app with the head's newer providers.
-    /// The assignment's own `provider_set` still governs the assigned *head*, so providers
-    /// remain independently revisable there without republishing the app.
-    pub fn with_provider_set(mut self, path: &str, sha256: &str) -> Self {
-        self.custom.insert(
-            "provider_set".into(),
-            serde_json::json!({ "path": path, "sha256": sha256 }),
-        );
-        self
     }
 }
 
@@ -1138,38 +1136,6 @@ pub async fn target_sha256_if_present(repo_dir: &Path, name: &str) -> Result<Opt
         .map(|target| hex::encode(&target.hashes.sha256)))
 }
 
-/// Resolve a provider set's reconciler artifact against the signed metadata a publisher already
-/// holds, before the set itself is signed.
-///
-/// `ProviderSet::validate` is syntactic: a stale copy-paste that pairs one artifact's path with a
-/// previous build's digest passes every check it makes and is signed into an immutable target. It
-/// then fails once, much later and fleet-wide, when `stage_providers` calls `exact_target` on a
-/// node — a cold install walks cold-install fallback down past the version, and an update returns
-/// `Unchanged`, so the group stalls with nothing to correct in place. The repository in hand is
-/// the same signed targets metadata every agent verifies against, so resolving it here turns that
-/// into a publish-time refusal with nothing signed.
-///
-/// One definition for every publisher (`updatectl publish-provider-set` over S3, the dev server's
-/// local repository): a front end that skipped the check would sign exactly the immutable target
-/// the other one refuses.
-pub async fn verify_provider_set_reconciler(
-    repo_dir: &Path,
-    set: &updated_contracts::artifact::ProviderSet,
-) -> Result<()> {
-    let reference = &set.reconciler.artifact;
-    verify_target_reference(
-        repo_dir,
-        &reference.path,
-        &reference.sha256,
-        "--provider-path",
-        "--provider-sha256",
-        "reconciler builds",
-        "Publish the reconciler with `publish-provider-artifact` against this same repository \
-         first, and pass the path and digest it prints. Nothing was signed.",
-    )
-    .await
-}
-
 /// Resolve one signed target reference — a `path` + `sha256` flag pair — against this
 /// repository's checked-out signed metadata, refusing at publish time what a node could only
 /// discover mid-rollout: a reference every syntactic check accepts but that resolves to nothing,
@@ -1382,7 +1348,6 @@ fn next_version(current: NonZeroU64, role: &str) -> Result<NonZeroU64> {
 fn validate_target_name(name: &str) -> Result<()> {
     let parts: Vec<_> = name.split('/').collect();
     let known_layout = (parts.len() == 6 && parts[0] == "products")
-        || (parts.len() == 2 && parts[0] == "provider-sets" && parts[1].ends_with(".json"))
         || (parts.len() == 3
             && parts[0] == "assignments"
             && matches!(parts[1], "agents" | "configs")
@@ -1501,7 +1466,7 @@ mod tests {
         assert!(validate_target_name("products/app/stable/1.0.0/linux-x86_64/app").is_ok());
         assert!(validate_target_name("assignments/agents/agent-123.json").is_ok());
         assert!(validate_target_name("assignments/node-123.json").is_err());
-        assert!(validate_target_name("provider-sets/web.json").is_ok());
+        assert!(validate_target_name("provider-sets/web.json").is_err());
         assert!(validate_target_name("assignments/group/node.json").is_err());
         assert!(validate_target_name("products/../../outside/stable/1.0/app").is_err());
         assert!(validate_target_name("products/app/stable/1.0/linux/app/extra").is_err());

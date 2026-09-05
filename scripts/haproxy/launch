@@ -4,13 +4,13 @@ set -euo pipefail
 # Start entrypoint (bin/launch) for an HAProxy node.
 #
 # The agent starts no workload process, so the signed
-# lifecycle provider runs this launcher whenever no master of ours is running (the first deployment
+# reconciler runs this launcher whenever no master of ours is running (the first deployment
 # on a node, or one whose master is gone). Every later upgrade is the provider making THIS master
 # re-exec in place (SIGUSR2), so this script runs once per master, not once per release.
 #
 # It leaves a detached master-worker behind under the stable pid file — detached because the
 # provider invocation that starts it must return, and the master must outlive it. Projection is
-# deliberately not duplicated here: the lifecycle provider stages both first start and reload
+# deliberately not duplicated here: the reconciler stages both first start and reload
 # through its single `stage_runtime` implementation before invoking this launcher.
 
 runtime="${UPDATED_INSTALL_ROOT:?UPDATED_INSTALL_ROOT is required}/runtime"

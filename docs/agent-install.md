@@ -1,21 +1,15 @@
 # Installing agents on nodes
 
-An `updated` node is bootstrapped **once** and then keeps itself current. That split is the whole
-design, and it is the thing to get straight before choosing an install method:
+An `updated` node is installed and upgraded through the platform's normal software lifecycle:
 
 ```
-installer / .deb / .rpm / Ansible  ──>  launcher + pinned TUF root + first agent
-                                              │
-signed TUF channel                 ──>  every later agent, and every workload
+installer / .deb / .rpm / Ansible  ──>  agent runtime + service definition
+signed TUF channel                 ──>  workload releases and desired configuration
 ```
 
-The launcher is installer-owned and deliberately never updates itself — it is the anchor the
-self-update machinery is measured against. Everything above it arrives through the fleet's own
-signed channel, verified against the pinned root.
-
-**The package is not the upgrade path.** Do not wire `updated-agent` into unattended-upgrades or a
-`yum update` cron expecting it to move agent versions: two updaters racing for the same binary is
-precisely the failure this system exists to prevent. Upgrade the package only to move the launcher.
+The service manager runs `updated-agent` directly and restarts it after any exit. Upgrade the agent
+with the package manager, an image rollout, or the same configuration-management system that owns
+other host software. The agent does not publish, stage, or replace its own executable.
 
 ## Choosing a method
 
@@ -26,12 +20,34 @@ precisely the failure this system exists to prevent. Upgrade the package only to
 | Ansible | Fleets. Wraps the package and adds per-host identity and config. |
 | DaemonSet | Not provided — see [Kubernetes nodes](#kubernetes-nodes). |
 
-Every method installs the same two binaries from the same attested release, and registers the same
+Every method installs the same agent binary from the same attested release, and registers the same
 service definition (`deploy/systemd/updated-agent.service`). There is one unit, not four. An
 attestation is a security property only when it is verified: network installs require an immutable
 `build-<commit>` tag and bind provenance to that commit and this repository's CI workflow.
 
 ## Packages
+
+### FIPS builds
+
+FIPS is selected when building the agent, not by preparing or changing a laptop's operating system:
+
+```sh
+cargo build --release -p agent --features fips
+target/release/updated-agent stage-runtime dist/agent
+```
+
+Distribute every file in the staged directory together. On macOS and Windows, this includes the
+exact shared AWS-LC FIPS module linked by the build. No separately installed FIPS program, SDK,
+package manager, or library search environment is required on the destination. The standard release
+packaging includes these companions, and the macOS installer places them before launching the
+agent. Linux's normal FIPS build links the module statically.
+
+The agent also embeds its companion module bytes so pinning a helper preserves the same runtime
+through an agent upgrade. Customer commands still receive the normal scrubbed environment. Building
+with FIPS support does not change the whole machine into a FIPS mode; applicable validation depends
+on the cryptographic module and its operating environment.
+
+### Installing a package
 
 ```sh
 repo=evan-hines-js/updatedc
@@ -60,10 +76,9 @@ teaches operators to ignore it. Finish the bootstrap:
 2. Place `tls.crt`, `tls.key`, and `ca.crt` in `/etc/updated/agent-tls/` (mode 0600, owned by root).
 3. `systemctl enable --now updated-agent`
 
-Tune the service through `/etc/updated/agent.env`, never by forking the unit. The value worth
-revisiting is `UPDATED_READY_TIMEOUT`: how long a replacement agent has to prove itself ready
-before the launcher retains the previous pointer. Widen it for a fleet whose first cold install
-pulls a large bundle over a slow link.
+Tune the service through `/etc/updated/agent.env`, never by forking the unit. `UPDATED_STATE_DIR`
+selects the persistent state directory and `UPDATED_CONFIG` selects the canonical configuration
+file used by the unit.
 
 ## install.sh
 
@@ -215,7 +230,7 @@ input, output, report, and renewal paths as an online-enrolled node; only initia
 
 The bundle is not a Kubernetes Secret. Wait for
 `UpdateAgent.status.enrollmentObjectKey`, read that repository-relative object from the private S3
-prefix with operator credentials, and place its exact bytes at `enrollment.json` in launcher state.
+prefix with operator credentials, and place its exact bytes at `enrollment.json` in agent state.
 The key is content-addressed and bound to the current signed repository generation, node identity,
 and assignment path. The per-node certificate and private key remain a separate offline-PKI input;
 the bundle contains neither, and S3 never holds the private key.
@@ -234,14 +249,15 @@ back in-cluster Services.
 
 ## Windows
 
-`updated-windows-x86_64.zip` carries `install-updated-agent.bat` beside the three binaries, on the
+`updated-windows-x86_64.zip` carries `install-updated-agent.bat` beside the agent and SCM service
+adapter, on the
 same rule as the Linux unit and the macOS plist: the release ships the service definition, so
 registering the service never needs a checkout of this repository.
 
 Unpack the archive into `C:\Program Files\updated`, place the pinned signed enrollment bundle and
 `config.toml` beside the binaries, then run `install-updated-agent.bat` from an elevated prompt. It
 registers the SCM service and its restart policy as LocalSystem. Configuration management is
-machine-wide, and signed provider artifacts are the authorization boundary for those privileges.
+machine-wide, and signed packages are the authorization boundary for those privileges.
 
 ## Verifying a node
 
@@ -252,5 +268,5 @@ kubectl -n updated-system get updateagent web-01 -o yaml
 ```
 
 An enrolled node shows a pinned public key and an `Enrolled` state on its `UpdateAgent`. Enrollment
-happens once — after `enrollment.json` exists in launcher state it is never retried, so editing
+happens once — after `enrollment.json` exists in agent state it is never retried, so editing
 `config.toml` afterwards does not re-enroll an established node.

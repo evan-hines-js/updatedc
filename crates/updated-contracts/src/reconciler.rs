@@ -1,8 +1,8 @@
 //! The node reconciler protocol vocabulary.
 //!
-//! Every release carries one signed node reconciler, invoked as ordinary argv
-//! (the published contract a third-party author writes against is
-//! `docs/node-reconciler-protocol.md`).
+//! A signed package binds the customer's entrypoint and opaque payload. The agent's native runtime
+//! implements this internal execution protocol around that entrypoint; package authors use the
+//! ordinary command interface documented in `docs/command-adapter.md`.
 //! The protocol has exactly four operations and four reserved
 //! attempt identities, and this module is their single definition: the agent that
 //! *invokes* a reconciler, and every reconciler implementation in this workspace that
@@ -18,10 +18,11 @@ use serde::{Deserialize, Serialize};
 
 /// The reconciler protocol implemented by this build.
 ///
-/// Version one includes a dedicated, agent-owned result channel. State-changing operations must
+/// Version two gives every invocation one payload subject and includes a dedicated, agent-owned
+/// result channel. State-changing operations must
 /// describe their outcome there; process exit status remains reserved for a reconciler that could
 /// not produce a valid answer at all.
-pub const PROTOCOL: &str = "1";
+pub const PROTOCOL: &str = "2";
 
 /// Maximum encoded size of one reconciler result.
 pub const MAX_RESULT_BYTES: usize = 16 * 1024;
@@ -168,14 +169,15 @@ impl RetryRequest {
     }
 }
 
-/// The only two meanings a valid mutation result can have.
+/// A completed mutation, a bounded retry, or a durable request for an operator decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutationResolution {
     Succeeded(SuccessfulMutation),
     Retry(RetryRequest),
+    NeedsAttention(String),
 }
 
-/// The semantic result document produced by `apply` or `rollback`.
+/// The semantic result document produced by `converge` or `rollback`.
 ///
 /// The wire shape is a tagged union rather than a bag of optional fields: a successful answer has a
 /// host action and no retry delay; a retry has a delay and no host action or `changed` claim. Those
@@ -192,6 +194,10 @@ pub struct ResultDocument(MutationResolution);
     deny_unknown_fields
 )]
 enum ResultDocumentWire {
+    NeedsAttention {
+        schema: u32,
+        message: String,
+    },
     Succeeded {
         schema: u32,
         changed: bool,
@@ -211,6 +217,10 @@ impl Serialize for ResultDocument {
         S: serde::Serializer,
     {
         match &self.0 {
+            MutationResolution::NeedsAttention(message) => ResultDocumentWire::NeedsAttention {
+                schema: Self::SCHEMA,
+                message: message.clone(),
+            },
             MutationResolution::Succeeded(result) => ResultDocumentWire::Succeeded {
                 schema: Self::SCHEMA,
                 changed: result.changed(),
@@ -247,6 +257,13 @@ fn validate_message(message: Option<&str>) -> Result<(), String> {
 }
 
 impl ResultDocument {
+    pub fn needs_attention(message: String) -> Result<Self, String> {
+        validate_message(Some(&message))?;
+        if message.is_empty() {
+            return Err("attention requires an explanation".into());
+        }
+        Ok(Self(MutationResolution::NeedsAttention(message)))
+    }
     pub const SCHEMA: u32 = 1;
     pub const MIN_RETRY_AFTER_SECONDS: u64 = 1;
     pub const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
@@ -273,6 +290,10 @@ impl ResultDocument {
 
     fn from_wire(wire: ResultDocumentWire) -> Result<Self, String> {
         match wire {
+            ResultDocumentWire::NeedsAttention { schema, message } => {
+                Self::validate_schema(schema)?;
+                Self::needs_attention(message)
+            }
             ResultDocumentWire::Succeeded {
                 schema,
                 changed,
@@ -312,12 +333,12 @@ impl ResultDocument {
 /// The four public reconciler operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Operation {
-    /// Idempotently converge machine state to the candidate.
-    Apply,
+    /// Idempotently converge machine state to the supplied payload.
+    Converge,
     /// Make one bounded readiness observation. This — and only this — is the readiness gate:
     /// exit zero means healthy.
     Healthcheck,
-    /// Idempotently restore or compensate toward the predecessor.
+    /// Idempotently compensate effects produced for the supplied failed payload.
     Rollback,
     /// Make one bounded steady-state observation for fingerprinting.
     Inspect,
@@ -327,14 +348,14 @@ pub enum Operation {
 /// result and durable audit record from accidentally invoking an observation operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationOperation {
-    Apply,
+    Converge,
     Rollback,
 }
 
 impl MutationOperation {
     pub const fn operation(self) -> Operation {
         match self {
-            Self::Apply => Operation::Apply,
+            Self::Converge => Operation::Converge,
             Self::Rollback => Operation::Rollback,
         }
     }
@@ -347,9 +368,9 @@ impl MutationOperation {
     /// when durable evidence is decoded.
     pub fn validate_invocation(self, reason: Reason, id: &str) -> Result<(), String> {
         let accepted = match (self, reason) {
-            (Self::Apply, Reason::Install) => id == attempt::BOOT,
-            (Self::Apply, Reason::Restart) => matches!(id, attempt::BOOT | attempt::CONVERGE),
-            (Self::Apply, Reason::Update) => attempt::is_transaction_invocation(id),
+            (Self::Converge, Reason::Install) => id == attempt::BOOT,
+            (Self::Converge, Reason::Restart) => matches!(id, attempt::BOOT | attempt::CONVERGE),
+            (Self::Converge, Reason::Update) => attempt::is_transaction_invocation(id),
             (Self::Rollback, Reason::Update) => attempt::is_compensation(id),
             (Self::Rollback, Reason::Install | Reason::Restart) => false,
         };
@@ -401,7 +422,7 @@ impl ObservationOperation {
 
 impl Operation {
     pub const ALL: [Self; 4] = [
-        Self::Apply,
+        Self::Converge,
         Self::Healthcheck,
         Self::Rollback,
         Self::Inspect,
@@ -410,7 +431,7 @@ impl Operation {
     /// The wire spelling passed as the reconciler's first argument.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Apply => "apply",
+            Self::Converge => "converge",
             Self::Healthcheck => "healthcheck",
             Self::Rollback => "rollback",
             Self::Inspect => "inspect",
@@ -421,14 +442,14 @@ impl Operation {
     ///
     /// Observations receive a fresh output directory too, but must never replace the durable
     /// output snapshot. Otherwise an ordinary healthcheck would erase the files emitted by the
-    /// preceding apply and spuriously cascade empty dependency inputs through the fleet.
+    /// preceding converge and spuriously cascade empty dependency inputs through the fleet.
     pub const fn publishes_outputs(self) -> bool {
         self.mutation().is_some()
     }
 
     pub const fn mutation(self) -> Option<MutationOperation> {
         match self {
-            Self::Apply => Some(MutationOperation::Apply),
+            Self::Converge => Some(MutationOperation::Converge),
             Self::Rollback => Some(MutationOperation::Rollback),
             Self::Healthcheck | Self::Inspect => None,
         }
@@ -438,7 +459,7 @@ impl Operation {
         match self {
             Self::Healthcheck => Some(ObservationOperation::Healthcheck),
             Self::Inspect => Some(ObservationOperation::Inspect),
-            Self::Apply | Self::Rollback => None,
+            Self::Converge | Self::Rollback => None,
         }
     }
 
@@ -671,62 +692,47 @@ impl ReconciledRelease {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconcilerIdentity(ReconcilerIdentityWire);
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReconcilerIdentityWire {
-    provider_set_sha256: String,
+    definition_sha256: String,
     product: String,
-    release: ReconciledRelease,
+    api: u32,
 }
 
 impl Serialize for ReconcilerIdentity {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
 }
-
 impl<'de> Deserialize<'de> for ReconcilerIdentity {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = ReconcilerIdentityWire::deserialize(deserializer)?;
-        Self::new(wire.provider_set_sha256, wire.product, wire.release)
-            .map_err(serde::de::Error::custom)
+        Self::new(wire.definition_sha256, wire.product, wire.api).map_err(serde::de::Error::custom)
     }
 }
-
 impl ReconcilerIdentity {
-    pub fn new(
-        provider_set_sha256: String,
-        product: String,
-        release: ReconciledRelease,
-    ) -> Result<Self, String> {
-        if !crate::is_canonical_sha256(&provider_set_sha256)
+    pub fn new(definition_sha256: String, product: String, api: u32) -> Result<Self, String> {
+        if !crate::is_canonical_sha256(&definition_sha256)
             || !crate::identity::is_segment(&product)
+            || api == 0
         {
-            return Err("invalid reconciler identity".into());
+            return Err("invalid package execution identity".into());
         }
         Ok(Self(ReconcilerIdentityWire {
-            provider_set_sha256,
+            definition_sha256,
             product,
-            release,
+            api,
         }))
     }
-
-    pub fn provider_set_sha256(&self) -> &str {
-        &self.0.provider_set_sha256
+    pub fn definition_sha256(&self) -> &str {
+        &self.0.definition_sha256
     }
-
     pub fn product(&self) -> &str {
         &self.0.product
     }
-
-    pub const fn release(&self) -> &ReconciledRelease {
-        &self.0.release
+    pub fn api(&self) -> u32 {
+        self.0.api
     }
 }
 
@@ -888,13 +894,11 @@ pub const FLAGS: &[&str] = &[
     "--reason",
     "--install-root",
     "--state-dir",
-    "--candidate",
-    "--candidate-version",
+    "--payload-root",
+    "--payload-version",
     "--output-dir",
     "--result-file",
     "--input-dir",
-    "--predecessor",
-    "--predecessor-version",
 ];
 
 /// One invocation's values, named. [`Arguments::argv`] is the only place a value is bound to a
@@ -912,20 +916,17 @@ pub struct Arguments<'a> {
     pub reason: Reason,
     pub install_root: &'a OsStr,
     pub state_dir: &'a OsStr,
-    /// The release to converge ONTO, in both directions: on a rollback this is the predecessor
-    /// being restored and `predecessor` is the failed candidate.
-    pub candidate: &'a OsStr,
-    pub candidate_version: &'a OsStr,
+    /// The one immutable payload this reconciler invocation acts on.
+    pub payload_root: &'a OsStr,
+    pub payload_version: &'a OsStr,
     /// Empty directory owned by this invocation. A successful operation publishes exactly the
     /// bounded regular files the reconciler leaves here.
     pub output_dir: &'a OsStr,
-    /// Fresh agent-owned path where `apply` and `rollback` must atomically publish one
+    /// Fresh agent-owned path where `converge` and `rollback` must atomically publish one
     /// [`ResultDocument`]. Observation operations must leave it absent.
     pub result_file: &'a OsStr,
     /// Immutable directory containing exactly the named files selected by the signed assignment.
     pub input_dir: &'a OsStr,
-    pub predecessor: &'a OsStr,
-    pub predecessor_version: &'a OsStr,
 }
 
 impl<'a> Arguments<'a> {
@@ -941,13 +942,11 @@ impl<'a> Arguments<'a> {
             ("--reason", OsStr::new(self.reason.as_str())),
             ("--install-root", self.install_root),
             ("--state-dir", self.state_dir),
-            ("--candidate", self.candidate),
-            ("--candidate-version", self.candidate_version),
+            ("--payload-root", self.payload_root),
+            ("--payload-version", self.payload_version),
             ("--output-dir", self.output_dir),
             ("--result-file", self.result_file),
             ("--input-dir", self.input_dir),
-            ("--predecessor", self.predecessor),
-            ("--predecessor-version", self.predecessor_version),
         ]
     }
 }
@@ -979,13 +978,13 @@ pub mod attempt {
 
     /// Whether `id` names either direction of one deployment transaction. Every transactional
     /// operation and observation uses this predicate, so the forward/compensating grammar cannot
-    /// drift between `apply`, `healthcheck`, and durable audit evidence.
+    /// drift between `converge`, `healthcheck`, and durable audit evidence.
     pub fn is_transaction_invocation(id: &str) -> bool {
         crate::is_canonical_sha256(id) || is_compensation(id)
     }
 
     /// Whether `id` is the derived compensating direction of one transaction. A `rollback`
-    /// mutation accepts only this form; the predecessor's compensating `apply` uses it too.
+    /// mutation accepts only this form.
     pub fn is_compensation(id: &str) -> bool {
         id.strip_suffix('r').is_some_and(crate::is_canonical_sha256)
     }
@@ -1001,7 +1000,7 @@ mod tests {
     #[test]
     fn the_four_operations_round_trip_their_published_spellings() {
         for (operation, spelling) in [
-            (Operation::Apply, "apply"),
+            (Operation::Converge, "converge"),
             (Operation::Healthcheck, "healthcheck"),
             (Operation::Rollback, "rollback"),
             (Operation::Inspect, "inspect"),
@@ -1051,7 +1050,7 @@ mod tests {
 
     #[test]
     fn only_state_changing_operations_publish_output_files() {
-        assert!(Operation::Apply.publishes_outputs());
+        assert!(Operation::Converge.publishes_outputs());
         assert!(Operation::Rollback.publishes_outputs());
         assert!(!Operation::Healthcheck.publishes_outputs());
         assert!(!Operation::Inspect.publishes_outputs());
@@ -1088,6 +1087,18 @@ mod tests {
         let succeeded_json = serde_json::to_value(&succeeded).unwrap();
         assert!(succeeded_json.get("retryAfterSeconds").is_none());
 
+        let attention =
+            ResultDocument::needs_attention("verify migration completion".into()).unwrap();
+        assert_eq!(
+            ResultDocument::from_bounded_json(&attention.to_bounded_json().unwrap()).unwrap(),
+            attention
+        );
+        assert!(ResultDocument::needs_attention(String::new()).is_err());
+        assert!(ResultDocument::needs_attention("bad\nmessage".into()).is_err());
+        assert!(ResultDocument::from_bounded_json(
+            br#"{"schema":1,"status":"needs-attention","message":"verify","changed":true}"#
+        )
+        .is_err());
         let retry = ResultDocument::retry(30, Some("package manager is locked".into())).unwrap();
         let retry_json = serde_json::to_value(&retry).unwrap();
         assert!(retry_json.get("changed").is_none());
@@ -1168,17 +1179,12 @@ mod tests {
             ReconciledRelease::new("2.0.0".into(), "a".repeat(64), "c".repeat(64)).unwrap(),
             ReconciledRelease::new("1.0.0".into(), "b".repeat(64), "d".repeat(64)).unwrap(),
         );
-        let reconciler = ReconcilerIdentity::new(
-            "e".repeat(64),
-            "system".into(),
-            ReconciledRelease::new("3.0.0".into(), "f".repeat(64), "0".repeat(64)).unwrap(),
-        )
-        .unwrap();
+        let reconciler = ReconcilerIdentity::new("e".repeat(64), "system".into(), 1).unwrap();
         let result =
             SuccessfulMutation::new(true, HostAction::Reboot, Some("kernel changed".into()))
                 .unwrap();
         let record = LastReconciliation::new(
-            MutationOperation::Apply,
+            MutationOperation::Converge,
             Reason::Update,
             "a".repeat(64),
             transition.clone(),
@@ -1205,7 +1211,7 @@ mod tests {
             |value| value["completedAtMs"] = serde_json::json!(0),
             |value| value["candidate"]["archiveSha256"] = serde_json::json!("not-a-digest"),
             |value| {
-                value["reconciler"]["providerSetSha256"] = serde_json::json!("not-a-digest");
+                value["reconciler"]["definitionSha256"] = serde_json::json!("not-a-digest");
             },
         ] {
             let mut invalid = serde_json::to_value(&record).unwrap();
@@ -1216,12 +1222,7 @@ mod tests {
         assert!(
             ReconciledRelease::new("2.0.0".into(), "not-a-digest".into(), "c".repeat(64)).is_err()
         );
-        assert!(ReconcilerIdentity::new(
-            "not-a-digest".into(),
-            "system".into(),
-            record.reconciler().release().clone(),
-        )
-        .is_err());
+        assert!(ReconcilerIdentity::new("not-a-digest".into(), "system".into(), 1).is_err());
 
         assert!(LastReconciliation::new(
             MutationOperation::Rollback,
@@ -1255,11 +1256,15 @@ mod tests {
         let transaction = "a".repeat(64);
         let compensation = format!("{transaction}r");
         for (operation, reason, attempt_id) in [
-            (MutationOperation::Apply, Reason::Install, attempt::BOOT),
-            (MutationOperation::Apply, Reason::Restart, attempt::BOOT),
-            (MutationOperation::Apply, Reason::Restart, attempt::CONVERGE),
-            (MutationOperation::Apply, Reason::Update, &transaction),
-            (MutationOperation::Apply, Reason::Update, &compensation),
+            (MutationOperation::Converge, Reason::Install, attempt::BOOT),
+            (MutationOperation::Converge, Reason::Restart, attempt::BOOT),
+            (
+                MutationOperation::Converge,
+                Reason::Restart,
+                attempt::CONVERGE,
+            ),
+            (MutationOperation::Converge, Reason::Update, &transaction),
+            (MutationOperation::Converge, Reason::Update, &compensation),
             (MutationOperation::Rollback, Reason::Update, &compensation),
         ] {
             assert!(
@@ -1268,9 +1273,13 @@ mod tests {
             );
         }
         for (operation, reason, attempt_id) in [
-            (MutationOperation::Apply, Reason::Install, attempt::CONVERGE),
-            (MutationOperation::Apply, Reason::Restart, &transaction),
-            (MutationOperation::Apply, Reason::Update, attempt::BOOT),
+            (
+                MutationOperation::Converge,
+                Reason::Install,
+                attempt::CONVERGE,
+            ),
+            (MutationOperation::Converge, Reason::Restart, &transaction),
+            (MutationOperation::Converge, Reason::Update, attempt::BOOT),
             (MutationOperation::Rollback, Reason::Restart, &compensation),
             (MutationOperation::Rollback, Reason::Update, &transaction),
         ] {
@@ -1401,13 +1410,11 @@ mod tests {
             reason: Reason::Restart,
             install_root: OsStr::new("/install"),
             state_dir: OsStr::new("/state"),
-            candidate: OsStr::new("/candidate"),
-            candidate_version: OsStr::new("2.0.0"),
+            payload_root: OsStr::new("/payload"),
+            payload_version: OsStr::new("2.0.0"),
             output_dir: OsStr::new("/out"),
             result_file: OsStr::new("/result.json"),
             input_dir: OsStr::new("/in"),
-            predecessor: OsStr::new("/predecessor"),
-            predecessor_version: OsStr::new("1.0.0"),
         };
         let argv = arguments.argv();
         let flags: Vec<&str> = argv.iter().map(|(flag, _)| *flag).collect();
@@ -1417,18 +1424,16 @@ mod tests {
                 .map(|(_, value)| value.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
             [
-                "1",
+                "2",
                 "boot",
                 "restart",
                 "/install",
                 "/state",
-                "/candidate",
+                "/payload",
                 "2.0.0",
                 "/out",
                 "/result.json",
                 "/in",
-                "/predecessor",
-                "1.0.0",
             ]
         );
     }
@@ -1473,7 +1478,7 @@ mod tests {
             );
         }
         // Backticked, like the identities above: the bare words appear in the doc for unrelated
-        // reasons ("install root", "restarting", "self-update"), so a bare-substring check stayed
+        // reasons ("install root", "restarting", "updating itself"), so a bare-substring check stayed
         // green with the whole `--reason` grammar deleted — the one state it exists to prevent.
         for reason in [Reason::Install, Reason::Restart, Reason::Update] {
             assert!(

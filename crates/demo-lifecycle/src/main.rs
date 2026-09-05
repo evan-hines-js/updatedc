@@ -26,7 +26,7 @@ fn main() {
 #[cfg(not(unix))]
 fn main() {
     eprintln!(
-        "demo-lifecycle: this demo deployment fixture manages its workload through unix process \
+        "demo-reconciler: this demo deployment fixture manages its workload through unix process \
          primitives and has no meaning on this platform"
     );
     std::process::exit(1);

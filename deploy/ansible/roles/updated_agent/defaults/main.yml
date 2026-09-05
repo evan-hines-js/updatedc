@@ -46,11 +46,8 @@ updated_hostname: "{{ inventory_hostname }}"
 # from your secret store per host rather than committing them to group_vars, e.g.
 #   updated_enrollment_client_cert: "{{ lookup('community.hashi_vault.hashi_vault', ...) }}"
 
-# ── Service tuning ────────────────────────────────────────────────────────────
-# Written to /etc/updated/agent.env, which the unit reads. Widen the ready timeout for a fleet
-# whose first cold install pulls a large bundle over a slow link.
-updated_ready_timeout: 60
-updated_confirm_timeout: 30
+# ── Service lifecycle ─────────────────────────────────────────────────────────
+# The host service manager supervises the agent directly.
 
 # Start the service once configured. Set false to stage a fleet and cut it over separately.
 updated_agent_started: true

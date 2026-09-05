@@ -557,13 +557,8 @@ impl<'a> Observations<'a> {
     /// `deployment` have converged. The shared report predicate owns that definition; this wrapper
     /// only supplies the control plane's expected identities.
     fn converged(&self, node: &str, identity: &str, deployment: &DesiredDeployment) -> bool {
-        self.report(node).is_some_and(|report| {
-            report.is_converged_to(
-                identity,
-                &deployment.application.sha256,
-                &deployment.provider_set.sha256,
-            )
-        })
+        self.report(node)
+            .is_some_and(|report| report.is_converged_to(identity, &deployment.application.sha256))
     }
 
     /// How far this group has progressed toward the deployment it is admitted to.
@@ -2307,10 +2302,6 @@ mod tests {
                 sha256: DIGEST.into(),
             },
             cold_install_fallback: false,
-            provider_set: crate::ExactTarget {
-                path: "prov".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: runtime(),
         }
@@ -2417,7 +2408,7 @@ mod tests {
             identity,
             "1.0.0",
             DIGEST,
-            desired.provider_set.sha256,
+            "f".repeat(64),
             healthy,
         )
         .unwrap();
@@ -2472,7 +2463,7 @@ mod tests {
             identity,
             "1.0.0",
             archive,
-            &deployment.provider_set.sha256,
+            "f".repeat(64),
             true,
         )
         .unwrap();
@@ -2506,7 +2497,7 @@ mod tests {
             identity,
             "1.0.0",
             archive,
-            &deployment.provider_set.sha256,
+            "f".repeat(64),
             healthy,
         )
         .unwrap();
@@ -2527,7 +2518,7 @@ mod tests {
             identity,
             "1.0.0",
             DIGEST,
-            desired.provider_set.sha256,
+            "f".repeat(64),
             true,
         )
         .unwrap();
@@ -3822,16 +3813,8 @@ mod tests {
         ]);
         let desired = deployment_named("v1");
         let identity = crate::deployment_identity(&desired).unwrap();
-        let mut report_a = NodeReport::new(
-            "n-a",
-            "v1",
-            identity,
-            "1.0.0",
-            DIGEST,
-            desired.provider_set.sha256,
-            true,
-        )
-        .unwrap();
+        let mut report_a =
+            NodeReport::new("n-a", "v1", identity, "1.0.0", DIGEST, "f".repeat(64), true).unwrap();
         report_a.reported_at_ms = test_now().timestamp_millis() as u64;
         // Genuinely signed, but by a key the control plane never pinned for this node — the forgery a
         // bucket writer could mount without the node's own key.
@@ -7943,7 +7926,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_app_bytes_with_the_old_provider_set_are_not_settled() {
+    fn matching_package_bytes_are_the_complete_deployment_unit() {
         let deployment = deployment_with_app("database", &"2".repeat(64));
         let identity = crate::deployment_identity(&deployment).unwrap();
         let mut report = NodeReport::new(
@@ -7981,8 +7964,8 @@ mod tests {
             NodeEvidence::Healthy
         ));
         assert!(
-            !observations.converged("n0", &identity, &deployment),
-            "provider identity is part of the deployed unit, not optional metadata"
+            observations.converged("n0", &identity, &deployment),
+            "the execution definition is contained in the signed package"
         );
     }
 
@@ -9618,7 +9601,7 @@ mod tests {
             identity,
             "1.0.0",
             archive,
-            &deployment.provider_set.sha256,
+            "f".repeat(64),
             false,
         )
         .unwrap();

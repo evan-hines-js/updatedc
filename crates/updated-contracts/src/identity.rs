@@ -8,7 +8,7 @@ use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// The largest product, channel, platform, provider-set, or deployment identity.
+/// The largest product, channel, platform or deployment identity.
 ///
 /// These values become path segments, status fields, log attributes, and telemetry fields in
 /// different parts of the system. Giving all of them one ASCII grammar prevents a value accepted

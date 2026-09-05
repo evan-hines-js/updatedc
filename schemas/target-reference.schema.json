@@ -5,7 +5,10 @@
   "description": "An immutable reference to one target authenticated by TUF metadata.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["path", "sha256"],
+  "required": [
+    "path",
+    "sha256"
+  ],
   "properties": {
     "path": {
       "type": "string",

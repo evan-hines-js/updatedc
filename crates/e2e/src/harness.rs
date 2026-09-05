@@ -4,10 +4,11 @@
 //! streamed to this process's stderr (so CI shows it inline) and captured in
 //! memory for assertions — never written to log files.
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -108,14 +109,10 @@ pub struct Ctx {
     _run_lock: std::fs::File,
     pub root: PathBuf,
     pub work: PathBuf,
-    /// Cargo's build-output dir for this driver. `e2e` uses the shared `target/`; a differently
-    /// named driver (the kill fuzzer) gets its own `target/<name>-cargo` so its `cargo build`
-    /// never unlinks a shared `target/release/*` artifact out from under a concurrent e2e run
-    /// (which surfaced as the launcher's transient `inspecting agent: No such file`).
+    /// Cargo's isolated build-output dir for this driver.
     pub target: PathBuf,
     pub server: PathBuf,
     pub agent: PathBuf,
-    pub launcher: PathBuf,
     /// Rust's own OS-arch key, e.g. `macos-aarch64` / `windows-x86_64`; matches
     /// what the agent sends and the server keys manifests by.
     pub platkey: String,
@@ -126,11 +123,7 @@ pub struct Ctx {
 }
 
 /// The cargo features every agent build in the run uses: `chaos` for the crash-injection
-/// points the recovery scenarios need, plus `fips` under `E2E_FIPS` so the agents the
-/// self-update scenarios publish and run link the validated provider too — the same binary
-/// shape as `Ctx::agent`. One source of truth, so no agent fixture can silently
-/// drop out of FIPS mode (and so feature unification never rebuilds the agent between
-/// fixtures).
+/// points the recovery scenarios need, plus `fips` under `E2E_FIPS`.
 pub fn agent_features(fips: bool) -> &'static [&'static str] {
     if fips {
         &["chaos", "fips"]
@@ -159,7 +152,7 @@ impl Ctx {
         let lock_path = root.join(format!("target/{name}.lock"));
         // Every driver builds into its own `target/<name>-cargo`, so concurrent `cargo build`s
         // (and the dev tree's own `target/`) never unlink a shared `target/release/*` artifact out
-        // from under each other — the collision that surfaced as the launcher's transient
+        // from under each other — the collision that surfaced as the service's transient
         // `inspecting agent: No such file`. Point cargo (via `CARGO_TARGET_DIR`) and every
         // built-artifact path below at the same dir so builds and copies agree.
         let target = root.join(format!("target/{name}-cargo"));
@@ -205,10 +198,7 @@ impl Ctx {
             _run_lock: run_lock,
             server: bin("server"),
             // The canonical chaos-enabled agent is copied here by `build()`.
-            // Versioned self-update fixture builds reuse Cargo's target path, so no
-            // scenario may execute that mutable build output directly.
             agent: work.join(format!("build/agent-chaos{exe}")),
-            launcher: bin("updated-launcher"),
             platkey: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             exe,
             work,
@@ -224,8 +214,8 @@ impl Ctx {
     pub fn build(&self) -> R {
         // `E2E_FIPS=1` runs the suite on FIPS-validated crypto: the binaries that do crypto (the
         // repository fixtures and agent — mTLS, the TUF transport, hashing,
-        // signing) are built `--features fips`, which links the validated aws-lc-rs. The launcher
-        // and sample apps do no crypto, so they build unchanged. A FIPS build that cannot validate
+        // signing) are built `--features fips`, which links the validated aws-lc-rs. Sample apps
+        // do no crypto, so they build unchanged. A FIPS build that cannot validate
         // its provider fails closed at startup.
         let fips_feature: &[&str] = if self.fips {
             &["--features", "fips"]
@@ -238,7 +228,6 @@ impl Ctx {
         ]
         .concat();
         cargo(&self.root, &crypto_cdn)?;
-        cargo(&self.root, &["build", "--release", "-p", "launcher"])?;
         // Same package, env and features as every versioned agent fixture; only the
         // staged name differs.
         self.build_and_stage(
@@ -252,8 +241,7 @@ impl Ctx {
     }
 
     /// Build one release package (with optional extra env and cargo `--features`) and stage the
-    /// resulting binary at `build/<dst_stem><exe>`. The single build-then-copy path behind
-    /// `build_app`, `build_agent`, and the post-ready-crash variant.
+    /// resulting binary at `build/<dst_stem><exe>`.
     fn build_and_stage(
         &self,
         pkg: &str,
@@ -271,7 +259,7 @@ impl Ctx {
         if !features.is_empty() {
             cmd.arg("--features").arg(features.join(","));
         }
-        run(&mut cmd)?;
+        run(cmd)?;
         let src = self.target.join(format!("release/{bin_stem}{}", self.exe));
         let dst = self.work.join(format!("build/{dst_stem}{}", self.exe));
         std::fs::copy(&src, &dst).map_err(str_err)?;
@@ -286,33 +274,6 @@ impl Ctx {
             &[],
             &[],
             &format!("app-{version}"),
-        )
-    }
-
-    /// Build `agent` with a baked version (so the bytes differ per version) and
-    /// copy it to `build/agent-<v><exe>`, for the self-update scenarios.
-    pub fn build_agent(&self, version: &str) -> R<PathBuf> {
-        self.build_and_stage(
-            "agent",
-            "updated-agent",
-            &[("AGENT_VERSION", version)],
-            agent_features(self.fips),
-            &format!("agent-{version}"),
-        )
-    }
-
-    /// Build a candidate that completes boot and signals ready, then exits
-    /// before the launcher's confirmation window can commit it.
-    pub fn build_post_ready_crashing_agent(&self, version: &str) -> R<PathBuf> {
-        self.build_and_stage(
-            "agent",
-            "updated-agent",
-            &[
-                ("AGENT_VERSION", version),
-                ("AGENT_CHAOS_EXIT_AFTER_READY", "1"),
-            ],
-            agent_features(self.fips),
-            &format!("agent-post-ready-crash-{version}"),
         )
     }
 
@@ -356,21 +317,25 @@ impl Ctx {
     /// through exact capabilities; release objects are fetched directly without a node identity.
     pub fn init_repo(&self, dir: &Path) -> R {
         for name in ["routing", "release"] {
-            run(Command::new(&self.server)
+            let mut command = Command::new(&self.server);
+            command
                 .arg("init")
                 .arg("--repo")
                 .arg(dir.join(format!("{name}-repo")))
                 .arg("--keys")
-                .arg(dir.join(format!("{name}-keys"))))?;
+                .arg(dir.join(format!("{name}-keys")));
+            run(command)?;
         }
         // Mint the fleet TLS material alongside the TUF keys. The private capability fixture
         // validates agent certificates; the public object fixture only presents its server
         // certificate. Loopback SANs cover `https://127.0.0.1:port`.
-        run(Command::new(&self.server)
+        let mut command = Command::new(&self.server);
+        command
             .arg("gen-certs")
             .arg("--dir")
             .arg(dir.join("certs"))
-            .args(["--san", "127.0.0.1", "--san", "localhost"]))
+            .args(["--san", "127.0.0.1", "--san", "localhost"]);
+        run(command)
     }
 
     /// Publish a per-platform release of `source` for `product` at `version`.
@@ -399,38 +364,59 @@ impl Ctx {
         source: &Path,
         corrupt: Option<&str>,
     ) -> R {
-        let application = product != "agent";
+        // The production publisher consumes a complete payload tree. The portable harness builds
+        // one version-agnostic sample executable and gives each published release its identity in
+        // config/release.toml, so materialize that tiny tree here instead of teaching the
+        // production publisher a test-only "wrap this executable" input shape.
+        let bundle: Cow<'_, Path> = if source.is_dir() {
+            Cow::Borrowed(source)
+        } else {
+            let prepared = dir.join("publish-source");
+            match std::fs::remove_dir_all(&prepared) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return fail(format!("removing stale payload source: {error}")),
+            }
+            std::fs::create_dir_all(prepared.join("bin")).map_err(str_err)?;
+            std::fs::create_dir_all(prepared.join("config")).map_err(str_err)?;
+            let entrypoint = prepared.join(format!("bin/app{}", self.exe));
+            std::fs::copy(source, &entrypoint).map_err(str_err)?;
+            // The former single-file publisher always installed its input as the payload
+            // entrypoint. Preserve that contract for fixtures such as the executable shell
+            // wedge, even though `File::create` gave their source a non-executable mode.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o755))
+                    .map_err(str_err)?;
+            }
+            std::fs::write(
+                prepared.join("config/release.toml"),
+                format!("version = \"{version}\"\n"),
+            )
+            .map_err(str_err)?;
+            Cow::Owned(prepared)
+        };
+        crate::fixture::prepare_package(&bundle)?;
         let mut command = Command::new(&self.server);
         command
-            .arg(if application {
-                "publish-app"
-            } else {
-                "publish-agent"
-            })
+            .arg("publish-app")
             .arg("--repo")
             .arg(dir.join("release-repo"))
             .arg("--keys")
             .arg(dir.join("release-keys"))
             .args(["--product", product, "--version", version])
-            .arg(if application { "--bundle" } else { "--target" })
-            .arg(format!("{}={}", self.platkey, source.display()));
-        if application {
-            command
-                .arg("--entrypoint")
-                .arg(format!("bin/app{}", self.exe));
-        }
+            .arg("--bundle")
+            .arg(format!("{}={}", self.platkey, bundle.display()));
         if let Some(kind) = corrupt {
             command.args(["--corrupt", kind]);
         }
-        run(&mut command)?;
-        if application {
-            let target = release_target(product, "stable", version, &self.platkey, product);
-            let sha = self.target_sha256(dir, &target)?;
-            std::fs::write(dir.join("desired-app"), format!("{target}\n{sha}\n"))
-                .map_err(str_err)?;
-            if let Ok(addr) = std::fs::read_to_string(dir.join("assignment-addr")) {
-                self.publish_current_assignment(dir, addr.trim(), version)?;
-            }
+        run(command)?;
+        let target = release_target(product, "stable", version, &self.platkey, product);
+        let sha = self.target_sha256(dir, &target)?;
+        std::fs::write(dir.join("desired-app"), format!("{target}\n{sha}\n")).map_err(str_err)?;
+        if let Ok(addr) = std::fs::read_to_string(dir.join("assignment-addr")) {
+            self.publish_current_assignment(dir, addr.trim(), version)?;
         }
         Ok(())
     }
@@ -441,18 +427,17 @@ impl Ctx {
     pub fn serve(&self, dir: &Path, addr: &str) -> R<Proc> {
         std::fs::write(dir.join("assignment-addr"), addr).map_err(str_err)?;
         let certs = dir.join("certs");
-        let mut object = Proc::spawn(
-            "object-server",
-            Command::new(&self.server)
-                .arg("serve-object")
-                .arg("--repo")
-                .arg(dir.join("release-repo"))
-                .args(["--addr", "127.0.0.1:0"])
-                .arg("--cert")
-                .arg(certs.join("server.crt"))
-                .arg("--key")
-                .arg(certs.join("server.key")),
-        )?;
+        let mut command = Command::new(&self.server);
+        command
+            .arg("serve-object")
+            .arg("--repo")
+            .arg(dir.join("release-repo"))
+            .args(["--addr", "127.0.0.1:0"])
+            .arg("--cert")
+            .arg(certs.join("server.crt"))
+            .arg("--key")
+            .arg(certs.join("server.key"));
+        let mut object = Proc::spawn("object-server", command)?;
         if !object.wait_for_log("serving object repository ", EVENT_TIMEOUT) {
             let exited = object.has_exited();
             let output = object.captured_log();
@@ -469,21 +454,20 @@ impl Ctx {
         let release_base_url = format!("{}/", object_url.trim_end_matches('/'));
         std::fs::write(dir.join("release-base-url"), &release_base_url).map_err(str_err)?;
 
-        let mut gateway = Proc::spawn(
-            "capability-gateway",
-            Command::new(&self.server)
-                .arg("serve-capability")
-                .arg("--repo")
-                .arg(dir.join("routing-repo"))
-                .args(["--addr", addr])
-                .args(["--public-url", &format!("https://{addr}")])
-                .arg("--cert")
-                .arg(certs.join("server.crt"))
-                .arg("--key")
-                .arg(certs.join("server.key"))
-                .arg("--ca")
-                .arg(certs.join("ca.crt")),
-        )?;
+        let mut command = Command::new(&self.server);
+        command
+            .arg("serve-capability")
+            .arg("--repo")
+            .arg(dir.join("routing-repo"))
+            .args(["--addr", addr])
+            .args(["--public-url", &format!("https://{addr}")])
+            .arg("--cert")
+            .arg(certs.join("server.crt"))
+            .arg("--key")
+            .arg(certs.join("server.key"))
+            .arg("--ca")
+            .arg(certs.join("ca.crt"));
+        let mut gateway = Proc::spawn("capability-gateway", command)?;
         if !gateway.wait_for_log("serving capability repository ", EVENT_TIMEOUT) {
             let exited = gateway.has_exited();
             let output = gateway.captured_log();
@@ -641,7 +625,7 @@ pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
 /// A spawned process whose entire descendant tree is stopped on drop. Its output
 /// is teed to the console and captured in `log`.
 pub struct Proc {
-    grouped: Grouped,
+    grouped: foundation::process::ContainedChild,
     log: LogBuf,
     readers: Vec<LogReader>,
     companions: Vec<Proc>,
@@ -665,6 +649,10 @@ pub trait CapturedLog {
             .map(|log| log.clone())
             .unwrap_or_default()
     }
+
+    fn log_count(&self, needle: &str) -> usize {
+        buf_count(self.log_buffer(), needle)
+    }
 }
 
 impl CapturedLog for Proc {
@@ -677,14 +665,14 @@ impl Proc {
     /// Spawn `cmd` in its own process group (Unix) / Job Object (Windows) so it
     /// can be torn down as a unit, teeing its stdout+stderr to the console and an
     /// in-memory buffer.
-    pub fn spawn(label: &str, cmd: &mut Command) -> R<Proc> {
+    pub fn spawn(label: &str, cmd: Command) -> R<Proc> {
         // The tree teardown (process group on Unix, Job Object on Windows) is `spawn_grouped`'s
         // job.
         let mut grouped = spawn_grouped(cmd).map_err(|e| format!("spawn {label}: {e}"))?;
         let log = log_buf();
         let readers = [
-            tee(label, grouped.child.stdout.take(), &log),
-            tee(label, grouped.child.stderr.take(), &log),
+            tee(label, grouped.take_stdout(), &log),
+            tee(label, grouped.take_stderr(), &log),
         ]
         .into_iter()
         .flatten()
@@ -697,53 +685,17 @@ impl Proc {
         })
     }
 
-    pub fn log_count(&self, needle: &str) -> usize {
-        buf_count(&self.log, needle)
-    }
-
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.grouped.child.try_wait(), Ok(Some(_)))
+        matches!(self.grouped.try_wait(), Ok(Some(_)))
     }
 }
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        self.grouped.teardown();
-        let _ = self.grouped.child.wait();
+        self.grouped.stop(Duration::from_millis(400));
         for reader in self.readers.drain(..) {
             reader.finish();
         }
-    }
-}
-
-#[cfg(windows)]
-fn assign_job(child: &Child) -> R<windows_sys::Win32::Foundation::HANDLE> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-    unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job.is_null() {
-            return fail("CreateJobObjectW failed");
-        }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const _,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) == 0
-            || AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0
-        {
-            let error = std::io::Error::last_os_error();
-            windows_sys::Win32::Foundation::CloseHandle(job);
-            return fail(format!("configuring E2E process Job Object: {error}"));
-        }
-        Ok(job)
     }
 }
 
@@ -752,7 +704,7 @@ fn assign_job(child: &Child) -> R<windows_sys::Win32::Foundation::HANDLE> {
 /// A process run under a *simulated init system*. Like systemd `Restart=on-failure`, it
 /// relaunches the process whenever it exits, up to a start-limit burst, then gives up.
 ///
-/// The launcher runs under the operator's init system, which owns its restarts; the harness has
+/// The agent runs under the operator's init system, which owns its restarts; the harness has
 /// no such service manager, so recovery paths (a rollback deferred to boot recovery, or reverting
 /// an unconfirmed update) would never get a second boot to run in. `Service` is that init system. Output across every restart accumulates in one buffer, and `Drop` both stops
 /// the restarts and tears down the running instance's whole process tree.
@@ -829,7 +781,7 @@ fn run_service(
                 None => cmd.env_remove(k),
             };
         }
-        let mut grouped = match spawn_grouped(&mut cmd) {
+        let mut grouped = match spawn_grouped(cmd) {
             Ok(g) => g,
             Err(e) => {
                 if let Ok(mut b) = log.lock() {
@@ -838,26 +790,33 @@ fn run_service(
                 return;
             }
         };
+        if let Ok(mut b) = log.lock() {
+            b.push_str(&format!("service launched agent (pid {})\n", grouped.id()));
+        }
         let readers = [
-            tee(label, grouped.child.stdout.take(), log),
-            tee(label, grouped.child.stderr.take(), log),
+            tee(label, grouped.take_stdout(), log),
+            tee(label, grouped.take_stderr(), log),
         ];
         loop {
             if stop.load(Ordering::SeqCst) {
-                grouped.teardown();
-                let _ = grouped.child.wait();
+                grouped.stop(Duration::from_millis(400));
                 for reader in readers.into_iter().flatten() {
                     reader.finish();
                 }
                 return;
             }
-            match grouped.child.try_wait() {
+            match grouped.try_wait() {
                 Ok(Some(_)) => break, // exited on its own → the init system restarts it
-                _ => std::thread::sleep(Duration::from_millis(100)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    if let Ok(mut b) = log.lock() {
+                        b.push_str(&format!("service wait failed: {error}\n"));
+                    }
+                    grouped.stop(Duration::ZERO);
+                    break;
+                }
             }
         }
-        grouped.close();
-        let _ = grouped.child.wait();
         for reader in readers.into_iter().flatten() {
             reader.finish();
         }
@@ -865,70 +824,10 @@ fn run_service(
     }
 }
 
-/// A spawned child in its own process group (Unix) / Job Object (Windows), so its whole
-/// tree can be torn down as a unit — the shared mechanism behind [`Proc`] and [`Service`].
-struct Grouped {
-    child: Child,
-    #[cfg(windows)]
-    job: windows_sys::Win32::Foundation::HANDLE,
-}
-
-impl Grouped {
-    /// Kill the whole tree (the child self-exited case leaves this to `Drop`).
-    fn teardown(&self) {
-        #[cfg(unix)]
-        unsafe {
-            let pgid = self.child.id() as libc::pid_t;
-            libc::kill(-pgid, libc::SIGTERM);
-            std::thread::sleep(Duration::from_millis(400));
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
-            windows_sys::Win32::Foundation::CloseHandle(self.job);
-        }
-    }
-    /// Release the OS resources of an already-exited child, taking any surviving descendants with
-    /// it — what a service manager does when the unit's main process exits (systemd's default
-    /// `KillMode=control-group`, and a Windows job object closing).
-    ///
-    /// Windows got this for free (closing a kill-on-close job terminates what is left); Unix did
-    /// not, so the same restart scenario left the managed application running on one platform and
-    /// not the other, and the two were quietly testing different things.
-    fn close(&self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.job);
-        }
-    }
-}
-
-fn spawn_grouped(cmd: &mut Command) -> R<Grouped> {
+/// Test processes use the production process-tree and parent-death containment primitive.
+fn spawn_grouped(mut cmd: Command) -> R<foundation::process::ContainedChild> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
-    #[cfg(windows)]
-    let job = assign_job(&child)?;
-    Ok(Grouped {
-        child,
-        #[cfg(windows)]
-        job,
-    })
+    foundation::process::ContainedChild::spawn(cmd).map_err(|e| format!("spawn: {e}"))
 }
 
 // -------------------------------- subprocess --------------------------------
@@ -936,29 +835,41 @@ fn spawn_grouped(cmd: &mut Command) -> R<Grouped> {
 fn cargo(root: &Path, args: &[&str]) -> R {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.current_dir(root).args(args);
-    run(&mut cmd)
+    run(cmd)
 }
 
 /// Run a command to completion, failing on a non-zero exit.
-pub fn run(cmd: &mut Command) -> R {
-    // Capture both streams so a failing child (a cargo build, a server invocation)
-    // reports *why* it failed, not just its exit code. On success we stay quiet.
-    let output = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("running {cmd:?}: {e}"))?;
-    if output.status.success() {
+pub fn run(cmd: Command) -> R {
+    run_before(cmd, Instant::now() + Duration::from_secs(EVENT_TIMEOUT))
+}
+
+fn run_before(mut cmd: Command, deadline: Instant) -> R {
+    use std::io::{Seek, SeekFrom};
+    // A concurrent macOS spawn can inherit a pipe before std sets CLOEXEC. Completion
+    // must depend on the child, never EOF from an unrelated process holding that pipe.
+    let mut stdout = tempfile::tempfile().map_err(|e| e.to_string())?;
+    let mut stderr = tempfile::tempfile().map_err(|e| e.to_string())?;
+    cmd.stdout(stdout.try_clone().map_err(|e| e.to_string())?)
+        .stderr(stderr.try_clone().map_err(|e| e.to_string())?);
+    let description = format!("{cmd:?}");
+    let status = foundation::process::run_to_exit(cmd, deadline);
+    if matches!(status, Ok(Some(0))) {
         return Ok(());
     }
     let mut detail = String::new();
-    for (label, stream) in [("stderr", &output.stderr), ("stdout", &output.stdout)] {
-        let text = String::from_utf8_lossy(stream);
+    for (label, stream) in [("stderr", &mut stderr), ("stdout", &mut stdout)] {
+        stream.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        stream
+            .take(1024 * 1024)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&bytes);
         if !text.trim().is_empty() {
             detail.push_str(&format!("\n--- {label} ---\n{}", text.trim_end()));
         }
     }
-    fail(format!("{cmd:?} exited with {}{detail}", output.status))
+    fail(format!("{description} finished with {status:?}{detail}"))
 }
 
 /// Durable-state diagnostics for a failed scenario: every `install/state` directory
@@ -1011,12 +922,12 @@ pub fn dump_install_state(work: &Path) -> String {
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "none".into());
-        // `confirmed=false` marks a provisional cold-install head still awaiting its first passing
-        // health gate — the state that drives the cold-install-fallback descent.
-        let confirmed = installed_doc
+        // `maturity=provisional` marks a cold-install head still awaiting its first passing health
+        // gate — the state that drives the cold-install-fallback descent.
+        let maturity = installed_doc
             .as_ref()
-            .and_then(|doc| doc.get("confirmed")?.as_bool())
-            .map(|c| c.to_string())
+            .and_then(|doc| doc.get("maturity")?.as_str())
+            .map(str::to_owned)
             .unwrap_or_else(|| "n/a".into());
         let rejected = std::fs::read_to_string(state.join("rejected"))
             .map(|text| {
@@ -1033,9 +944,9 @@ pub fn dump_install_state(work: &Path) -> String {
         } else {
             "none"
         };
-        // Provider/pending presence: a rollback replays the *predecessor's own* providers held in
-        // `pending`, so `lifecycle=none`/`pending=none` on a record that should have run rollback
-        // hooks is the smoking gun for a rollback that skipped them (rather than product logic).
+        // Provider/guard presence: predecessor convergence uses the reconciler retained in
+        // `rollback_guard`, so a missing binding on a guarded record is the smoking gun for a
+        // rollback that cannot restore its predecessor.
         let present = |key: &str| {
             installed_doc
                 .as_ref()
@@ -1048,17 +959,16 @@ pub fn dump_install_state(work: &Path) -> String {
                 })
                 .unwrap_or("n/a")
         };
-        let (lifecycle, pending) = (present("lifecycle"), present("pending"));
+        let (reconciler, rollback_guard) = (present("reconciler"), present("rollback_guard"));
         out.push_str(&format!(
-            "\n  {label}: installed={installed} confirmed={confirmed} rejected=[{rejected}] \
-             transaction={transaction} lifecycle={lifecycle} pending={pending}"
+            "\n  {label}: installed={installed} maturity={maturity} rejected=[{rejected}] \
+             transaction={transaction} reconciler={reconciler} rollback-guard={rollback_guard}"
         ));
     }
     out
 }
 
-/// Extract the PID printed as `(pid N)` in the first log line containing `needle` — used to target
-/// the agent process the launcher reports launching.
+/// Extract the PID printed as `(pid N)` in the first log line containing `needle`.
 pub fn pid_after(log: &str, needle: &str) -> Option<u32> {
     let at = log.find(needle)?;
     let rest = &log[at..];
@@ -1067,8 +977,7 @@ pub fn pid_after(log: &str, needle: &str) -> Option<u32> {
     rest[open..open + close].trim().parse().ok()
 }
 
-/// Kill one process by PID (not its group/tree) — to simulate an agent crash while the launcher
-/// and the hook-managed workload keep running.
+/// Kill one process by PID (not its group/tree) to simulate an agent crash.
 pub fn kill_pid(pid: u32) {
     #[cfg(unix)]
     unsafe {
@@ -1183,10 +1092,31 @@ pub fn make_owner_writable(path: &Path) -> R {
 mod tests {
     use super::agent_features;
 
-    /// The self-update scenarios publish and run the fixtures `build_agent` /
-    /// `build_post_ready_crashing_agent` produce, so those builds must carry `fips`
-    /// under `E2E_FIPS` exactly as `Ctx::build`'s canonical agent does — otherwise a
-    /// FIPS run exercises the TUF-fetch, digest-verify and staging path on default crypto.
+    #[cfg(unix)]
+    #[test]
+    fn command_completion_does_not_wait_for_inherited_output() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & echo diagnostic >&2; exit 7"]);
+        let start = std::time::Instant::now();
+        let error = super::run(command).unwrap_err();
+        assert!(error.contains("Some(7)"), "{error}");
+        assert!(error.contains("diagnostic"), "{error}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_command_has_a_deadline() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let start = std::time::Instant::now();
+        let error =
+            super::run_before(command, start + std::time::Duration::from_millis(200)).unwrap_err();
+        assert!(error.contains("TimedOut"), "{error}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// Every agent build carries chaos and gains FIPS with the run.
     #[test]
     fn every_agent_build_is_chaos_and_gains_fips_with_the_run() {
         assert_eq!(agent_features(false), &["chaos"]);
@@ -1220,7 +1150,7 @@ mod workload_guard_tests {
             .unwrap();
         std::fs::write(
             root.join("workload.json"),
-            format!("{{\"pid\":{pid},\"release\":\"r\",\"environment\":\"e\"}}"),
+            format!("{{\"pid\":{pid},\"release\":\"r\",\"version\":\"1.0.0\"}}"),
         )
         .unwrap();
 

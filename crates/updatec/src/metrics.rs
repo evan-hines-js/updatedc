@@ -27,7 +27,7 @@ pub struct FleetSnapshot {
     /// Each planned group's verdict and node accounting, straight from the planner.
     pub groups: BTreeMap<String, (GroupProgress, GroupNodes)>,
     /// Agents with an authentic report inside `REPORT_FRESHNESS` — the same staleness the
-    /// admission gate applies.
+    /// admission gate converges.
     pub reports_fresh: usize,
     /// Agents that have reported before (pinned key, at least one stored envelope) but have no
     /// fresh authentic report now. A never-reported agent is unobserved, not stale.

@@ -44,6 +44,19 @@ pub(crate) fn identity_object<T>(result: Result<T, kube::Error>) -> Result<T, St
     }
 }
 
+/// The shared object boundary for admitting or authorizing an identity. Finalizers may keep a
+/// deleted agent readable; that object must not grant fresh authority while awaiting cleanup.
+pub(crate) fn agent_has_live_identity(
+    agent: &crate::UpdateAgent,
+    repository: &str,
+    node: &str,
+) -> bool {
+    agent.metadata.deletion_timestamp.is_none()
+        && agent.metadata.name.as_deref() == Some(node)
+        && agent.spec.repository_ref.name == repository
+        && agent.spec.identity.is_well_formed_for(node)
+}
+
 /// The complete node-key authorization policy.
 ///
 /// Every path that turns a key into node authority -- enrollment revalidation, renewal, and
@@ -56,9 +69,7 @@ pub(crate) fn agent_authorizes_key(
     node: &str,
     public_key: &str,
 ) -> bool {
-    agent.metadata.name.as_deref() == Some(node)
-        && agent.spec.repository_ref.name == repository
-        && agent.spec.identity.is_well_formed_for(node)
+    agent_has_live_identity(agent, repository, node)
         && matches!(
             agent.spec.identity.kind,
             crate::AgentIdentityKind::Manual | crate::AgentIdentityKind::Enrolled
@@ -161,7 +172,7 @@ pub(crate) async fn authorize_node(
     // decommissioned, re-homed or superseded node kept reading its deployment's database passwords
     // and API tokens from here for as long as no new generation was published — while `/renew`,
     // which gates on the same pin, answered 403. Every endpoint that mints an object capability
-    // applies the same check as the one that mints certificates.
+    // converges the same check as the one that mints certificates.
     let authorized = authorize_identity(&state.identity, identity).await?;
     let assignment = updated_contracts::telemetry::assignment_object_key(
         &authorized.repository.spec.assignment_prefix,

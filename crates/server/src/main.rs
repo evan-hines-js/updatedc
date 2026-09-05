@@ -4,9 +4,6 @@
 //!
 //! - `init`    mint the five ed25519 role keys and an empty signed repository.
 //! - `publish-app` build and publish application bundles.
-//! - `publish-provider-artifact` alias of `publish-app` for provider binaries.
-//! - `publish-agent` publish agent binaries.
-//! - `publish-provider-set` publish an immutable exact provider collection.
 //! - `publish-assignment` publish an exact desired deployment last.
 //! - `export-enrollment` write the enrollment bundle a node boots from.
 //! - `target-sha256` print the content address of a published target.
@@ -53,9 +50,7 @@ async fn main() {
 
     let result = match cmd {
         "init" => init(rest).await,
-        "publish-app" | "publish-provider-artifact" => publish(rest, true).await,
-        "publish-agent" => publish(rest, false).await,
-        "publish-provider-set" => publish_provider_set(rest).await,
+        "publish-app" => publish(rest).await,
         "publish-assignment" => publish_assignment(rest).await,
         "export-enrollment" => export_enrollment(rest),
         "target-sha256" => target_sha256(rest).await,
@@ -65,7 +60,7 @@ async fn main() {
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|publish-app|publish-provider-artifact|publish-agent|publish-provider-set|publish-assignment|export-enrollment|target-sha256|gen-certs|serve-capability|serve-object> [flags]"
+                "usage: server <init|publish-app|publish-assignment|export-enrollment|target-sha256|gen-certs|serve-capability|serve-object> [flags]"
             );
             exit(2);
         }
@@ -177,7 +172,6 @@ async fn publish_assignment(args: &[String]) -> R {
     let deployment = flag(args, "--deployment").ok_or("--deployment <id> is required")?;
     let application = target_reference(args, "application")?;
     let cold_install_fallback = args.iter().any(|arg| arg == "--cold-install-fallback");
-    let provider_set = target_reference(args, "provider-set")?;
     // Routing and releases are deliberately different repositories: the former is private and
     // capability-gated, while the latter is fetched directly from the object plane. Requiring the
     // release root makes that trust boundary explicit and prevents a fixture or operator tool from
@@ -204,7 +198,6 @@ async fn publish_assignment(args: &[String]) -> R {
         targets_url,
         application,
         cold_install_fallback,
-        provider_set,
         release_root,
         runtime,
     };
@@ -253,48 +246,6 @@ async fn publish_assignment(args: &[String]) -> R {
     Ok(())
 }
 
-async fn publish_provider_set(args: &[String]) -> R {
-    let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
-    let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
-    let id = flag(args, "--id").ok_or("--id <provider-set-id> is required")?;
-    let reconciler = updated_contracts::artifact::Reconciler {
-        artifact: target_reference(args, "provider")?,
-        args: flags_all(args, "--provider-arg"),
-        timeout_millis: flag(args, "--provider-timeout-ms")
-            .unwrap_or_else(|| "300000".into())
-            .parse()?,
-    };
-    // Same gate, same wording, as the production publisher: `for_publication` is where the rule
-    // lives, so this fixture cannot drift into accepting a document `updatectl` would refuse.
-    let set = updated_contracts::artifact::ProviderSet::for_publication(id.clone(), reconciler)?;
-    let source = repo_dir.join(".provider-set-build.json");
-    let name = format!("provider-sets/{id}.json");
-    let keys = repo::Keys::in_dir(&keys_dir)?;
-    // Under the lock before the staging write, for the same reason as `publish_assignment`: the
-    // staging name is fixed and shared, and `add_release` signs whatever bytes it finds there.
-    let _publish_lock = lock_publisher(&repo_dir)?;
-    repo::verify_provider_set_reconciler(&repo_dir, &set).await?;
-    foundation::durable::atomic_write(
-        &source,
-        ".provider-set-",
-        &set.to_bounded_json().map_err(|error| error.to_string())?,
-    )?;
-    repo::add_release(
-        &repo_dir,
-        &keys,
-        vec![PublishTarget {
-            name: name.clone(),
-            source: source.clone(),
-            custom: Default::default(),
-        }],
-        flag_i64(args, "--expiry-days", 365)?,
-    )
-    .await?;
-    let _ = std::fs::remove_file(source);
-    println!("published provider set {name}");
-    Ok(())
-}
-
 fn target_reference(
     args: &[String],
     prefix: &str,
@@ -331,7 +282,7 @@ async fn init(args: &[String]) -> R {
 
 // --- publish ----------------------------------------------------------------
 
-async fn publish(args: &[String], application_bundle: bool) -> R {
+async fn publish(args: &[String]) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
     let product = flag(args, "--product").ok_or("--product <name> is required")?;
@@ -347,27 +298,16 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
             return Err(format!("{flag} is not a valid identity segment: {value:?}").into());
         }
     }
-    let component = if application_bundle {
-        product.clone()
-    } else {
-        "agent".into()
-    };
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
 
-    let artifact_flag = if application_bundle {
-        "--bundle"
-    } else {
-        "--target"
-    };
+    let artifact_flag = "--bundle";
     let raw = flags_all(args, artifact_flag);
     if raw.is_empty() {
         return Err(format!("at least one {artifact_flag} <os>-<arch>=<path> is required").into());
     }
     let keys = repo::Keys::in_dir(&keys_dir)?;
     let _publish_lock = lock_publisher(&repo_dir)?;
-    let bundle_scratch = application_bundle
-        .then(|| BundleBuildScratch::create(&repo_dir))
-        .transpose()?;
+    let bundle_scratch = BundleBuildScratch::create(&repo_dir)?;
 
     let mut targets = Vec::new();
     for (target_index, t) in raw.iter().enumerate() {
@@ -382,35 +322,21 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
                 return Err(format!("platform {part} is invalid in {platform:?}").into());
             }
         }
-        let path = if application_bundle {
-            let scratch = bundle_scratch.as_ref().expect("created above").path();
-            let archive = scratch.join(format!("{target_index}.tar.zst"));
-            let wrap_root = scratch.join(format!("{target_index}.wrap"));
-            let entrypoint =
-                flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
-            updated::bundle::create_bundle_from_source(
-                Path::new(source),
-                &archive,
-                &wrap_root,
-                &product,
-                &version,
-                platform,
-                &entrypoint,
-            )?;
-            // Test-only: deliberately damage the just-built archive. It is corrupted *before*
-            // `add_release` hashes it, so the published target is signed for its own broken bytes —
-            // it passes the client's download sha check and fails only at extract/validate. This is
-            // the malformed-but-signed bundle an honest publisher can never emit, used to exercise
-            // the client's ingest-rejection + cold-install-fallback descent. Never used by real releases.
-            if let Some(kind) = flag(args, "--corrupt") {
-                corrupt_archive(&archive, &kind, &version)?;
-            }
-            archive
-        } else {
-            PathBuf::from(source)
-        };
+        let scratch = bundle_scratch.path();
+        let path = scratch.join(format!("{target_index}.tar.zst"));
+        updated::command_adapter::inspect_package(Path::new(source))?;
+        updated::bundle::create_bundle(Path::new(source), &path, &product, &version, platform)?;
+
+        // Test-only: deliberately damage the just-built archive. It is corrupted *before*
+        // `add_release` hashes it, so the published target is signed for its own broken bytes —
+        // it passes the client's download sha check and fails only at extract/validate. This is
+        // the malformed-but-signed bundle an honest publisher can never emit, used to exercise
+        // the client's ingest-rejection + cold-install-fallback descent. Never used by real releases.
+        if let Some(kind) = flag(args, "--corrupt") {
+            corrupt_archive(&path, &kind, &version)?;
+        }
         targets.push(PublishTarget::application(
-            &product, &channel, &version, os, arch, &component, path,
+            &product, &channel, &version, os, arch, &product, path,
         ));
     }
 
@@ -1380,10 +1306,6 @@ mod tests {
             "products/app".into(),
             "--application-sha256".into(),
             digest.clone(),
-            "--provider-set-path".into(),
-            "provider-sets/set.json".into(),
-            "--provider-set-sha256".into(),
-            digest,
             "--runtime".into(),
             runtime_path.display().to_string(),
         ];

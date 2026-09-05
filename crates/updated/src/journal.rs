@@ -19,11 +19,11 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-/// Both durable transaction shapes carry exactly one bounded provider identity plus fixed-width
+/// Both durable transaction shapes carry exactly one bounded reconciler identity plus fixed-width
 /// release/digest metadata. Keeping their disk ceiling here means adding a new journal cannot
 /// accidentally return to an unbounded read path.
 const JOURNAL_RECORD_MAX_BYTES: usize =
-    crate::state::ProviderRelease::MAX_SERIALIZED_BYTES + 16 * 1024;
+    crate::state::ReconcilerRelease::MAX_SERIALIZED_BYTES + 16 * 1024;
 
 /// A durable transaction record. The prefix is the record's own, so the two journals' interrupted
 /// temp files are distinguishable in a state directory an operator is looking at.

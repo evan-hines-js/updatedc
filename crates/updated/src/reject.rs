@@ -33,6 +33,13 @@ impl Rejections {
         digest_key(hash).is_ok_and(|hash| self.hashes.contains(&hash))
     }
 
+    /// Evidence that may discharge a durable journal obligation. A failed whole-record write
+    /// conservatively withholds this proof until a successful retry, while selection continues
+    /// to suppress every rejection observed by the live process.
+    pub fn is_durably_rejected(&self, hash: &str) -> bool {
+        !self.dirty && self.is_rejected(hash)
+    }
+
     /// Record `hash` as rejected (persisted immediately). Validated on the way in with the
     /// same rule [`Rejections::load`] enforces on the way out: a key that `save` accepts
     /// but `load` refuses would fail every subsequent start, and the rejection record is
@@ -141,25 +148,22 @@ fn load_record(path: &Path) -> std::io::Result<BTreeSet<String>> {
     Ok(hashes)
 }
 
-/// Whether `hash` is a well-formed rejection key: a plain SHA-256 digest (agent
-/// candidates) or `repository-lineage:digest` (application candidates). The single
+/// Whether `hash` is a well-formed `repository-lineage:digest` rejection key. The single
 /// definition of that grammar — callers that must know in advance whether
 /// [`Rejections::reject`] would accept a key ask here rather than restating it.
 pub fn is_rejection_key(hash: &str) -> bool {
-    updated_contracts::is_canonical_sha256(hash)
-        || hash.split_once(':').is_some_and(|(lineage, digest)| {
-            updated_contracts::is_canonical_sha256(lineage)
-                && updated_contracts::is_canonical_sha256(digest)
-        })
+    hash.split_once(':').is_some_and(|(lineage, digest)| {
+        updated_contracts::is_canonical_sha256(lineage)
+            && updated_contracts::is_canonical_sha256(digest)
+    })
 }
 
-/// Validated rejection key. Agent candidates use their plain digest; application
-/// candidates use `repository-lineage:digest`, preventing a rejection in one metadata
+/// Validated rejection key. Every package uses `repository-lineage:digest`, preventing a rejection in one metadata
 /// lineage from poisoning a different lineage that happens to reuse the same bytes.
 fn digest_key(hash: &str) -> Result<String, String> {
     if !is_rejection_key(hash) {
         return Err(format!(
-            "invalid rejection key (expected a SHA-256 digest or lineage:digest, got {} characters)",
+            "invalid rejection key (expected lineage:digest, got {} characters)",
             hash.len()
         ));
     }
@@ -175,6 +179,10 @@ mod tests {
         std::iter::repeat_n(byte, 64).collect()
     }
 
+    fn key(byte: char) -> String {
+        format!("{}:{}", hash('f'), hash(byte))
+    }
+
     fn tmp() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rejected");
@@ -184,7 +192,7 @@ mod tests {
     #[test]
     fn rejects_then_survives_reload() {
         let (_dir, path) = tmp();
-        let digest = hash('2');
+        let digest = key('2');
         let mut r = Rejections::load(&path).unwrap();
         assert!(!r.is_rejected(&digest));
         r.reject(&digest).unwrap();
@@ -193,18 +201,18 @@ mod tests {
         // A fresh load (as after a restart) still remembers it.
         let r2 = Rejections::load(&path).unwrap();
         assert!(r2.is_rejected(&digest), "rejection survives a restart");
-        assert!(!r2.is_rejected(&hash('3')));
+        assert!(!r2.is_rejected(&key('3')));
     }
 
     #[test]
     fn the_durable_record_is_canonical_and_bounded() {
         let (_dir, path) = tmp();
         let mut rejections = Rejections::load(&path).unwrap();
-        rejections.reject(&hash('b')).unwrap();
-        rejections.reject(&hash('a')).unwrap();
+        rejections.reject(&key('b')).unwrap();
+        rejections.reject(&key('a')).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            format!("{}\n{}\n", hash('a'), hash('b'))
+            format!("{}\n{}\n", key('a'), key('b'))
         );
 
         std::fs::write(&path, vec![b'x'; MAX_REJECTION_RECORD_BYTES + 1]).unwrap();
@@ -217,8 +225,8 @@ mod tests {
     #[test]
     fn noncanonical_record_aliases_fail_closed() {
         let (_dir, path) = tmp();
-        let a = hash('a');
-        let b = hash('b');
+        let a = key('a');
+        let b = key('b');
         for body in [
             String::new(),
             a.clone(),
@@ -251,7 +259,7 @@ mod tests {
     #[test]
     fn rejection_is_not_a_retry_timer() {
         let (_dir, path) = tmp();
-        let digest = hash('2');
+        let digest = key('2');
         let mut r = Rejections::load(&path).unwrap();
         r.reject(&digest).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -266,7 +274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("missing-parent");
         let path = parent.join("rejected");
-        let digest = hash('2');
+        let digest = key('2');
         let mut rejections = Rejections::load(&path).unwrap();
 
         assert!(rejections.reject(&digest).is_err());
@@ -275,12 +283,14 @@ mod tests {
             "the process that observed bad bytes must remain fail-closed even when persistence fails"
         );
         assert!(!path.exists());
+        assert!(!rejections.is_durably_rejected(&digest));
 
         std::fs::create_dir(&parent).unwrap();
         rejections
             .reject(&digest)
             .expect("an idempotent retry must finish the failed durable write");
         assert!(Rejections::load(&path).unwrap().is_rejected(&digest));
+        assert!(rejections.is_durably_rejected(&digest));
     }
 
     #[test]
@@ -300,7 +310,7 @@ mod tests {
         // un-restartable crash loop rather than one failed rejection.
         let (_dir, path) = tmp();
         let mut r = Rejections::load(&path).unwrap();
-        for bad in ["", "v2", "2.0.0", &hash('g'), &"a".repeat(63)] {
+        for bad in ["", "v2", "2.0.0", &key('g'), &hash('a'), &"a".repeat(63)] {
             assert_eq!(
                 r.reject(bad).unwrap_err().kind(),
                 std::io::ErrorKind::InvalidInput,
@@ -316,11 +326,11 @@ mod tests {
         let (_dir, path) = tmp();
         let mut r = Rejections::load(&path).unwrap();
         assert_eq!(
-            r.reject(&hash('A')).unwrap_err().kind(),
+            r.reject(&key('A')).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
-        r.reject(&hash('a')).unwrap();
-        assert!(r.is_rejected(&hash('a')));
-        assert!(!r.is_rejected(&hash('A')));
+        r.reject(&key('a')).unwrap();
+        assert!(r.is_rejected(&key('a')));
+        assert!(!r.is_rejected(&key('A')));
     }
 }

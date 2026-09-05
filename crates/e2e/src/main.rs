@@ -3,7 +3,7 @@
 //! End-to-end test / demo. One cross-platform Rust binary — instead of parallel
 //! bash and PowerShell scripts that inevitably drift — that builds the release
 //! binaries, stands up a real TUF repository via the `server`, and drives real
-//! application-update, rollback, agent self-update, crash-recovery, and
+//! application-update, rollback, externally supervised agent restart, crash-recovery, and
 //! TUF/hardening scenarios against them. Platform-specific behaviour lives behind
 //! `#[cfg(...)]`, not in a second script.
 //!
@@ -22,7 +22,6 @@ pub use e2e::fixtures::*;
 pub use e2e::harness::*;
 use scenarios::*;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -44,8 +43,10 @@ type Scenario = (&'static str, fn(&Ctx) -> R);
 
 fn scenarios() -> Vec<Scenario> {
     let mut s: Vec<Scenario> = vec![
+        ("an update that becomes unhealthy during confirmation is rolled back", unhealthy_unconfirmed_release_rolls_back),
+        ("routine convergence runs health gates even when its cadence is shorter than the grace", routine_convergence_keeps_running_health_gates),
         (
-            "the release's apply hook upgrades the workload v1->v2, and a broken v3 is rolled back",
+            "the reconciler converges the workload v1->v2, and a broken v3 is rolled back",
             app_update_and_rollback,
         ),
         (
@@ -53,7 +54,7 @@ fn scenarios() -> Vec<Scenario> {
             zero_downtime_upgrade,
         ),
         (
-            "a cold node installs its first application and the release's apply hook starts it",
+            "a cold node installs its first payload and the reconciler starts it",
             cold_install_applies_the_first_release,
         ),
         (
@@ -69,7 +70,7 @@ fn scenarios() -> Vec<Scenario> {
             chaotic_application_health_failures,
         ),
         (
-            "a stateless cold node descends past an assigned head whose apply hook fails, to the newest healthy release",
+            "a stateless cold node descends past an assigned head whose converge fails, to the newest healthy release",
             cold_install_descends_past_broken_head,
         ),
         (
@@ -97,10 +98,10 @@ fn scenarios() -> Vec<Scenario> {
             "a health-check-failed release stays rejected across a restart",
             persisted_rejection,
         ),
-        ("a reconciler apply failure rolls back", provider_apply_failure),
+        ("a reconciler converge failure rolls back", provider_converge_failure),
         (
-            "an interrupted apply is compensated under its own attempt id and lands exactly once",
-            apply_replay_converges_exactly_once,
+            "an interrupted converge is compensated under its own attempt id and lands exactly once",
+            converge_replay_converges_exactly_once,
         ),
         ("a reconciler healthcheck failure rolls back", provider_healthcheck_failure),
         ("a reconciler rollback failure remains recoverable", provider_rollback_failure),
@@ -118,20 +119,8 @@ fn scenarios() -> Vec<Scenario> {
             migration_shaped_failed_migration_rolls_back,
         ),
         (
-            "an agent crash never disturbs the hook-managed workload; the launcher relaunches the agent",
+            "an agent crash never disturbs the hook-managed workload; the service restarts the agent",
             agent_crash_never_disturbs_the_workload,
-        ),
-        (
-            "the agent self-updates by pointer flip; the hook-managed workload is untouched",
-            agent_self_update,
-        ),
-        (
-            "an unlaunchable agent candidate is rolled back, rejected, and never retried",
-            agent_self_update_rollback,
-        ),
-        (
-            "a ready agent that crashes during confirmation is rolled back without disturbing the workload",
-            agent_post_ready_crash_rolls_back,
         ),
     ];
     // Unix-only mechanisms (file modes; a shell entrypoint for the never-healthy head).
@@ -143,7 +132,7 @@ fn scenarios() -> Vec<Scenario> {
             lifecycle_healthcheck_gates_readiness,
         ));
         s.push((
-            "a stateless cold node stops and descends past assigned heads that apply but never become healthy",
+            "a stateless cold node stops and descends past assigned heads that converge but never become healthy",
             cold_install_descends_past_unhealthy_head,
         ));
     }
@@ -162,8 +151,8 @@ fn scenarios() -> Vec<Scenario> {
         rollback_chaos_recovery,
     ));
     s.push((
-        "a reboot mid-rollback still converges the restored predecessor",
-        a_reboot_mid_rollback_still_converges_the_predecessor,
+        "a reboot mid-rollback holds when restored predecessor health is lost",
+        a_reboot_mid_rollback_holds_when_predecessor_health_is_lost,
     ));
     s
 }
@@ -180,11 +169,6 @@ fn run_suite() -> R {
             "sample app binaries differ; release identity must come only from bundle config",
         );
     }
-    // Two distinguishable agent builds for the self-update scenarios.
-    ctx.build_agent("1.0.0")?;
-    ctx.build_agent("2.0.0")?;
-    ctx.build_post_ready_crashing_agent("2.0.0")?;
-
     // Every scenario owns a unique working dir and unique ports, so they are safe to
     // run concurrently on a bounded worker pool. They are blocking process work
     // (spawn, poll HTTP, sleep), not async I/O, so plain threads fit; an async runtime

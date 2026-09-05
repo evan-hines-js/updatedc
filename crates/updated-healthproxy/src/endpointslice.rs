@@ -300,7 +300,7 @@ impl NameResolver {
                 ),
             }
         }
-        // Drop names that left the inventory, the same discipline `run` applies to the caches it
+        // Drop names that left the inventory, the same discipline `run` converges to the caches it
         // owns. [`LastKnownGood`] ages a key out only when that key is looked up again — and a
         // hostname removed from the projected inventory is never passed to `resolve` again, so
         // without this its entry outlives the member forever and ordinary VM recycling grows this

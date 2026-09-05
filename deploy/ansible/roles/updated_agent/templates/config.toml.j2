@@ -1,11 +1,11 @@
-# Managed by the updated_agent Ansible role. The launcher reads this canonical path; it holds only
-# paths and a name — no secret. Enrollment happens once: after enrollment.json exists in launcher
+# Managed by the updated_agent Ansible role. The agent reads this canonical path; it holds only
+# paths and a name — no secret. Enrollment happens once: after enrollment.json exists in agent
 # state it is never retried, so editing this file does not re-enroll an established node.
 #
 # The annotated reference copy of this document — same keys, same mTLS paths, placeholder values —
 # is packaging/etc/config.toml, the conffile the .deb/.rpm ship. It cannot be templated directly
 # (a conffile cannot carry Jinja), so keep the key set here in step with it. Drift is loud, not
-# silent: the launcher refuses to parse an unknown or missing enrollment key at first boot.
+# silent: the agent refuses to parse an unknown or missing enrollment key at first boot.
 [enrollment]
 url = {{ updated_enrollment_url | to_json }}
 # This node's self-asserted enrollment name — the gateway mints it as the leaf certificate's CN and

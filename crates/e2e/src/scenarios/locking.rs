@@ -10,11 +10,11 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
 
-    let mut first_cmd = Node::new(ctx, &dir, srv, "app")
+    let first_cmd = Node::new(ctx, &dir, srv, "app")
         .health_grace("2s")
         .workload(svc)
-        .launcher()?;
-    let first = Proc::spawn("agent-1", &mut first_cmd)?;
+        .command()?;
+    let first = Proc::spawn("agent-1", first_cmd)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("the first agent never converged its release");
     }
@@ -30,7 +30,7 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     let second_cmd = Node::new(ctx, &dir, srv, "app")
         .health_grace("2s")
         .workload(svc)
-        .launcher()?;
+        .command()?;
     let second = Service::spawn("agent-2", &second_cmd);
     if !second.wait_for_log("already owns this install", EVENT_TIMEOUT) {
         return fail("the second agent was not refused with the expected lock message");
@@ -39,7 +39,7 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     // The refused agent must die on the instance lock before it boot-converges. The owner keeps
     // recording its own steady-state observations while we watch, so the assertion is not "the log
     // never grew" — it is that nothing a REFUSED agent would produce appears: its first invocation
-    // would be the boot converge's `apply`, and everything the owner legitimately appends in steady
+    // would be the boot converge's `converge`, and everything the owner legitimately appends in steady
     // state is a reserved-identity observation.
     let only_owner_observations = fixture::operations(&fixture::root(&dir))[operations..]
         .iter()

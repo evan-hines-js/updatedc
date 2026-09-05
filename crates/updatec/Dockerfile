@@ -21,11 +21,26 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+# Install the workspace-pinned toolchain in its own cacheable layer. The image only builds release
+# binaries, so it needs the minimal compiler profile rather than the rustfmt and clippy components
+# requested by developer workstations. Large component downloads can be interrupted by a registry
+# or proxy closing a TLS connection without close_notify; retry them before rebuilding anything.
+RUN toolchain="$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" && \
+    test -n "$toolchain" && \
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do \
+        RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER" RUSTUP_USE_CURL=1 \
+            rustup toolchain install "$toolchain" --profile minimal --no-self-update && exit 0; \
+        echo "rustup toolchain download failed (attempt $attempt of 10); retrying" >&2; \
+        sleep 2; \
+    done; \
+    exit 1
 COPY .cargo ./.cargo
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p updatec -p server && \
+    toolchain="$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" && \
+    rustup run "$toolchain" cargo build --release -p updatec -p server && \
     cp /src/target/release/updatec /tmp/updatec && \
     cp /src/target/release/server /tmp/server
 

@@ -17,10 +17,10 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
             .check_interval("1s")
             .health_grace("1s")
             .workload(svc)
-            .launcher()
+            .command()
     };
 
-    // Run 1: apply the broken v2. Its health gate fails, the transaction leaves a durable rollback
+    // Run 1: converge the broken v2. Its health gate fails, the transaction leaves a durable rollback
     // journal and ends the disposable agent; the init system relaunches the stack and boot recovery
     // rejects v2 and restores v1 — persisting the rejection so the failed bytes are never
     // re-applied.

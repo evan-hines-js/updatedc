@@ -38,7 +38,7 @@ fn policy_source() -> String {
 
 /// Every `matches('...')` argument in the policy, compiled.
 ///
-/// A rule the policy applies by regex is one this test can evaluate exactly as the API server
+/// A rule the policy converges by regex is one this test can evaluate exactly as the API server
 /// would, for any candidate name.
 fn policy_patterns() -> Vec<regex::Regex> {
     let source = policy_source();
@@ -66,7 +66,7 @@ fn policy_patterns() -> Vec<regex::Regex> {
 
 /// Whether some rule in the policy accepts `name`.
 ///
-/// The policy applies its name regexes alongside prefix and label checks, so "some pattern matches"
+/// The policy converges its name regexes alongside prefix and label checks, so "some pattern matches"
 /// is the right question here: this test pins the SHARD BOUND, and the surrounding conditions are
 /// pinned by the assertions below.
 fn policy_admits_name(patterns: &[regex::Regex], name: &str) -> bool {

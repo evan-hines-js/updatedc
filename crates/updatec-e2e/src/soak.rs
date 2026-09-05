@@ -624,7 +624,6 @@ fn metric(output: &mut String, name: &str, value: impl std::fmt::Display) {
 struct ReleaseCatalog {
     platform: String,
     root_json: String,
-    provider_sha: String,
     release_data: PathBuf,
 }
 
@@ -648,13 +647,11 @@ impl ReleaseCatalog {
         let root_json = String::from_utf8(
             updated_tuf::repo::root_bytes(&config.release_data.join("repository")).await?,
         )?;
-        let mut catalog = Self {
+        let catalog = Self {
             platform,
             root_json,
-            provider_sha: String::new(),
             release_data: config.release_data.clone(),
         };
-        catalog.provider_sha = catalog.target_sha("provider-sets/default.json").await?;
         catalog
             .app_sha(BASELINE_VERSION)
             .await
@@ -683,14 +680,7 @@ impl ReleaseCatalog {
     }
 
     fn deployment(&self, group: &str, version: &str, sha: &str) -> DeploymentSpec {
-        fixture::deployment(
-            group,
-            version,
-            &self.platform,
-            sha,
-            &self.provider_sha,
-            &self.root_json,
-        )
+        fixture::deployment(group, version, &self.platform, sha, &self.root_json)
     }
 
     async fn ensure_candidate(
@@ -738,8 +728,6 @@ impl ReleaseCatalog {
             "stable".into(),
             "--version".into(),
             version.clone(),
-            "--entrypoint".into(),
-            "bin/app".into(),
             "--bundle".into(),
             format!("{}={}", self.platform, source.display()),
         ])

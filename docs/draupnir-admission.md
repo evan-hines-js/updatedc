@@ -6,7 +6,7 @@ per-group overrides, separate event stream, or hash allow-list mode.
 
 The controller sends Draupnir the complete set of active release subjects. That includes desired
 group and default deployments and every retained deployment that a node may still be running. A
-subject currently consists of the application SHA-256 and provider-set SHA-256. Its `id` is the
+subject currently consists of the package SHA-256. Its `id` is the
 SHA-256 of those canonical, versioned facts—not of a display name or mutable URL.
 
 The request is both notification and query. updatedc sends it immediately when it encounters a
@@ -48,8 +48,7 @@ decision has no safe reading.
   "subjects": [
     {
       "id": "<sha256-of-canonical-subject>",
-      "applicationSha256": "<64-hex-sha256>",
-      "providerSetSha256": "<64-hex-sha256>"
+      "applicationSha256": "<64-hex-sha256>"
     }
   ]
 }

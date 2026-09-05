@@ -4,16 +4,49 @@
 # Download this script from an immutable `build-<commit>` release and verify its GitHub provenance
 # before running it as root. The exact bootstrap commands are in docs/agent-install.md.
 #
-# This script runs ONCE per node. It places the installer-owned launcher, the first agent, the
-# service definition, and the node's enrollment config — and then it is finished. Every later agent
-# version and every workload arrives through the fleet's own signed TUF channel, verified against
-# the pinned root, which is the entire point of the system. Re-running this script to "upgrade" a
-# node is not the upgrade path; the only reason to run it again is to move the LAUNCHER, which is
-# installer-owned by design and deliberately never updates itself.
+# This script places the installer-owned agent, the
+# service definition, and the node's enrollment config. The host installer owns agent upgrades;
+# signed TUF assignments manage workloads. Native crypto dependencies travel with the agent.
 #
 # What it downloads is the immutable, attested build CI published: a per-platform archive plus
 # SHA256SUMS, both verified before anything is written outside the work directory.
 set -euo pipefail
+
+# Shared by bootstrap and the artifact regression tests. Sourcing this file only exposes the
+# validator; it never prepares identity, downloads files, or touches a host installation.
+fail() { printf '[updated] error: %s\n' "$*" >&2; exit 1; }
+validate_archive() {
+  local archive="$1" platform="$2" unit="$3"
+  local archive_members archive_headers archive_header member required_members
+  native_libraries=()
+  archive_members="$(tar -tzf "$archive")" \
+    || fail "could not list $archive"
+  [ "$(printf '%s\n' "$archive_members" | sort | uniq -d)" = "" ] \
+    || fail "$archive contains duplicate paths"
+  required_members=0
+  while IFS= read -r member; do
+    case "$member" in
+      updated-agent|"$unit") required_members=$((required_members + 1)) ;;
+      libaws_lc_fips_*_crypto.dylib|libaws_lc_fips_*_rust_wrapper.dylib)
+        [ "$platform" = Darwin ] || fail "unexpected native library in $archive"
+        case "$member" in *[!a-zA-Z0-9_.-]*) fail "unsafe native library path in $archive" ;; esac
+        native_libraries+=("$member")
+        [ "${#native_libraries[@]}" -le 8 ] || fail "too many native libraries in $archive"
+        ;;
+      *) fail "$archive contains unexpected paths; refusing to extract it as root" ;;
+    esac
+  done <<<"$archive_members"
+  [ "$required_members" -eq 2 ] || fail "$archive is missing its agent or service definition"
+  archive_headers="$(tar -tvzf "$archive")" \
+    || fail "could not inspect $archive member types"
+  while IFS= read -r archive_header; do
+    case "$archive_header" in
+      -*) ;;
+      *) fail "$archive contains a non-regular member; refusing to extract it as root" ;;
+    esac
+  done <<<"$archive_headers"
+}
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return; fi
 
 DEFAULT_REPO="evan-hines-js/updatedc"
 
@@ -73,7 +106,6 @@ EOF
 
 log()  { printf '[updated] %s\n' "$*"; }
 warn() { printf '[updated] warning: %s\n' "$*" >&2; }
-fail() { printf '[updated] error: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
   local status=$?
@@ -302,24 +334,9 @@ awk -v want="${PACKAGE_FILE:-$ARCHIVE}" '$2 == want' "$WORK/SHA256SUMS" >"$WORK/
   || fail "checksum mismatch on ${PACKAGE_FILE:-$ARCHIVE}; refusing to install"
 log "verified ${PACKAGE_FILE:-$ARCHIVE} against SHA256SUMS"
 
-# This release archive has an intentionally tiny, exact shape. Validate the member names before
-# extracting as root: checksumming an archive proves which bytes arrived, but it does not make a
-# `../` or absolute member safe to unpack. Exact comparison also rejects extra files, links under
-# nested paths, duplicate names, and control characters.
+native_libraries=()
 if [ -z "$PACKAGE_KIND" ]; then
-  archive_members="$(tar -tzf "$WORK/$ARCHIVE")" \
-    || fail "could not list $ARCHIVE"
-  expected_archive_members="$(printf '%s\n' updated-launcher updated-agent "$UNIT_FILE")"
-  [ "$archive_members" = "$expected_archive_members" ] \
-    || fail "$ARCHIVE contains unexpected paths; refusing to extract it as root"
-  archive_headers="$(tar -tvzf "$WORK/$ARCHIVE")" \
-    || fail "could not inspect $ARCHIVE member types"
-  while IFS= read -r archive_header; do
-    case "$archive_header" in
-      -*) ;;
-      *) fail "$ARCHIVE contains a non-regular member; refusing to extract it as root" ;;
-    esac
-  done <<<"$archive_headers"
+  validate_archive "$WORK/$ARCHIVE" "$OS" "$UNIT_FILE"
 fi
 
 # ── Install ──────────────────────────────────────────────────────────────────
@@ -357,7 +374,8 @@ install_archive() {
   local extract="$WORK/archive"
   mkdir -p "$extract"
   tar -C "$extract" -xzf "$WORK/$ARCHIVE"
-  for binary in updated-launcher updated-agent; do
+  # Install dependencies before the executable that needs them on its very first launch.
+  for binary in "${native_libraries[@]}" updated-agent; do
     [ -f "$extract/$binary" ] && [ ! -L "$extract/$binary" ] \
       || fail "$ARCHIVE did not contain a regular $binary"
     install -m 0755 "$extract/$binary" "$BIN_DIR/$binary"
@@ -386,15 +404,15 @@ fi
 # packaging/etc/config.toml, the conffile the .deb/.rpm install and the file docs point operators
 # at; the Ansible role templates the same document from its own variables. Keep the key set and the
 # /etc/updated/agent-tls layout below in step with that file. A key that drifts does not fail
-# quietly: the launcher's enrollment config is strict and refuses to parse an unknown or missing
+# quietly: the agent's enrollment config is strict and refuses to parse an unknown or missing
 # one at first boot.
 mkdir -p "$CONFIG_DIR" "$TLS_DIR"
 if [ "$CONFIGURE" = 1 ]; then
   log "writing $CONFIG_DIR/config.toml"
   cat >"$CONFIG_DIR/config.toml" <<EOF
-# Written by install.sh. The launcher reads this canonical path; it holds only paths and a name.
+# Written by install.sh. The agent reads this canonical path; it holds only paths and a name.
 # The annotated reference copy of this document is packaging/etc/config.toml.
-# Enrollment happens once — after enrollment.json exists in launcher state it is never retried.
+# Enrollment happens once — after enrollment.json exists in agent state it is never retried.
 [enrollment]
 url = "$GATEWAY_URL"
 name = "$NODE_NAME"
@@ -425,7 +443,7 @@ if [ "$OS" = Linux ]; then
     systemctl daemon-reload
     SERVICE_READY=1
   else
-    warn "systemd is not present; register $BIN_DIR/updated-launcher with this host's init system"
+    warn "systemd is not present; register $BIN_DIR/updated-agent with this host's init system and set UPDATED_STATE_DIR=$STATE_DIR"
   fi
 else
   SERVICE_READY=1
@@ -460,7 +478,6 @@ cat <<EOF
   config     $CONFIG_DIR/config.toml
   identity   $TLS_DIR
 
-This installer's job is done. The node enrolls with $GATEWAY_URL, and from here every agent
-version and every workload arrives through the fleet's signed TUF channel, verified against the
-pinned root. Do not re-run this script to upgrade the agent — publish to the channel instead.
+The node enrolls with $GATEWAY_URL. Signed TUF assignments manage workloads; upgrade the agent
+and its bundled native dependencies through this installer or the host's package manager.
 EOF

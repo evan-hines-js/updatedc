@@ -20,19 +20,9 @@ pub(crate) enum Command {
     /// co-signed new root version. Existing devices follow the chain automatically.
     RotateRoot(RotateRootArgs),
     /// Build, sign, and publish an application bundle, then roll a named UpdateGroup onto it.
-    Deploy(DeployArgs),
-    /// Build, sign, and publish a lifecycle-provider artifact bundle as
-    /// a signed target. Like `deploy` but publishes only the target — no group is rolled. A
-    /// provider set then references the resulting `path`+`sha256`.
-    PublishProviderArtifact(ProviderArtifactArgs),
-    /// Check a release's node reconciler against the published protocol: replay tolerance,
-    /// observation purity, fingerprint stability, and the two refusals. Runs the hook against a
-    /// scratch install root; needs no repository, keys, or Kubernetes access.
-    ReconcilerCheck(reconciler_check::ReconcilerCheckArgs),
-    /// Sign and publish an immutable provider set (`provider-sets/<id>.json`) as a target,
-    /// binding the required lifecycle provider artifact by path+sha256. This is the
-    /// S3-native counterpart of `server publish-provider-set`.
-    PublishProviderSet(ProviderSetArgs),
+    Deploy(Box<DeployArgs>),
+    /// Validate a package and entrypoint; optionally run against an isolated predecessor fixture.
+    Check(crate::package::CheckArgs),
     /// Print the canonical public-key pin for an operator-provisioned node private key.
     NodePublicKey(NodePublicKeyArgs),
 }
@@ -125,6 +115,8 @@ pub(crate) struct RotateRootArgs {
 #[derive(Args, Debug)]
 pub(crate) struct DeployArgs {
     #[command(flatten)]
+    pub(crate) procedure: crate::package::ProcedureArgs,
+    #[command(flatten)]
     pub(crate) backend: Backend,
 
     /// Namespace holding the UpdateGroup.
@@ -147,38 +139,13 @@ pub(crate) struct DeployArgs {
     #[arg(long, env = "UPDATECTL_VERSION")]
     pub(crate) version: String,
 
-    /// Bundle-relative path of the launched executable (e.g. `bin/app`).
-    #[arg(long, env = "UPDATECTL_ENTRYPOINT")]
-    pub(crate) entrypoint: String,
-
-    /// Source to publish: a prepared directory tree, or a single executable file that is
-    /// wrapped into a one-file bundle at `--entrypoint`.
+    /// Package directory containing the entrypoint and its files.
     #[arg(long, env = "UPDATECTL_SOURCE")]
     pub(crate) source: PathBuf,
 
-    /// Target platform `<os>-<arch>`. Defaults to the host's `linux-<arch>`.
+    /// Target platform `<os>-<arch>`. Defaults to the host platform.
     #[arg(long, env = "UPDATECTL_PLATFORM")]
     pub(crate) platform: Option<String>,
-
-    /// Target path of the provider set this release ships with. When set (together with
-    /// `--provider-set-sha256`), it is signed into the app target's custom metadata, so an
-    /// cold-install-fallback descent to this version re-selects exactly these providers — app and
-    /// providers roll back as one unit. Omit to leave provider selection to the assignment head.
-    #[arg(
-        long,
-        env = "UPDATECTL_PROVIDER_SET_PATH",
-        requires = "provider_set_sha256"
-    )]
-    pub(crate) provider_set_path: Option<String>,
-
-    /// sha256 of the provider set named by `--provider-set-path`.
-    #[arg(
-        long,
-        env = "UPDATECTL_PROVIDER_SET_SHA256",
-        requires = "provider_set_path",
-        value_parser = canonical_sha256
-    )]
-    pub(crate) provider_set_sha256: Option<String>,
 
     /// Days until the re-signed TUF metadata expires.
     #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
@@ -201,81 +168,8 @@ pub(crate) struct DeployArgs {
     pub(crate) output: OutputFormat,
 }
 
-#[derive(Args, Debug)]
-pub(crate) struct ProviderArtifactArgs {
-    #[command(flatten)]
-    pub(crate) backend: Backend,
-
-    /// Product name; also the bundle target's component segment. The published target is
-    /// `products/<product>/<channel>/<version>/<platform>/<product>`.
-    #[arg(long, env = "UPDATECTL_PRODUCT")]
-    pub(crate) product: String,
-
-    /// Release channel.
-    #[arg(long, env = "UPDATECTL_CHANNEL", default_value = "stable")]
-    pub(crate) channel: String,
-
-    /// Semantic version of this provider artifact.
-    #[arg(long, env = "UPDATECTL_VERSION")]
-    pub(crate) version: String,
-
-    /// Bundle-relative path of the provider executable (e.g. `bin/lifecycle`).
-    #[arg(long, env = "UPDATECTL_ENTRYPOINT")]
-    pub(crate) entrypoint: String,
-
-    /// Source to publish: a prepared directory tree, or a single executable file that is
-    /// wrapped into a one-file bundle at `--entrypoint`.
-    #[arg(long, env = "UPDATECTL_SOURCE")]
-    pub(crate) source: PathBuf,
-
-    /// Target platform `<os>-<arch>`. Defaults to the host's `linux-<arch>`.
-    #[arg(long, env = "UPDATECTL_PLATFORM")]
-    pub(crate) platform: Option<String>,
-
-    /// Days until the re-signed TUF metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    pub(crate) expiry_days: i64,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct ProviderSetArgs {
-    #[command(flatten)]
-    pub(crate) backend: Backend,
-
-    /// Provider set id; the published target is `provider-sets/<id>.json`.
-    #[arg(long, env = "UPDATECTL_PROVIDER_SET_ID")]
-    pub(crate) id: String,
-
-    /// Lifecycle provider artifact target path (from `publish-provider-artifact`).
-    #[arg(long)]
-    pub(crate) provider_path: String,
-
-    /// sha256 of the lifecycle provider artifact.
-    #[arg(long, value_parser = canonical_sha256)]
-    pub(crate) provider_sha256: String,
-
-    /// Extra argument passed to the lifecycle provider (repeatable).
-    #[arg(long)]
-    pub(crate) provider_arg: Vec<String>,
-
-    /// Lifecycle provider timeout, milliseconds.
-    #[arg(long, default_value_t = 300_000)]
-    pub(crate) provider_timeout_ms: u64,
-
-    /// Days until the re-signed TUF metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    pub(crate) expiry_days: i64,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum OutputFormat {
     Text,
     Json,
-}
-
-/// Refuse a non-canonical digest where the operator typed it, through the same grammar the wire
-/// format and the object store use. `clap` names the offending flag, so the message says only what
-/// was wrong with the value.
-fn canonical_sha256(value: &str) -> Result<String, String> {
-    updated_contracts::digest::parse_canonical_sha256(value)
 }

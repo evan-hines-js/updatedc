@@ -1,8 +1,7 @@
 //! Guard: the agent must not re-inline process-tree containment primitives. Spawning
 //! a child as a killable tree (Unix process group / Windows job object) is a platform
 //! mechanism that belongs in `foundation::process`, not copied into the lifecycle-hook
-//! runner. This test reads the source so the rule cannot erode unnoticed — the way
-//! `launcher` guards its dependency isolation.
+//! runner. This test reads the source so the rule cannot erode unnoticed.
 //!
 //! The needles live here (a different file) than the source under inspection, so this
 //! test's own literals never self-match.

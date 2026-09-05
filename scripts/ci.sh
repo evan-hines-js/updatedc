@@ -194,7 +194,7 @@ run_rust() {
   section "Windows cross-lint"
   if rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-msvc$'; then
     cargo clippy --target x86_64-pc-windows-msvc \
-      -p foundation -p control -p launcher -p windows-service \
+      -p foundation -p windows-service \
       --all-targets --all-features --no-deps -- -D warnings
     echo "ok: the Windows-only paths lint clean"
   else
@@ -371,7 +371,7 @@ prepare = next(container for container in pod["initContainers"] if container["na
 runtime_uid = runtime["securityContext"]["runAsUser"]
 assert f"uid={runtime_uid}" in prepare["args"][0], prepare["args"]
 assert 'chown -R "$uid:$uid" /var/lib/updated' in prepare["args"][0], prepare["args"]
-assert "chmod 0600 /var/lib/updated/launcher/agent.key" in prepare["args"][0], prepare["args"]
+assert "chmod 0600 /var/lib/updated/state/agent.key" in prepare["args"][0], prepare["args"]
 assert "chmod 0400 /prepared-tls/ca.crt /prepared-tls/tls.crt /prepared-tls/tls.key" in prepare["args"][0], prepare["args"]
 volumes = {volume["name"]: volume for volume in pod["volumes"]}
 assert volumes["agent-tls-source"]["secret"]["secretName"] == "agent-tls", volumes
@@ -886,6 +886,8 @@ run_haproxy() {
     return
   fi
   ./scripts/linux-haproxy-e2e.sh
+  section "Linux Jenkins snapshot and recovery ordering"
+  bash ./scripts/linux-jenkins-recovery-test.sh
 }
 
 run_kind() {

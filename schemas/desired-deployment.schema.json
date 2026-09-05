@@ -12,12 +12,13 @@
     "targetsUrl",
     "application",
     "coldInstallFallback",
-    "providerSet",
     "releaseRoot",
     "runtime"
   ],
   "properties": {
-    "schema": { "const": 4 },
+    "schema": {
+      "const": 5
+    },
     "deployment": {
       "description": "Bounded deployment identity copied into status and telemetry: 1-128 characters of lowercase ASCII letters, digits, dot, underscore, or dash, beginning and ending with a letter or digit. Uppercase is refused so one identity cannot become two on a case-folding filesystem, and reserved Windows device stems (con, prn, aux, nul, com1-9, lpt1-9), alone or with an extension, are excluded.",
       "type": "string",
@@ -42,20 +43,26 @@
       "description": "Only when no release has ever been installed, allow descent through signed repository history if the exact assigned head is unusable. This is never an update or rollback policy.",
       "type": "boolean"
     },
-    "providerSet": {
-      "$ref": "https://updated.dev/schemas/target-reference.schema.json"
-    },
     "releaseRoot": {
       "description": "The pinned TUF root metadata of the release repository, embedded verbatim as a signed `{signed, signatures}` envelope. Validation requires a JSON object.",
       "type": "object"
     },
-    "runtime": { "$ref": "#/$defs/runtime" }
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    }
   },
   "$defs": {
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["product", "channel", "installRoot", "repository", "storage", "timeouts"],
+      "required": [
+        "product",
+        "channel",
+        "installRoot",
+        "repository",
+        "storage",
+        "timeouts"
+      ],
       "properties": {
         "product": {
           "description": "The bounded product identity used as a target-layout and directory segment: 1-128 characters of lowercase ASCII letters, digits, dot, underscore, or dash, beginning and ending with a letter or digit. Uppercase and reserved Windows device stems are excluded, because this value becomes a directory name.",
@@ -79,16 +86,26 @@
         "inputs": {
           "$ref": "#/$defs/input_selection"
         },
-        "repository": { "$ref": "#/$defs/repository_limits" },
-        "storage": { "$ref": "#/$defs/storage" },
-        "timeouts": { "$ref": "#/$defs/timeouts" }
+        "repository": {
+          "$ref": "#/$defs/repository_limits"
+        },
+        "storage": {
+          "$ref": "#/$defs/storage"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/timeouts"
+        }
       }
     },
     "input_selection": {
       "description": "A non-secret descriptor for the atomic input snapshot the node fetches over its authenticated dataflow connection.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["generation", "object_sha256", "files"],
+      "required": [
+        "generation",
+        "object_sha256",
+        "files"
+      ],
       "properties": {
         "generation": {
           "description": "Controller-keyed opaque snapshot generation; never a raw content digest.",
@@ -116,7 +133,11 @@
     "repository_limits": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["metadataLimit", "targetLimit", "transportTimeoutSeconds"],
+      "required": [
+        "metadataLimit",
+        "targetLimit",
+        "transportTimeoutSeconds"
+      ],
       "properties": {
         "metadataLimit": {
           "description": "Maximum bytes buffered for any one TUF metadata document.",
@@ -142,21 +163,11 @@
       "additionalProperties": false,
       "required": [
         "inactiveReleases",
-        "inactiveProviders",
-        "inactiveAgents",
         "inactiveBytes",
         "inactiveRepositoryCaches"
       ],
       "properties": {
         "inactiveReleases": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "inactiveProviders": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "inactiveAgents": {
           "type": "integer",
           "minimum": 0
         },
@@ -180,8 +191,7 @@
         "healthSuccesses",
         "healthIntervalSeconds",
         "refreshRetrySeconds",
-        "confirmationWindowSeconds",
-        "agentCheckIntervalSeconds"
+        "confirmationWindowSeconds"
       ],
       "properties": {
         "checkIntervalSeconds": {
@@ -212,11 +222,6 @@
           "maximum": 2592000
         },
         "confirmationWindowSeconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2592000
-        },
-        "agentCheckIntervalSeconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000

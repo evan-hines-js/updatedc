@@ -20,7 +20,7 @@
 //!   target into the S3 repository, then patches the named `UpdateGroup` to reference the
 //!   new target. It touches Kubernetes only to patch that one resource.
 //!
-//! * `reconciler-check` is the pre-publication conformance harness for the one cross-organization
+//! * `check` is the pre-publication conformance harness for the one cross-organization
 //!   surface in the system: it runs a release's own node reconciler against a scratch install root
 //!   through the published argv grammar and checks the properties the agent cannot enforce —
 //!   replay tolerance, observation purity, fingerprint stability, and the two refusals. It touches
@@ -49,15 +49,14 @@ use std::sync::Arc;
 mod cli;
 mod deploy;
 mod keys;
-mod publish;
-mod reconciler_check;
+mod package;
+mod package_check;
 mod repository;
 mod root;
 
 use cli::*;
 use deploy::*;
 use keys::*;
-use publish::*;
 use repository::*;
 use root::*;
 
@@ -96,20 +95,31 @@ fn role_key_names(dir: &Path) -> Result<Vec<String>, Error> {
         .collect()
 }
 
+pub(crate) fn main() -> std::process::ExitCode {
+    if let Some(code) =
+        updated::command_adapter::control_dispatch().or_else(updated::command_adapter::dispatch)
+    {
+        return code;
+    }
+    if let Some(code) = updated::helper::dispatch() {
+        return code;
+    }
+    run_main()
+}
+
 #[tokio::main]
-pub(crate) async fn main() -> std::process::ExitCode {
+async fn run_main() -> std::process::ExitCode {
     // The kube client and S3 store both drive rustls; install the workspace's one provider.
     updated::tls::install_crypto_provider();
     let result = match Cli::parse().command {
         Command::TrustRoot(args) => trust_root(args).await,
         Command::RotateRoot(args) => rotate_root(args).await,
-        Command::Deploy(args) => deploy(args).await,
-        Command::PublishProviderArtifact(args) => publish_provider_artifact(args).await,
-        Command::PublishProviderSet(args) => publish_provider_set(args).await,
+        Command::Deploy(args) => deploy(*args).await,
+        Command::Check(args) => package::check(args),
+
         Command::NodePublicKey(args) => print_node_public_key(args),
         // Local and synchronous: it drives child processes against a scratch directory and touches
         // no repository at all.
-        Command::ReconcilerCheck(args) => reconciler_check::reconciler_check(args),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -172,18 +182,6 @@ mod tests {
         }
     }
 
-    fn provider_set_args() -> ProviderSetArgs {
-        ProviderSetArgs {
-            backend: backend("releases/app"),
-            id: "web-linux-v4".into(),
-            provider_path: "providers/lifecycle/1.0.0/linux-x86_64/lifecycle".into(),
-            provider_sha256: "a".repeat(64),
-            provider_arg: Vec::new(),
-            provider_timeout_ms: 300_000,
-            expiry_days: 365,
-        }
-    }
-
     #[test]
     fn manual_node_pin_uses_the_online_enrollment_encoding() {
         let (guard, dir) = scratch("node-key");
@@ -195,130 +193,6 @@ mod tests {
         let expected = updatec::join::csr_public_key(&csr).unwrap().to_hex();
         assert_eq!(node_public_key(&path).unwrap(), expected);
         drop(guard);
-    }
-
-    /// A published provider set is an immutable signed target. Every flag combination the agent's
-    /// own `validate` rejects must be refused here, before signing — a set that no node can accept
-    /// cannot be repaired, only superseded under a new id.
-    #[test]
-    fn a_provider_set_is_held_to_the_agents_validation_before_it_is_signed() {
-        let set = provider_set(&provider_set_args()).unwrap();
-        assert_eq!(
-            set.reconciler.artifact.sha256,
-            "a".repeat(64),
-            "the canonical digest is preserved exactly"
-        );
-
-        let cases = [
-            ("timeout", {
-                let mut args = provider_set_args();
-                args.provider_timeout_ms = 0;
-                args
-            }),
-            ("id", {
-                let mut args = provider_set_args();
-                args.id = "web linux".into();
-                args
-            }),
-            ("artifact reference", {
-                let mut args = provider_set_args();
-                args.provider_path = "../escape".into();
-                args
-            }),
-            ("artifact reference", {
-                let mut args = provider_set_args();
-                args.provider_sha256 = "not-a-digest".into();
-                args
-            }),
-            ("artifact reference", {
-                let mut args = provider_set_args();
-                args.provider_sha256 = "A".repeat(64);
-                args
-            }),
-            ("arguments", {
-                let mut args = provider_set_args();
-                args.provider_arg = vec!["--flag".into(); 257];
-                args
-            }),
-        ];
-        for (expected, args) in cases {
-            let error = provider_set(&args)
-                .err()
-                .unwrap_or_else(|| panic!("{expected}: expected a rejection"))
-                .to_string();
-            assert!(error.contains(expected), "{error}");
-            assert!(
-                error.contains("nothing was signed"),
-                "the operator is told the repository is untouched: {error}"
-            );
-        }
-    }
-
-    /// A published provider set is immutable, and its reconciler reference is only ever resolved
-    /// much later, on a node, by `stage_providers` — where a well-formed but unresolvable reference
-    /// (a stale digest paired with a fresh path) stalls the whole group with nothing to correct in
-    /// place. It must be resolved against the signed metadata in hand, before anything is signed.
-    #[tokio::test]
-    async fn a_provider_set_resolves_its_reconciler_against_the_signed_metadata_before_signing() {
-        let (_tmp, root) = scratch("provider-set-resolve");
-        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
-        let origin = root.join("origin");
-        repo::init(&origin, &keys, 365).await.unwrap();
-        let store = InMemory::new();
-        let dest = destination("releases/app");
-        let backend = backend("releases/app");
-        updatec::runtime::publish_repository(&store, &dest, &origin)
-            .await
-            .unwrap();
-
-        // The reconciler artifact the operator published first.
-        let artifact = root.join("lifecycle.tar.zst");
-        tokio::fs::write(&artifact, b"reconciler").await.unwrap();
-        let target = PublishTarget::application(
-            "lifecycle",
-            "stable",
-            "1.0.0",
-            "linux",
-            "x86_64",
-            "lifecycle",
-            artifact,
-        );
-        let path = target.name.clone();
-        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
-        repo::add_release(checkout.path(), &keys, vec![target], 365)
-            .await
-            .unwrap();
-        checkout.publish(&store, &dest).await.unwrap();
-        let sha256 = repo::target_sha256(checkout.path(), &path).await.unwrap();
-
-        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
-        let mut args = provider_set_args();
-        args.provider_path = path.clone();
-
-        // The stale copy-paste: the right path, a previous build's digest.
-        let error =
-            repo::verify_provider_set_reconciler(checkout.path(), &provider_set(&args).unwrap())
-                .await
-                .expect_err("a digest that names a different build is refused at publish time")
-                .to_string();
-        assert!(error.contains(&sha256), "{error}");
-        assert!(error.contains("Nothing was signed"), "{error}");
-
-        // A path no signed target carries at all.
-        args.provider_sha256 = sha256.clone();
-        args.provider_path = path.replace("1.0.0", "9.9.9");
-        let error =
-            repo::verify_provider_set_reconciler(checkout.path(), &provider_set(&args).unwrap())
-                .await
-                .expect_err("an unresolvable path is refused at publish time")
-                .to_string();
-        assert!(error.contains("does not resolve"), "{error}");
-
-        // The reference the artifact publish actually printed.
-        args.provider_path = path.clone();
-        repo::verify_provider_set_reconciler(checkout.path(), &provider_set(&args).unwrap())
-            .await
-            .expect("the published reconciler resolves");
     }
 
     #[tokio::test]
@@ -598,7 +472,7 @@ mod tests {
             theirs.path(),
             &keys,
             vec![PublishTarget {
-                name: "provider-sets/theirs.json".into(),
+                name: "products/theirs/stable/1.0.0/linux-x86_64/theirs".into(),
                 source: file,
                 custom: Default::default(),
             }],
@@ -630,7 +504,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            targets.contains("provider-sets/theirs.json"),
+            targets.contains("products/theirs/stable/1.0.0/linux-x86_64/theirs"),
             "the concurrent publisher's signed target survived"
         );
     }
@@ -675,7 +549,7 @@ mod tests {
             theirs.path(),
             &keys,
             vec![PublishTarget {
-                name: "provider-sets/theirs.json".into(),
+                name: "products/theirs/stable/1.0.0/linux-x86_64/theirs".into(),
                 source: file,
                 custom: Default::default(),
             }],
@@ -704,7 +578,7 @@ mod tests {
             if path.to_string_lossy().ends_with(".targets.json") {
                 survived |= std::fs::read_to_string(&path)
                     .unwrap()
-                    .contains("provider-sets/theirs.json");
+                    .contains("products/theirs/stable/1.0.0/linux-x86_64/theirs");
             }
         }
         assert!(
@@ -1071,98 +945,6 @@ mod tests {
             floor,
             "the floor comes from the versioned copies once the unversioned documents are gone"
         );
-    }
-
-    /// The provider set a release pins is signed into the app target and read exactly once —
-    /// during a cold-install-fallback descent on a node, mid-rollback. A well-formed but mismatched
-    /// path/digest pair is therefore resolved against the checked-out signed metadata here, where
-    /// the answer is already in hand, instead of stalling a node at recovery time.
-    #[tokio::test]
-    async fn deploy_resolves_the_pinned_provider_set_against_the_checked_out_metadata() {
-        let (_tmp, root) = scratch("provider-set-ref");
-        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
-        let origin = root.join("origin");
-        repo::init(&origin, &keys, 365).await.unwrap();
-
-        let store = InMemory::new();
-        let dest = destination("releases/app");
-        let backend = backend("releases/app");
-        updatec::runtime::publish_repository(&store, &dest, &origin)
-            .await
-            .unwrap();
-
-        // Publish one provider set, as `publish-provider-set` does.
-        let published = checkout_metadata(&store, &dest, &backend).await.unwrap();
-        let file = root.join("set.json");
-        tokio::fs::write(&file, b"{}").await.unwrap();
-        repo::add_release(
-            published.path(),
-            &keys,
-            vec![PublishTarget {
-                name: "provider-sets/web-v4.json".into(),
-                source: file,
-                custom: Default::default(),
-            }],
-            365,
-        )
-        .await
-        .unwrap();
-        let sha = repo::target_sha256(published.path(), "provider-sets/web-v4.json")
-            .await
-            .unwrap();
-        published.publish(&store, &dest).await.unwrap();
-
-        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
-        assert_eq!(
-            resolve_provider_set(&checkout, Some("provider-sets/web-v4.json"), Some(&sha))
-                .await
-                .unwrap(),
-            Some(("provider-sets/web-v4.json".to_string(), sha.clone())),
-            "the published set resolves and is signed in its lowercase form"
-        );
-        assert_eq!(
-            resolve_provider_set(&checkout, None, None).await.unwrap(),
-            None,
-            "omitting the flags leaves provider selection to the assignment head"
-        );
-        let error = resolve_provider_set(
-            &checkout,
-            Some("provider-sets/web-v4.json"),
-            Some(&sha.to_ascii_uppercase()),
-        )
-        .await
-        .expect_err("noncanonical digest aliases must be refused before signing")
-        .to_string();
-        assert!(error.contains("canonical lowercase"), "{error}");
-
-        // The stale copy-paste: a path that was never published, paired with a valid digest.
-        let error = resolve_provider_set(&checkout, Some("provider-sets/web-v3.json"), Some(&sha))
-            .await
-            .expect_err("an unresolvable provider set path must not be signed")
-            .to_string();
-        assert!(error.contains("does not resolve"), "{error}");
-        assert!(error.contains("Nothing was signed"), "{error}");
-
-        // A real path against the wrong release's digest.
-        let error = resolve_provider_set(
-            &checkout,
-            Some("provider-sets/web-v4.json"),
-            Some(&"b".repeat(64)),
-        )
-        .await
-        .expect_err("a digest that is not this target's must not be signed")
-        .to_string();
-        assert!(
-            error.contains("does not match the signed digest"),
-            "{error}"
-        );
-
-        let error =
-            resolve_provider_set(&checkout, Some("provider-sets/web-v4.json"), Some("nope"))
-                .await
-                .expect_err("a malformed digest is still rejected")
-                .to_string();
-        assert!(error.contains("canonical lowercase SHA-256"), "{error}");
     }
 
     /// An emergency override must be self-clearing. The deploy patch therefore states

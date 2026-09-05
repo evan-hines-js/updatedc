@@ -290,16 +290,6 @@ spec:
                     type: boolean
                   name:
                     type: string
-                  providerSet:
-                    properties:
-                      path:
-                        type: string
-                      sha256:
-                        type: string
-                    required:
-                    - path
-                    - sha256
-                    type: object
                   releaseRepository:
                     properties:
                       metadataUrl:
@@ -351,16 +341,8 @@ spec:
                         type: object
                       storage:
                         properties:
-                          inactiveAgents:
-                            format: uint
-                            minimum: 0.0
-                            type: integer
                           inactiveBytes:
                             format: uint64
-                            minimum: 0.0
-                            type: integer
-                          inactiveProviders:
-                            format: uint
                             minimum: 0.0
                             type: integer
                           inactiveReleases:
@@ -372,18 +354,12 @@ spec:
                             minimum: 0.0
                             type: integer
                         required:
-                        - inactiveAgents
                         - inactiveBytes
-                        - inactiveProviders
                         - inactiveReleases
                         - inactiveRepositoryCaches
                         type: object
                       timeouts:
                         properties:
-                          agentCheckIntervalSeconds:
-                            format: uint64
-                            minimum: 0.0
-                            type: integer
                           checkIntervalSeconds:
                             format: uint64
                             minimum: 0.0
@@ -409,7 +385,6 @@ spec:
                             minimum: 0.0
                             type: integer
                         required:
-                        - agentCheckIntervalSeconds
                         - checkIntervalSeconds
                         - confirmationWindowSeconds
                         - healthGraceSeconds
@@ -428,7 +403,6 @@ spec:
                 required:
                 - application
                 - name
-                - providerSet
                 - releaseRepository
                 - runtime
                 type: object
@@ -1001,27 +975,18 @@ spec:
                     type: string
                   reconciler:
                     properties:
+                      api:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      definitionSha256:
+                        type: string
                       product:
                         type: string
-                      providerSetSha256:
-                        type: string
-                      release:
-                        properties:
-                          archiveSha256:
-                            type: string
-                          manifestSha256:
-                            type: string
-                          version:
-                            type: string
-                        required:
-                        - archiveSha256
-                        - manifestSha256
-                        - version
-                        type: object
                     required:
+                    - api
+                    - definitionSha256
                     - product
-                    - providerSetSha256
-                    - release
                     type: object
                 required:
                 - attemptId
@@ -1123,16 +1088,6 @@ spec:
                     type: boolean
                   name:
                     type: string
-                  providerSet:
-                    properties:
-                      path:
-                        type: string
-                      sha256:
-                        type: string
-                    required:
-                    - path
-                    - sha256
-                    type: object
                   releaseRepository:
                     properties:
                       metadataUrl:
@@ -1184,16 +1139,8 @@ spec:
                         type: object
                       storage:
                         properties:
-                          inactiveAgents:
-                            format: uint
-                            minimum: 0.0
-                            type: integer
                           inactiveBytes:
                             format: uint64
-                            minimum: 0.0
-                            type: integer
-                          inactiveProviders:
-                            format: uint
                             minimum: 0.0
                             type: integer
                           inactiveReleases:
@@ -1205,18 +1152,12 @@ spec:
                             minimum: 0.0
                             type: integer
                         required:
-                        - inactiveAgents
                         - inactiveBytes
-                        - inactiveProviders
                         - inactiveReleases
                         - inactiveRepositoryCaches
                         type: object
                       timeouts:
                         properties:
-                          agentCheckIntervalSeconds:
-                            format: uint64
-                            minimum: 0.0
-                            type: integer
                           checkIntervalSeconds:
                             format: uint64
                             minimum: 0.0
@@ -1242,7 +1183,6 @@ spec:
                             minimum: 0.0
                             type: integer
                         required:
-                        - agentCheckIntervalSeconds
                         - checkIntervalSeconds
                         - confirmationWindowSeconds
                         - healthGraceSeconds
@@ -1261,7 +1201,6 @@ spec:
                 required:
                 - application
                 - name
-                - providerSet
                 - releaseRepository
                 - runtime
                 type: object

@@ -4,8 +4,8 @@
 //! binds a value to a flag — is [`updated_contracts::reconciler`]. It cannot own this half:
 //! that crate deliberately contains no process behavior, and this is a `std::process::Command`
 //! mutation that also reads the ambient environment. So the environment lives here, one crate up,
-//! where both invokers already are: the agent's `update::prepare_lifecycle_command` and
-//! `updatectl reconciler-check`.
+//! where both invokers already are: the agent's `update::prepare_reconciler_command` and
+//! `updatectl check`.
 //!
 //! One chokepoint, because a harness that is *stricter* than production certifies hooks that then
 //! fail on a real node, and one that is *looser* passes hooks that depend on something the agent
@@ -18,7 +18,7 @@ use std::{io, path::Path, process::Command};
 
 /// Maximum stdout or stderr retained from one reconciler invocation.
 ///
-/// Both the agent and `updatectl reconciler-check` use [`capture_output`]; a hook therefore cannot
+/// Both the agent and `updatectl check` use [`capture_output`]; a hook therefore cannot
 /// consume unbounded memory in either invoker, and the harness certifies the same fingerprint
 /// ceiling production enforces.
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -139,7 +139,7 @@ pub fn capture_output(mut input: impl io::Read + Send + 'static) -> OutputCaptur
 /// agent's own environment into a hook, and the difference is invisible until something in it
 /// matters. Application configuration—including secrets—exists only as named files under the
 /// invocation's input directory; there is no scalar/environment representation to drift from it.
-pub fn apply_environment(command: &mut Command) {
+pub fn configure_environment(command: &mut Command) {
     command.env_clear();
 
     #[cfg(unix)]
@@ -241,7 +241,7 @@ pub fn prune_output_snapshots(
         .iter()
         .map(|digest| paths.reconciler_output_snapshot(digest))
         .collect();
-    let entries = match std::fs::read_dir(&paths.provider_outputs) {
+    let entries = match std::fs::read_dir(&paths.execution_outputs) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error),
@@ -275,14 +275,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("result.json");
         assert_eq!(
-            take_result(&path, Operation::Apply).unwrap_err().kind(),
+            take_result(&path, Operation::Converge).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
         let result = ResultDocument::succeeded(true, HostAction::None, None).unwrap();
         write_result(&path, &result);
         assert_eq!(
-            take_result(&path, Operation::Apply).unwrap(),
+            take_result(&path, Operation::Converge).unwrap(),
             InvocationResult::Mutation(MutationResolution::Succeeded(
                 SuccessfulMutation::new(true, HostAction::None, None).unwrap()
             ))
@@ -315,14 +315,12 @@ mod tests {
             ReconciledRelease::new("1.0.0".into(), "a".repeat(64), "b".repeat(64)).unwrap(),
             ReconciledRelease::new("2.0.0".into(), "c".repeat(64), "d".repeat(64)).unwrap(),
         );
-        let reconciler_release =
-            ReconciledRelease::new("3.0.0".into(), "f".repeat(64), "0".repeat(64)).unwrap();
         let record = LastReconciliation::new(
             MutationOperation::Rollback,
             Reason::Update,
             format!("{}r", "a".repeat(64)),
             transition,
-            ReconcilerIdentity::new("e".repeat(64), "system".into(), reconciler_release).unwrap(),
+            ReconcilerIdentity::new("e".repeat(64), "system".into(), 1).unwrap(),
             SuccessfulMutation::new(true, HostAction::None, Some("restored predecessor".into()))
                 .unwrap(),
             1,
@@ -362,7 +360,7 @@ mod tests {
             .env("PATH", "/opt/ambient")
             .env("PSModulePath", "/opt/ambient/modules")
             .env("TOKEN", "ambient");
-        apply_environment(&mut command);
+        configure_environment(&mut command);
         let environment: BTreeMap<String, String> = command
             .get_envs()
             .filter_map(|(name, value)| {
@@ -447,7 +445,7 @@ mod tests {
     fn output_snapshot_gc_keeps_only_active_and_rollback_protected_values() {
         let root = tempfile::tempdir().unwrap();
         let paths = crate::config::Paths::resolve(root.path(), &root.path().join("enrollment"));
-        std::fs::create_dir_all(&paths.provider_outputs).unwrap();
+        std::fs::create_dir_all(&paths.execution_outputs).unwrap();
         let active = "a".repeat(64);
         let rollback = "b".repeat(64);
         let stale = paths.reconciler_output_snapshot(&"c".repeat(64));
@@ -458,7 +456,7 @@ mod tests {
         ] {
             std::fs::write(path, b"possibly secret").unwrap();
         }
-        std::fs::create_dir(paths.provider_outputs.join("interrupted-write")).unwrap();
+        std::fs::create_dir(paths.execution_outputs.join("interrupted-write")).unwrap();
 
         assert_eq!(
             prune_output_snapshots(&paths, &[active.clone(), rollback.clone()]).unwrap(),
@@ -467,6 +465,6 @@ mod tests {
         assert!(paths.reconciler_output_snapshot(&active).is_file());
         assert!(paths.reconciler_output_snapshot(&rollback).is_file());
         assert!(!stale.exists());
-        assert!(!paths.provider_outputs.join("interrupted-write").exists());
+        assert!(!paths.execution_outputs.join("interrupted-write").exists());
     }
 }

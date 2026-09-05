@@ -476,17 +476,9 @@ pub(crate) fn adopts_preapproval(
     existing: &crate::UpdateAgent,
     desired: &crate::UpdateAgent,
 ) -> bool {
-    // What a reserved identity LOOKS like (no registration digest, no pinned key) is
-    // `AgentIdentity::is_well_formed_for`'s rule, so it is asked rather than restated here. Spelled
-    // out a second time, this predicate was a copy of that rule that nothing kept in step: relaxing
-    // the shape of a `Reserved` identity in one place would have left the other still admitting the
-    // old shape, and this is the predicate that decides who may claim a name over the fleet-wide
-    // bootstrap certificate. Steady-state authority similarly delegates field-shape validation to
-    // `agent_authorizes_key` instead of maintaining a second schema here.
+    // Admission and steady-state authority share the live object and identity-shape rules.
     existing.spec.identity.kind == crate::AgentIdentityKind::Reserved
-        && existing
-            .spec
-            .identity
-            .is_well_formed_for(&existing.name_any())
-        && existing.spec.repository_ref.name == desired.spec.repository_ref.name
+        && desired.metadata.name.as_deref().is_some_and(|node| {
+            agent_has_live_identity(existing, &desired.spec.repository_ref.name, node)
+        })
 }

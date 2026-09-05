@@ -5,12 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "selfupdate-service"
+name = "updated-agent-service"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
-# The launcher is spawned as a contained tree: the kill-on-close job object is what makes it
-# impossible for a launcher to outlive this wrapper and have the SCM start a second launcher
-# over the same state directory.
+# The agent is spawned as a contained tree: the kill-on-close job object prevents it from
+# outliving the SCM service host.
 foundation = { path = "../foundation" }

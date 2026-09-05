@@ -127,10 +127,6 @@ mod tests {
                 sha256: "a".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: updated_contracts::artifact::TargetReference {
-                path: "provider".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: updated_contracts::assignment::ManagedRuntime {
                 inputs,

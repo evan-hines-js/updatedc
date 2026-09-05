@@ -22,7 +22,7 @@ struct Worker {
 /// Sole owner of fingerprint scheduling, execution, cancellation, and the publishable result.
 /// A fingerprint hook never overlaps a mutation hook: deployment paths call `restart_after`, and
 /// steady convergence calls `pause_for_mutation`; both wait for this worker's contained process
-/// tree to die before `apply` begins.
+/// tree to die before `converge` begins.
 pub(crate) struct Tracker {
     current: Option<Fingerprint>,
     due: Instant,
@@ -61,7 +61,7 @@ impl Tracker {
         }
     }
 
-    /// Stop an observation before an `apply` can touch the state it reads. A successful no-change
+    /// Stop an observation before a `converge` can touch the state it reads. A successful no-change
     /// result may keep the last completed value and its hourly cadence; a changed result follows
     /// this with [`restart_after_deployment`](Self::restart_after_deployment).
     pub(crate) fn pause_for_mutation(&mut self) {

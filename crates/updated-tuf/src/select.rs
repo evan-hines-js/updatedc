@@ -48,9 +48,9 @@ fn matching_targets(
 /// the branch reserved for stateless first installs: with the head's bytes rejected it would
 /// descend to an older release and install it, past the floor `selection.rs` refuses to cross.
 ///
-/// Spelling the stance out is what makes that unrepresentable. A caller can lift the "already
-/// installed, nothing to do" short-circuit ([`Stance::Floor`]) without lifting the floor, and it
-/// cannot lift the floor without saying, in as many words, that nothing is installed.
+/// Spelling the stance out is what makes that unrepresentable. A caller can explicitly request an
+/// exact reacquisition without lifting the floor, and it cannot lift the floor without saying, in
+/// as many words, that nothing is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stance<'a> {
     /// Nothing is installed. There is no anti-rollback floor, and this is the ONLY stance under
@@ -58,10 +58,6 @@ pub enum Stance<'a> {
     Nothing,
     /// `version` is installed: it is the anti-rollback floor, and re-selecting it is a no-op.
     Installed(&'a str),
-    /// `version` is the anti-rollback floor, but content identity decides whether a candidate is
-    /// already present. Used by self-update, where corrected bytes may intentionally retain the
-    /// same version and the caller compares the selected digest with the running executable.
-    Floor(&'a str),
     /// These exact installed bytes must be re-acquired — a repair republishing a drifted tree over
     /// the release the node is already committed to. Both version and digest are required: a
     /// version-only repair followed the assignment when it moved and became an unjournaled second
@@ -75,9 +71,7 @@ impl<'a> Stance<'a> {
     pub fn floor(self) -> Option<&'a str> {
         match self {
             Self::Nothing => None,
-            Self::Installed(version) | Self::Floor(version) | Self::Reacquire { version, .. } => {
-                Some(version)
-            }
+            Self::Installed(version) | Self::Reacquire { version, .. } => Some(version),
         }
     }
 
@@ -86,7 +80,7 @@ impl<'a> Stance<'a> {
     fn already_have(self) -> Option<&'a str> {
         match self {
             Self::Installed(version) => Some(version),
-            Self::Nothing | Self::Floor(_) | Self::Reacquire { .. } => None,
+            Self::Nothing | Self::Reacquire { .. } => None,
         }
     }
 
@@ -100,7 +94,6 @@ impl<'a> Stance<'a> {
         match self {
             Self::Nothing => "<none>".into(),
             Self::Installed(version) => version.to_string(),
-            Self::Floor(version) => format!("{version} (content-addressed floor)"),
             Self::Reacquire { version, .. } => format!("{version} (re-acquiring exact bytes)"),
         }
     }
@@ -110,7 +103,7 @@ impl<'a> Stance<'a> {
 ///
 /// The single per-candidate judgement, so the selector and [`TrustedRepository::selection_diagnostics`]
 /// cannot disagree about a release. Diagnostics used to re-derive its own three facts — rejected,
-/// above-ceiling, authorized — and simply did not know about two of the gates the selector applies:
+/// above-ceiling, authorized — and simply did not know about two of the gates the selector converges:
 /// the assigned-head-bytes pin and the downgrade watermark. An operator debugging why
 /// `coldInstallFallback` refused a release was shown a candidate that looked eligible in every
 /// column the tool printed, with nothing naming the gate that actually stopped it.
@@ -204,7 +197,7 @@ impl<'policy, 'stance, 'ceiling> CandidateRules<'policy, 'stance, 'ceiling> {
     }
 }
 
-/// Judge one candidate against every gate, in the order the selector applies them.
+/// Judge one candidate against every gate, in the order the selector converges them.
 fn judge_candidate(
     target: &VerifiedTarget,
     version: &Version,
@@ -325,51 +318,6 @@ pub struct SelectedRelease {
     pub target: VerifiedTarget,
     pub version: String,
     pub sha256: String,
-    /// The provider set signed *into this app version* — populated only when cold-install
-    /// fallback descended below the assigned head. `None` at the assigned head, where the
-    /// assignment's own `provider_set` governs (so providers stay independently revisable).
-    pub provider_set: Option<updated_contracts::artifact::TargetReference>,
-}
-
-/// The provider set an application target was published with, read from its signed custom
-/// metadata (see [`crate::repo::PublishTarget::with_provider_set`]).
-///
-/// `Ok(None)` means this app version was published without a bound provider set. `Err` means one
-/// is bound but this build cannot read it — a field a newer publisher added (`TargetReference` is
-/// `deny_unknown_fields`), a renamed key, a digest that is not sha256 hex. The two must stay
-/// distinguishable, because "absent" is what makes a descended app defer to the *assignment's*
-/// provider set: reporting an unreadable binding as absent would pair the rolled-back app with the
-/// head's newer reconciler, the exact mispairing the descent exists to prevent. Every sibling
-/// document on this seam refuses what it cannot read; so does this.
-fn signed_provider_set(
-    target: &VerifiedTarget,
-) -> Result<Option<updated_contracts::artifact::TargetReference>, String> {
-    let Some(value) = target.custom.get("provider_set") else {
-        return Ok(None);
-    };
-    let reference: updated_contracts::artifact::TargetReference =
-        serde_json::from_value(value.clone())
-            .map_err(|error| format!("its signed provider set is unreadable ({error})"))?;
-    if !reference.is_valid() {
-        return Err("its signed provider set reference is invalid".into());
-    }
-    Ok(Some(reference))
-}
-
-/// The provider-set reference a desired application candidate would actually use.
-///
-/// The assigned head and older targets without a binding use the assignment set; a descended
-/// target with a readable binding uses its own. Selection, rejection filtering, and diagnostics
-/// all call this one classifier so none can report or skip a different deployed unit.
-fn effective_provider_set(
-    target: &VerifiedTarget,
-    assignment: &updated_contracts::assignment::RepositoryAssignment,
-    head_sha256: &str,
-) -> Result<updated_contracts::artifact::TargetReference, String> {
-    if updated_contracts::digest::digests_match(&target_sha(target), head_sha256) {
-        return Ok(assignment.provider_set.clone());
-    }
-    Ok(signed_provider_set(target)?.unwrap_or_else(|| assignment.provider_set.clone()))
 }
 
 /// Shared select-and-download path used by the long-running and one-shot modes.
@@ -385,19 +333,12 @@ impl TrustedRepository {
     /// non-rejected, policy-authorized target at or below it. That lets a stateless
     /// node recover from a broken head assignment without stranding, while the
     /// signed opt-in ensures only the publisher can authorize a floor-less descent.
-    /// A candidate *below* the head is installable only together with the provider set signed
-    /// into it, so one whose signed `provider_set` this build cannot read is skipped and the
-    /// descent continues past it.
     pub fn assigned_application(
         &self,
         policy: &DefaultPolicy,
         stance: Stance<'_>,
         note_skip: impl FnMut(&str),
-        mut rejected: impl FnMut(
-            &VerifiedTarget,
-            &str,
-            Option<&updated_contracts::artifact::TargetReference>,
-        ) -> bool,
+        mut rejected: impl FnMut(&VerifiedTarget, &str) -> bool,
     ) -> Result<Option<SelectedRelease>, crate::Error> {
         // Repair is not desired-state selection. It is reconstruction of the exact immutable
         // artifact already committed on this node. Bind that request to both identity halves and
@@ -419,7 +360,7 @@ impl TrustedRepository {
             // archive participates in selection here.
             let rules = CandidateRules::new(policy, stance, None);
             if !judge_candidate(&target, &candidate, &rules, &mut |target, version| {
-                rejected(target, version, None)
+                rejected(target, version)
             })
             .exact_outcome()?
             {
@@ -429,10 +370,6 @@ impl TrustedRepository {
                 sha256: target_sha(&target),
                 target,
                 version: candidate.to_string(),
-                // Repair carries the already-committed provider identity unchanged. Returning a
-                // provider-set choice here would invite its caller to turn local byte repair into
-                // a provider-only desired-state transition.
-                provider_set: None,
             }));
         }
         let assignment = self
@@ -451,7 +388,6 @@ impl TrustedRepository {
             let mut note_skip = note_skip;
             // Reported after the walk: `select_first_eligible_from` holds `note_skip` for its
             // duration.
-            let mut unbindable = Vec::new();
             let selected = select_first_eligible_from(
                 matching_targets(self, policy),
                 policy,
@@ -461,50 +397,13 @@ impl TrustedRepository {
                     sha256: head_sha,
                 }),
                 &mut note_skip,
-                |target, version| {
-                    // Below the head, the app version's own signed provider set is what makes the
-                    // descent a rollback of app and providers as one unit. A binding this build
-                    // cannot read makes the candidate uninstallable, not provider-less: selecting
-                    // it would report `None` and defer to the assignment's set — this older app
-                    // against the head's newer reconciler. Refuse it and keep descending, the same
-                    // treatment a policy-ineligible target gets. At the head there is nothing to
-                    // pin (the assignment governs), so its binding is not consulted at all.
-                    let provider_set = match effective_provider_set(target, assignment, head_sha) {
-                        Ok(provider_set) => provider_set,
-                        Err(error) => {
-                            unbindable.push(format!("skipping {version}: {error}"));
-                            return true;
-                        }
-                    };
-                    rejected(target, version, Some(&provider_set))
-                },
+                |target, version| rejected(target, version),
             )
-            .map(|(target, version)| {
-                let sha256 = target_sha(&target);
-                // Only a descent pins the providers this app version was signed with, so that a
-                // rolled-back app and its providers move together. Ordered fallback normally
-                // selects the assigned head itself — a first install on a healthy assignment —
-                // and there the assignment's own `provider_set` governs, exactly as it does for
-                // an already-enrolled node taking the exact-pin branch below. Pinning the
-                // baked-in set here instead would strand every freshly enrolled node on the
-                // provider set the app was published with, so a provider-set-only assignment
-                // revision would silently reach enrolled nodes and not new ones, and the two
-                // would run different reconcilers at the same app version indefinitely.
-                let descended = !updated_contracts::digest::digests_match(&sha256, head_sha);
-                SelectedRelease {
-                    // A descended candidate whose binding could not be read was refused above, so
-                    // this re-read is the one that already succeeded.
-                    provider_set: descended
-                        .then(|| signed_provider_set(&target).ok().flatten())
-                        .flatten(),
-                    sha256,
-                    target,
-                    version,
-                }
+            .map(|(target, version)| SelectedRelease {
+                sha256: target_sha(&target),
+                target,
+                version,
             });
-            for message in unbindable {
-                note_skip(&message);
-            }
             return Ok(selected);
         }
 
@@ -518,7 +417,7 @@ impl TrustedRepository {
             }),
         );
         if !judge_candidate(&target, &ceiling, &rules, &mut |target, version| {
-            rejected(target, version, Some(&assignment.provider_set))
+            rejected(target, version)
         })
         .exact_outcome()?
         {
@@ -529,7 +428,6 @@ impl TrustedRepository {
             target,
             version,
             sha256,
-            provider_set: None,
         }))
     }
 
@@ -542,7 +440,7 @@ impl TrustedRepository {
         &self,
         policy: &DefaultPolicy,
         stance: Stance<'_>,
-        mut is_rejected: impl FnMut(&str, Option<&str>) -> bool,
+        mut is_rejected: impl FnMut(&str) -> bool,
     ) -> String {
         let Some(assignment) = self.assignment_context() else {
             return "no desired deployment in the release repository".into();
@@ -581,29 +479,9 @@ impl TrustedRepository {
         for (target, version) in candidates {
             let sha = target_sha(&target);
             let short = &sha[..sha.len().min(12)];
-            let mut provider_error = None;
-            // The selector's own judgement, not a second opinion assembled here: every gate it
-            // applies is named, in the order it applies them, including the two this listing used
-            // to be blind to.
             let verdict = judge_candidate(&target, &version, &rules, &mut |target, _| {
-                let application_sha256 = target_sha(target);
-                if matches!(stance, Stance::Reacquire { .. }) {
-                    return is_rejected(&application_sha256, None);
-                }
-                match effective_provider_set(target, assignment, &assignment.application.sha256) {
-                    Ok(provider_set) => {
-                        is_rejected(&application_sha256, Some(&provider_set.sha256))
-                    }
-                    Err(error) => {
-                        provider_error = Some(error);
-                        true
-                    }
-                }
+                is_rejected(&target_sha(target))
             });
-            let verdict = match (verdict, provider_error) {
-                (CandidateVerdict::Rejected, Some(error)) => CandidateVerdict::Unauthorized(error),
-                (verdict, _) => verdict,
-            };
             lines.push(format!(
                 "  candidate {version} ({}) sha={short} verdict={}",
                 target.path,
@@ -634,7 +512,6 @@ impl TrustedRepository {
             sha256,
             // A forward upgrade (not an assigned-fallback descent) carries providers via the
             // assignment head, not a version-pinned set.
-            provider_set: None,
         })
     }
 }
@@ -670,7 +547,7 @@ mod tests {
         DefaultPolicy::current("app", "stable")
     }
 
-    /// Every gate the selector applies, named by the one judgement both readers consume.
+    /// Every gate the selector converges, named by the one judgement both readers consume.
     ///
     /// This is the contract that stopped `selection_diagnostics` from being able to disagree with
     /// the selector: it reported three of these and silently knew nothing about `AboveCeiling`'s
@@ -888,22 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn reacquire_keeps_the_floor_but_allows_corrected_bytes_at_the_running_version() {
-        let targets = vec![candidate("2.0.0", 2), candidate("1.0.0", 1)];
-        let selected = select_head_from(
-            targets,
-            &policy(),
-            Stance::Floor("2.0.0"),
-            |_| {},
-            |_, _| false,
-        )
-        .expect("content identity, not the shared version label, decides a reacquire");
-
-        assert_eq!(selected.1, "2.0.0");
-        assert_eq!(target_sha(&selected.0), hex::encode(vec![2; 32]));
-    }
-
-    #[test]
     fn a_rejected_head_never_turns_an_upgrade_into_an_intermediate_release() {
         let rejected_hash = target_sha(&candidate("0.7.0", 7).0);
         let targets = vec![
@@ -947,7 +808,7 @@ mod tests {
 /// and drive [`TrustedRepository::assigned_application`] end to end.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod provider_binding {
+mod assigned_packages {
     use super::*;
     use crate::fixture::runtime;
     use crate::{repo, TrustedRepository};
@@ -959,27 +820,15 @@ mod provider_binding {
         format!("products/app/stable/{version}/{OS}-{ARCH}/app")
     }
 
-    /// Author the repo and return a repository loaded with an assignment that pins app 2.0.0
-    /// as the head (its provider set B), with cold-install fallback opted in.
+    /// Three signed package versions provide a bounded fallback route.
     async fn repo_with_assignment(fallback: bool) -> (tempfile::TempDir, TrustedRepository) {
-        repo_with_assignment_where(fallback, false).await
-    }
-
-    /// As [`repo_with_assignment`], plus a third, older release (0.9.0 with provider set Z) so a
-    /// descent has somewhere to go past 1.0.0. When `unreadable_predecessor_binding` is set,
-    /// 1.0.0's signed `provider_set` carries a field this build's `TargetReference` cannot
-    /// deserialize — the newer-publisher case.
-    async fn repo_with_assignment_where(
-        fallback: bool,
-        unreadable_predecessor_binding: bool,
-    ) -> (tempfile::TempDir, TrustedRepository) {
         let guard = tempfile::tempdir().unwrap();
         let tmp = guard.path().to_path_buf();
         let repo_dir = tmp.join("repo");
         let keys = repo::generate_keys(&tmp.join("keys")).await.unwrap();
         repo::init(&repo_dir, &keys, 365).await.unwrap();
 
-        // Three app versions, each with the provider set it shipped with signed into its metadata.
+        // Three complete package identities.
         let v0_src = tmp.join("app-0");
         let v1_src = tmp.join("app-1");
         let v2_src = tmp.join("app-2");
@@ -987,24 +836,12 @@ mod provider_binding {
         std::fs::write(&v1_src, b"app-1.0.0").unwrap();
         std::fs::write(&v2_src, b"app-2.0.0").unwrap();
         let v0 =
-            repo::PublishTarget::application("app", "stable", "0.9.0", OS, ARCH, "app", v0_src)
-                .with_provider_set("provider-sets/z.json", &"c".repeat(64));
-        let mut v1 =
-            repo::PublishTarget::application("app", "stable", "1.0.0", OS, ARCH, "app", v1_src)
-                .with_provider_set("provider-sets/a.json", &"a".repeat(64));
-        if unreadable_predecessor_binding {
-            v1.custom.insert(
-                "provider_set".into(),
-                serde_json::json!({
-                    "path": "provider-sets/a.json",
-                    "sha256": "a".repeat(64),
-                    "successor": "provider-sets/a2.json",
-                }),
-            );
-        }
+            repo::PublishTarget::application("app", "stable", "0.9.0", OS, ARCH, "app", v0_src);
+        let v1 =
+            repo::PublishTarget::application("app", "stable", "1.0.0", OS, ARCH, "app", v1_src);
+
         let v2 =
-            repo::PublishTarget::application("app", "stable", "2.0.0", OS, ARCH, "app", v2_src)
-                .with_provider_set("provider-sets/b.json", &"b".repeat(64));
+            repo::PublishTarget::application("app", "stable", "2.0.0", OS, ARCH, "app", v2_src);
         repo::add_release(&repo_dir, &keys, vec![v0, v1, v2], 365)
             .await
             .unwrap();
@@ -1027,10 +864,6 @@ mod provider_binding {
                 sha256: head_sha,
             },
             cold_install_fallback: fallback,
-            provider_set: updated_contracts::artifact::TargetReference {
-                path: "provider-sets/b.json".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: serde_json::json!({}),
             runtime: runtime(),
         };
@@ -1049,187 +882,6 @@ mod provider_binding {
         DefaultPolicy::current("app", "stable")
     }
 
-    #[test]
-    fn signed_provider_set_separates_absent_from_unreadable() {
-        let target = repo::PublishTarget::application(
-            "app",
-            "stable",
-            "1.0.0",
-            OS,
-            ARCH,
-            "app",
-            std::path::PathBuf::from("unused"),
-        )
-        .with_provider_set("provider-sets/a.json", &"a".repeat(64));
-        let verified = VerifiedTarget {
-            path: target.name.clone(),
-            length: 1,
-            sha256: vec![0u8; 32],
-            custom: serde_json::to_value(&target.custom).unwrap(),
-        };
-        let bound = signed_provider_set(&verified)
-            .expect("readable")
-            .expect("bound");
-        assert_eq!(bound.path, "provider-sets/a.json");
-        assert_eq!(bound.sha256, "a".repeat(64));
-
-        let plain = VerifiedTarget {
-            custom: serde_json::json!({"product": "app"}),
-            ..verified.clone()
-        };
-        assert!(
-            signed_provider_set(&plain).expect("readable").is_none(),
-            "no binding at all is the absent case"
-        );
-
-        // A binding this build cannot read must NOT report as absent: absent means "defer to the
-        // assignment's provider set", which for a descended app is the head's newer reconciler.
-        let newer_publisher = VerifiedTarget {
-            custom: serde_json::json!({
-                "provider_set": {
-                    "path": "provider-sets/a.json",
-                    "sha256": "a".repeat(64),
-                    "successor": "provider-sets/a2.json",
-                }
-            }),
-            ..verified.clone()
-        };
-        assert!(signed_provider_set(&newer_publisher).is_err());
-        let malformed_digest = VerifiedTarget {
-            custom: serde_json::json!({
-                "provider_set": {"path": "provider-sets/a.json", "sha256": "not-a-digest"}
-            }),
-            ..verified
-        };
-        assert!(signed_provider_set(&malformed_digest).is_err());
-    }
-
-    // A descent must never hand back "no bound provider set" for a version that HAS one it could
-    // not read: that answer means "use the assignment's set", pairing this older app with the
-    // head's newer reconciler — the mispairing cold-install fallback exists to prevent. So 1.0.0 is
-    // uninstallable here and the descent continues to 0.9.0 and its own set.
-    #[tokio::test]
-    async fn a_descent_skips_a_version_whose_signed_provider_set_it_cannot_read() {
-        let (_tmp, repo) = repo_with_assignment_where(true, true).await;
-        let mut skips = Vec::new();
-        let selected = repo
-            .assigned_application(
-                &policy(),
-                Stance::Nothing,
-                |skip| skips.push(skip.to_string()),
-                |_, version, _| version == "2.0.0",
-            )
-            .unwrap()
-            .expect("a readable predecessor is selectable");
-        assert_eq!(selected.version, "0.9.0");
-        assert_eq!(
-            selected
-                .provider_set
-                .expect("descent binds a provider set")
-                .path,
-            "provider-sets/z.json"
-        );
-        assert!(
-            skips
-                .iter()
-                .any(|skip| skip.starts_with("skipping 1.0.0:") && skip.contains("provider set")),
-            "the refusal is diagnosable, not silent: {skips:?}"
-        );
-    }
-
-    // The head assignment (2.0.0) is broken, so a first-install node with cold-install fallback
-    // descends to 1.0.0 — and must roll back to the provider set signed with 1.0.0 (A), not
-    // the assignment head's B. This is the app+provider-as-one-unit rollback.
-    #[tokio::test]
-    async fn cold_install_fallback_descends_to_the_app_versions_own_provider_set() {
-        let (_tmp, repo) = repo_with_assignment(true).await;
-        let selected = repo
-            .assigned_application(
-                &policy(),
-                Stance::Nothing,
-                |_| {},
-                |_, version, _| version == "2.0.0",
-            )
-            .unwrap()
-            .expect("a healthy predecessor is selectable");
-        assert_eq!(selected.version, "1.0.0");
-        assert_eq!(
-            selected
-                .provider_set
-                .expect("descent binds a provider set")
-                .path,
-            "provider-sets/a.json",
-            "a descended app must roll back to the providers signed with it"
-        );
-    }
-
-    // First install with a healthy head stays at 2.0.0 and, like every other way of arriving at
-    // the head, defers to the assignment's own `provider_set`. Binding the app's baked-in set
-    // here would make a fresh node and an enrolled node at the same app version run different
-    // provider sets the moment a provider-set-only assignment revision is published.
-    #[tokio::test]
-    async fn first_install_at_head_defers_providers_to_the_assignment_like_every_other_node() {
-        let (_tmp, repo) = repo_with_assignment(true).await;
-        let selected = repo
-            .assigned_application(&policy(), Stance::Nothing, |_| {}, |_, _, _| false)
-            .unwrap()
-            .expect("the head is selectable");
-        assert_eq!(selected.version, "2.0.0");
-        assert!(
-            selected.provider_set.is_none(),
-            "cold-install fallback binds a provider set only where it descended BELOW the assigned \
-             head; at the head the assignment governs, so a provider-set-only revision reaches \
-             newly enrolled and long-enrolled nodes alike"
-        );
-    }
-
-    #[tokio::test]
-    async fn provider_set_rejection_skips_the_whole_deployed_unit_without_poisoning_app_bytes() {
-        let (_tmp, repo) = repo_with_assignment(true).await;
-        let rejected_provider_set = repo
-            .assignment_context()
-            .expect("the fixture has an assignment")
-            .document()
-            .provider_set
-            .sha256
-            .clone();
-
-        let selected = repo
-            .assigned_application(
-                &policy(),
-                Stance::Nothing,
-                |_| {},
-                |_, _, provider_set| {
-                    provider_set.is_some_and(|provider| provider.sha256 == rejected_provider_set)
-                },
-            )
-            .unwrap()
-            .expect("cold-install fallback can descend past a rejected provider set");
-
-        assert_eq!(selected.version, "1.0.0");
-        assert_eq!(
-            selected
-                .provider_set
-                .expect("the predecessor carries its own provider set")
-                .path,
-            "provider-sets/a.json"
-        );
-        let diagnostics =
-            repo.selection_diagnostics(&policy(), Stance::Nothing, |_, provider_set_sha256| {
-                provider_set_sha256 == Some(rejected_provider_set.as_str())
-            });
-        assert!(
-            diagnostics
-                .lines()
-                .any(|line| line.contains("candidate 2.0.0")
-                    && line.contains("artifact or exact deployment was rejected")),
-            "diagnostics must consume the same deployed-unit rejection rule: {diagnostics}"
-        );
-    }
-
-    // An established node (exact-pin, no floor-less descent) leaves provider selection to the
-    // assignment's own `provider_set`, so a provider-only revision reconciles at the head
-    // WITHOUT an app change: `provider_set` is `None`, and the agent uses the assignment's.
     /// A repair must not become a downgrade.
     ///
     /// `repair.rs` re-acquires the release the node is ALREADY committed to, so it has to lift the
@@ -1263,32 +915,22 @@ mod provider_binding {
                     sha256: &head_sha,
                 },
                 |_| {},
-                |_, _, _| false,
+                |_, _| false,
             )
             .unwrap()
             .expect("a repair re-selects the release it is repairing");
         assert_eq!(repaired.version, "2.0.0");
         assert!(
-            repo.assigned_application(
-                &policy(),
-                Stance::Installed("2.0.0"),
-                |_| {},
-                |_, _, _| false,
-            )
-            .unwrap()
-            .is_none(),
+            repo.assigned_application(&policy(), Stance::Installed("2.0.0"), |_| {}, |_, _| false,)
+                .unwrap()
+                .is_none(),
             "an ordinary pass over the installed head has nothing to do"
         );
 
         // The head is rejected. `Nothing` — a genuine cold install — descends to 1.0.0, which is
         // the whole point of cold-install fallback. A repair on a node holding 2.0.0 must NOT: that
         // would be a downgrade past the floor, so it selects nothing instead.
-        let head_rejected =
-            |_: &VerifiedTarget,
-             version: &str,
-             _: Option<&updated_contracts::artifact::TargetReference>| {
-                version == "2.0.0"
-            };
+        let head_rejected = |_: &VerifiedTarget, version: &str| version == "2.0.0";
         assert_eq!(
             repo.assigned_application(&policy(), Stance::Nothing, |_| {}, head_rejected)
                 .unwrap()
@@ -1333,16 +975,12 @@ mod provider_binding {
                     sha256: &committed_sha,
                 },
                 |_| {},
-                |_, _, _| false,
+                |_, _| false,
             )
             .unwrap()
             .expect("the exact committed bytes remain repairable");
         assert_eq!(repaired.version, "1.0.0");
         assert_eq!(repaired.sha256, committed_sha);
-        assert!(
-            repaired.provider_set.is_none(),
-            "repair preserves the committed provider instead of selecting a desired one"
-        );
 
         assert!(
             repo.assigned_application(
@@ -1352,31 +990,11 @@ mod provider_binding {
                     sha256: &"0".repeat(64),
                 },
                 |_| {},
-                |_, _, _| false,
+                |_, _| false,
             )
             .unwrap()
             .is_none(),
             "a version match cannot substitute differently packed bytes"
-        );
-    }
-
-    #[tokio::test]
-    async fn established_node_defers_providers_to_the_assignment_for_provider_only_updates() {
-        let (_tmp, repo) = repo_with_assignment(false).await;
-        let selected = repo
-            .assigned_application(
-                &policy(),
-                Stance::Installed("1.0.0"),
-                |_| {},
-                |_, _, _| false,
-            )
-            .unwrap()
-            .expect("the assigned head is an upgrade from 1.0.0");
-        assert_eq!(selected.version, "2.0.0");
-        assert!(
-            selected.provider_set.is_none(),
-            "at the head the assignment's provider_set governs, so providers stay \
-             independently revisable without republishing the app"
         );
     }
 }

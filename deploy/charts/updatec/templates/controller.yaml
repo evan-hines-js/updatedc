@@ -1,6 +1,6 @@
 {{/*
-Single-writer safety comes from the `updatec-publisher` lease, which every replica must hold before
-it reconciles — not from the volume. What the volume decides is whether a second replica can start
+Single-writer safety requires both the repository-scoped publisher lease and the shared-state file
+lock. A lost leader exits before releasing that lock. Volume access decides whether a replica can start
 at all: two pods cannot bind one ReadWriteOnce claim, so a rolling update over an RWO volume
 deadlocks (the new pod waits for a volume the old pod will not release until the new one is ready).
 Hence: shared volume => RollingUpdate and any replica count; exclusive volume => Recreate and

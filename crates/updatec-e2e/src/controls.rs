@@ -36,20 +36,16 @@ pub(crate) async fn deploy_release(
         "cp /usr/local/bin/sampleapp /tmp/gen/bin/app"
     };
     let repository = release_repository_flags();
-    let FleetLayout {
-        platform,
-        provider_path,
-        provider_sha,
-    } = layout;
+    let FleetLayout { platform } = layout;
+    let execution = crate::cluster::demo_execution_flags();
     let deploys = groups
         .iter()
         .map(|group| {
             format!(
                 "updatectl deploy --keys-dir /data/release-keys {repository} \
                  --namespace {NAMESPACE} --group {group} --product app --channel stable \
-                 --version {version} --entrypoint bin/app --platform {platform} \
-                 --source /tmp/gen --provider-set-path {provider_path} \
-                 --provider-set-sha256 {provider_sha}"
+                 --version {version} --platform {platform} \
+                 --source /tmp/gen {execution}"
             )
         })
         .collect::<Vec<_>>()
@@ -57,7 +53,7 @@ pub(crate) async fn deploy_release(
     let script = format!(
         "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
          rm -rf /tmp/gen && mkdir -p /tmp/gen/bin /tmp/gen/config; {entrypoint}; \
-         chmod 0755 /tmp/gen/bin/app; \
+         chmod 0755 /tmp/gen/bin/app; cp /usr/local/bin/demo-lifecycle /tmp/gen/bin/lifecycle; \
          printf 'version = \"{version}\"\\n' >/tmp/gen/config/release.toml; {deploys}"
     );
     let status = tokio::process::Command::new("kubectl")
@@ -324,14 +320,24 @@ fn ready_external_addresses() -> Result<Vec<String>, Box<dyn std::error::Error>>
 /// is the failure a stale report has to fail closed on. Deleting the pod would prove something
 /// else entirely (the workload would go with it).
 ///
-/// Only the agent is signalled. Its launcher relaunches an agent that EXITS; a stopped one has not
-/// exited, so it stays stopped and stays silent — which is the state under test — and the launcher
+/// Only the agent is signalled. Kubernetes restarts an agent that EXITS; a stopped one has not
+/// exited, so it stays stopped and stays silent — which is the state under test — and Kubernetes
 /// brings it straight back on `CONT` if it ever does exit.
 fn signal_agent(pod: &str, signal: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let state_check = match signal {
+        "STOP" => "[ \"$state\" = T ]",
+        "CONT" => "[ \"$state\" != T ]",
+        _ => return Err(format!("unsupported agent signal {signal}").into()),
+    };
     let script = format!(
         "set -e; found=0; for d in /proc/[0-9]*; do \
            c=$(cat $d/comm 2>/dev/null || true); \
-           case \"$c\" in updated-agent) kill -{signal} ${{d#/proc/}} && found=1;; esac; \
+           case \"$c\" in updated-agent) \
+             kill -{signal} ${{d#/proc/}}; \
+             for attempt in 1 2 3 4 5; do \
+               state=$(awk '/^State:/ {{print $2}}' $d/status); \
+               if {state_check}; then found=1; break; fi; sleep 0.1; \
+             done;; esac; \
          done; [ $found = 1 ]"
     );
     run(agent_exec(pod).args(["sh", "-c", &script]))
@@ -584,7 +590,7 @@ pub(crate) async fn assert_dataflow_inputs(
             output(agent_exec(pod).args([
                 "sh",
                 "-c",
-                "for file in /var/lib/updated/providers/outputs/*.json; do \
+                "for file in /var/lib/updated/execution/outputs/*.json; do \
                  cat \"$file\" 2>/dev/null && printf '\\n'; done",
             ]))
             .is_ok_and(|inputs| {

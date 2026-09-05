@@ -7,8 +7,8 @@
 use std::io;
 
 use updated::bundle::{ExpectedBundle, InstallError, ReleaseId};
+use updated::bundle_store::BundleStore;
 use updated::config::{Application, Paths};
-use updated::provider::BundleStore;
 use updated_tuf::select::{target_sha, SelectedRelease, Stance};
 use updated_tuf::{DefaultPolicy, TrustedRepository, VerifiedTarget};
 
@@ -24,6 +24,7 @@ pub(crate) struct ApplicationRequest<'a> {
 
 #[derive(Debug)]
 pub(crate) struct PreparedApplication {
+    pub(crate) reconciler: updated::state::ReconcilerRelease,
     pub(crate) release: ReleaseId,
     pub(crate) version: String,
     pub(crate) archive_sha256: String,
@@ -121,15 +122,10 @@ impl std::error::Error for PrepareError {
 /// `Ok(None)` means the current version is already desired or the candidate's artifact/deployment
 /// identity was previously rejected. Activation and rejection persistence remain front-end policy.
 ///
-/// The decision is deterministic and side-effect free, and it answers two questions at once: which
-/// release to acquire, and — when cold-install fallback descended below the assigned head — which signed
-/// provider set governs it (app and providers are one signed unit). Every caller needs both, so the
-/// decision is made HERE, once, and its result is handed to [`prepare_assigned_application`] and to
-/// `selection::stage_providers`; asking the repository twice would be one decision with two
-/// evaluation sites.
+/// Selection is side-effect free. Execution is derived from that exact package after verification.
 pub(crate) fn select_assigned_application(
     request: &ApplicationRequest<'_>,
-    mut is_rejected: impl FnMut(&str, Option<&str>) -> bool,
+    mut is_rejected: impl FnMut(&str) -> bool,
 ) -> Result<Option<SelectedRelease>, PrepareError> {
     let policy = DefaultPolicy::current(&request.application.product, &request.application.channel);
     // Rejection filtering now happens inside selection: exact-pin returns None when
@@ -142,12 +138,7 @@ pub(crate) fn select_assigned_application(
             &policy,
             request.stance,
             |_message| {},
-            |target, _version, provider_set| {
-                is_rejected(
-                    &target_sha(target),
-                    provider_set.map(|provider| provider.sha256.as_str()),
-                )
-            },
+            |target, _version| is_rejected(&target_sha(target)),
         )
         .map_err(PrepareError::Repository)
 }
@@ -185,7 +176,16 @@ pub(crate) async fn prepare_assigned_application(
             source,
         },
     })?;
+    let reconciler = store.execution(&id).map_err(|error| match error {
+        InstallError::Storage(error) => PrepareError::Storage(error),
+        InstallError::Archive(source) => PrepareError::Bundle {
+            version: selected.version.clone(),
+            archive_sha256: selected.sha256.clone(),
+            source,
+        },
+    })?;
     Ok(PreparedApplication {
+        reconciler,
         release: id,
         version: selected.version,
         archive_sha256: selected.sha256,

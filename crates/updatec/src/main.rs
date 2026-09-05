@@ -156,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fleet = updatec::runtime::FleetWatch::start(client.clone(), &namespace, &repository)
         .await
         .map_err(|error| format!("watching the fleet failed: {error}"))?;
+    let mut publisher_state = None;
     loop {
         // A frozen store is indistinguishable from a fleet that has stopped changing, so this
         // replica must not keep planning against one. Exiting hands the problem to Kubernetes,
@@ -164,10 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !fleet.is_live() {
             return Err("the fleet watch stopped; restarting to re-establish it".into());
         }
-        match updatec::runtime::acquire_or_renew_lease(
+        match updatec::runtime::acquire_or_renew_publisher_lease(
             client.clone(),
             &namespace,
-            "updatec-publisher",
+            &repository,
             &identity,
         )
         .await
@@ -181,6 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // page, while another replica had meanwhile reconciled cleanly and cleared the
             // condition on every set.
             Ok(false) => {
+                if publisher_state.is_some() {
+                    updatec::runtime::exit_publisher_epoch();
+                }
                 hooks.end_leadership_epoch();
                 // A follower has no fleet view: serving the last leader-epoch snapshot as if it
                 // were current let a scrape read week-old gauges as fresh. The failure counter
@@ -190,18 +194,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             Err(error) => {
+                if publisher_state.is_some() {
+                    tracing::error!(%error, "publisher lease failed; ending writer epoch");
+                    updatec::runtime::exit_publisher_epoch();
+                }
                 hooks.end_leadership_epoch();
                 tracing::error!(%error, "leader lease operation failed");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
         }
+        if publisher_state.is_none() {
+            match updatec::runtime::acquire_publisher_state(std::path::Path::new(&state)) {
+                Ok(lock) => publisher_state = Some(lock),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // The former lease holder may still be finishing a blocking write. Never
+                    // enter its shared repository until that process has ended its writer epoch.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         // The future borrows `hooks` mutably, so it is scoped: the failure handling below needs
-        // `hooks` again, which is only possible once the (finished or cancelled) future is dropped.
+        // `hooks` again once the finished future is dropped. Lease loss exits this process;
+        // it must not drop the future and release the lock while filesystem tasks still run.
         //
         // BOTH halves of the pass run inside the watchdog below, not just publication. Backend
         // materialization is a full fleet LIST plus, per backend, an access check, inventory
-        // ConfigMap applies, SA/Role/RoleBinding/Deployment applies and a status patch; run ahead
+        // ConfigMap converges, SA/Role/RoleBinding/Deployment converges and a status patch; run ahead
         // of the watchdog it could outlast the 15s lease on a throttled apiserver, and this replica
         // would then walk into publication as a former leader while a peer had already taken over.
         let result = {
@@ -243,19 +264,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::pin!(reconciliation);
             loop {
                 tokio::select! {
-                    result = &mut reconciliation => break Some(result),
+                    result = &mut reconciliation => break result,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                        match updatec::runtime::acquire_or_renew_lease(
-                            client.clone(), &namespace, "updatec-publisher", &identity,
+                        match updatec::runtime::acquire_or_renew_publisher_lease(
+                            client.clone(), &namespace, &repository, &identity,
                         ).await {
                             Ok(true) => {}
                             Ok(false) => {
-                                tracing::warn!("publisher lease lost; cancelling reconciliation");
-                                break None;
+                                tracing::warn!("publisher lease lost; terminating writer epoch");
+                                updatec::runtime::exit_publisher_epoch();
                             }
                             Err(error) => {
-                                tracing::error!(%error, "publisher lease renewal failed; cancelling reconciliation");
-                                break None;
+                                tracing::error!(%error, "publisher lease renewal failed; terminating writer epoch");
+                                updatec::runtime::exit_publisher_epoch();
                             }
                         }
                     }
@@ -263,13 +284,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         match result {
-            Some(Ok(updatec::runtime::ReconcileOutcome::Reconciled { digest, snapshot })) => {
+            Ok(updatec::runtime::ReconcileOutcome::Reconciled { digest, snapshot }) => {
                 tracing::info!(%digest, "desired state reconciled");
                 if let Some(snapshot) = snapshot {
                     metrics.write().expect("metrics lock").last = Some(snapshot);
                 }
             }
-            Some(Ok(updatec::runtime::ReconcileOutcome::WaitingForRepository)) => {
+            Ok(updatec::runtime::ReconcileOutcome::WaitingForRepository) => {
                 // A chart is normally installed before its first repository CR, and deletion may
                 // leave this controller running. Neither is an error or a status write against an
                 // object known not to exist. Do not expose the last incarnation's fleet gauges as
@@ -277,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 metrics.write().expect("metrics lock").last = None;
                 tracing::debug!(%repository, "waiting for UpdateRepository");
             }
-            Some(Err(error)) => {
+            Err(error) => {
                 // Full detail (which may name the bucket/endpoint/object key) goes to the
                 // operator log only; the CR status gets a generic category so a reader with
                 // `get` on the CRs learns nothing about the storage backend.
@@ -307,10 +328,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::error!(%status_error, "recording ReconcileFailing on group sets failed");
                 }
             }
-            // A cancelled pass (lost lease) is a follower outcome, not a failure — and it ends
-            // this replica's leadership epoch, so the streak resets with it for the same reason
-            // the non-leader arms above reset it.
-            None => hooks.end_leadership_epoch(),
         }
         // Poll for desired-state changes once per second so a freshly patched
         // rollout is republished promptly and the fleet starts converging fast.

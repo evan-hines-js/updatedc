@@ -3,28 +3,22 @@
 
 use crate::*;
 
-/// End this agent because it cannot make progress, leaving every piece of durable evidence
-/// (the transaction journal, the unspent marker claims, the rejection records) exactly as it is.
+/// End this agent because it cannot make progress, leaving every piece of durable transaction
+/// evidence exactly as it is.
 ///
 /// This is the ONLY response to an unrecoverable boot or update step, and it is deliberately an
-/// exit rather than a wait: the agent is disposable — it holds no workload — and the launcher
-/// relaunches it, so the next boot re-derives the identical, idempotent recovery from the same
+/// exit rather than a wait: the agent is disposable — it holds no workload — and its platform
+/// service manager relaunches it, so the next boot re-derives identical recovery from the same
 /// evidence. Holding the process alive instead means a single failed durable write pins the node
 /// down forever: no exit, so no relaunch, so no next boot, so the recovery that was supposed to
 /// happen "next boot" never did. Replaying an operator hook in
-/// a tight loop is not the alternative hazard it looks like either: the launcher throttles every
-/// relaunch through one exponential backoff capped at five minutes, and that backoff is rate-
-/// limited precisely so THIS path cannot escape it. An exit from here typically comes after a long
-/// boot — situation gathering, activation, an operator hook with an operator-chosen timeout — so
-/// the launcher's "it ran a while, this was a transient crash" reset would otherwise
-/// fire on every cycle; it stops resetting past a bounded number of relaunches per hour, and the
-/// loop settles at one replay per five minutes.
+/// a tight loop is bounded by the platform service's restart policy.
 pub(crate) fn exit_for_relaunch(
     what: &str,
     cause: &dyn std::fmt::Display,
 ) -> Box<dyn std::error::Error> {
     let reason = format!(
-        "{what} failed: {cause}; exiting with the recovery journal intact so the launcher \
+        "{what} failed: {cause}; exiting with the recovery journal intact so the service manager \
          relaunches boot recovery"
     );
     error(&reason);
@@ -33,42 +27,18 @@ pub(crate) fn exit_for_relaunch(
 
 /// How long a boot-recovery step is retried when what failed it is a node-local transient.
 ///
-/// It must outlast the launcher's readiness gate plus its confirmation window (45s + 30s with the
-/// shipped defaults), because that is the whole point: a candidate that spends the transient behind
-/// its readiness signal gets COMMITTED, so if the fault outlives the budget the exit that follows
-/// is an ordinary relaunch instead of a permanent, by-content-hash rejection.
+/// It is long enough to absorb short-lived node faults without forcing a service restart.
 pub(crate) const TRANSIENT_RETRY_BUDGET: Duration = Duration::from_secs(120);
 
 /// How long a boot-recovery step waits between attempts at a node-local transient.
 pub(crate) const TRANSIENT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Run one fallible boot-recovery step, waiting out node-local transients from behind the
-/// readiness signal, and turning anything else into [`exit_for_relaunch`].
-///
-/// Boot recovery runs in front of the readiness signal because commitment is meant to attest that
-/// these agent bytes reconciled their durable state. But for a CANDIDATE agent, exiting
-/// before that signal is not the relaunch `exit_for_relaunch` describes — the launcher records the
-/// candidate rejected, the predecessor comes back and blacklists the candidate's SHA-256 in
-/// `agent-rejected`, a record that never expires. A full state volume, a read-only remount, an
-/// EIO, or a CDN blip during staging would therefore strand this node an agent release behind
-/// the fleet, permanently, over a fault that says nothing about the release — the same fault
-/// attribution `update.rs` already makes for a pointer write and `self_update.rs` for a failed
-/// handoff.
-///
-/// So a transient cause is retried instead, and readiness is signalled before the first retry:
-/// with the signal sent, the confirmation window runs on its own clock and the candidate is
-/// committed on the strength of what it is — bytes that started and stayed up — rather than on
-/// whether this node's disk was writable at that moment. Retrying is safe because the step is
-/// exactly what the next boot would re-derive: every phase is guarded by `recovery_pending`, so a
-/// re-run resumes where the failure landed.
-///
-/// The retry is BOUNDED. An agent that never exits is the failure mode `exit_for_relaunch`
-/// exists to prevent, so once the budget is spent this ends the process like any other
-/// unrecoverable step — by then the candidate is committed, and the relaunch is throttled by the
-/// launcher's backoff.
+/// Run one fallible boot-recovery step, waiting out node-local transients and turning anything
+/// else into [`exit_for_relaunch`]. Retrying is safe because every phase is guarded by
+/// `recovery_pending`, so a re-run resumes where the failure landed. The retry remains bounded;
+/// once the budget is spent the platform service manager gets a clean restart boundary.
 pub(crate) async fn recover_through_transients<T>(
     what: &str,
-    launcher: &mut Launcher,
     shutdown: &AtomicBool,
     mut step: impl FnMut() -> io::Result<T>,
 ) -> Result<T, Box<dyn std::error::Error>> {
@@ -82,13 +52,9 @@ pub(crate) async fn recover_through_transients<T>(
             return Err(exit_for_relaunch(what, &error));
         }
         warn(&format!(
-            "{what} hit a node-local fault ({error}); signalling readiness and retrying in {}ms so \
-             a transient cannot get these agent bytes rejected by content hash",
+            "{what} hit a node-local fault ({error}); retrying in {}ms",
             TRANSIENT_RETRY_INTERVAL.as_millis()
         ));
-        // Idempotent: the ordinary signal below this in `run` still happens, and only one READY
-        // frame reaches the launcher.
-        launcher.signal_ready();
         if sleep_interruptible(TRANSIENT_RETRY_INTERVAL, shutdown).await {
             return Err(exit_for_relaunch(what, &error));
         }

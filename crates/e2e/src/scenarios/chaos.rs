@@ -7,7 +7,7 @@ const TRANSACTION_START_TIMEOUT: u64 = 120;
 const RECOVERY_TIMEOUT: u64 = 120;
 const HEALTH_GRACE: &str = "10s";
 
-/// Crash the agent at every application-update transaction boundary; the launcher
+/// Crash the agent at every application-update transaction boundary; the external service
 /// relaunches it and recovery (driven by the on-disk journal) drives the update to a
 /// committed version. The chaos is one-shot, so the relaunched agent recovers
 /// rather than crashing again. Each boundary runs in a fully isolated dir + repo so
@@ -31,9 +31,9 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
             .workload(&svc)
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
-            .launcher()?;
+            .command()?;
         cmd.env(updated::env::CHAOS_POINT, point);
-        let boot = Proc::spawn("chaos", &mut cmd)?;
+        let boot = Service::spawn("chaos", &cmd);
 
         // Repository refresh/provider staging happens before the transaction begins and
         // may consume a full transport timeout on a saturated parallel CI runner. Do not
@@ -47,7 +47,7 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
             ));
         }
 
-        // The agent applies the update, crashes once at `point`; the launcher
+        // The agent converges the update, crashes once at `point`; the service wrapper
         // must observe that crash and launch a fresh agent. Merely seeing v2 at
         // the service endpoint is insufficient for the later boundaries: the new workload
         // can become healthy just before the old agent dies.
@@ -91,7 +91,7 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
 }
 
 /// Crash the agent at every *first-install* journal boundary. There is no predecessor to
-/// fall back to, so recovery is not a rollback: the launcher relaunches, the on-disk install
+/// fall back to, so recovery is not a rollback: the service wrapper relaunches, the on-disk install
 /// journal drives the interrupted install to a committed, live release, and no journal is left
 /// behind. This proves cold install has the same crash-safe journaled parity as an update.
 /// Each boundary runs in its own isolated dir + repo, cold-installed from only the runtime.
@@ -113,11 +113,11 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
             .workload(&svc)
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
-            .launcher()?;
+            .command()?;
         cmd.env(updated::env::CHAOS_POINT, point);
-        let boot = Proc::spawn("install-chaos", &mut cmd)?;
+        let boot = Service::spawn("install-chaos", &cmd);
 
-        // The first agent cold-installs and crashes once at `point`; the launcher must
+        // The first agent cold-installs and crashes once at `point`; the service wrapper must
         // observe that crash and launch a fresh agent that resumes the install.
         let crash_seen = boot.wait_for_log(
             &format!("CHAOS: exiting at boundary \"{point}\""),
@@ -189,8 +189,8 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             // every one after it. A workload that merely died would be restarted by the next boot's
             // own converge — the reconciler owns it — so a running, unhealthy release is what makes
             // a boot gate fail and a rollback happen at all.
-            .faulty_workload(&svc, "degrade-after-ready")
-            .launcher()?;
+            .faulty_upgrade(&svc, "degrade-after-ready")
+            .command()?;
         cmd.env(updated::env::CHAOS_POINT, point);
         let node = Service::spawn("rollback-chaos", &cmd);
         let abandon = |node: Service, server: Proc, message: String| -> R {
@@ -219,11 +219,11 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
                 format!("rollback case {point} never committed its degrading candidate"),
             );
         }
-        let Some(agent) = pid_after(&node.captured_log(), "launched agent") else {
+        let Some(agent) = pid_after(&node.captured_log(), "service launched agent") else {
             return abandon(
                 node,
                 server,
-                format!("rollback case {point}: the launcher never reported an agent PID"),
+                format!("rollback case {point}: the service never reported an agent PID"),
             );
         };
         kill_pid(agent);
@@ -238,7 +238,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             matches!(
                 updated::state::read_installed(&state_path),
                 updated::state::Installed::Present(ref state)
-                    if state.release.version == "1.0.0" && state.pending.is_none()
+                    if state.release.version == "1.0.0" && state.rollback_guard.is_none()
             ) && !journal_path.exists()
         });
         let live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
@@ -246,8 +246,8 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             .is_ok_and(|contents| !contents.trim().is_empty());
         let attempts = fixture::attempts(&fixture_root);
         // One transaction, two directions, two identities. The forward direction runs under the
-        // transaction's own token; every compensating operation — the predecessor's `apply`, its
-        // health gate, and the `rollback` — runs under that token's dashless `r` twin, because a
+        // transaction's own token; candidate `rollback`, predecessor `converge`, and predecessor
+        // health all run under that token's dashless `r` twin, because a
         // reconciler that keys completion on the attempt id must never see the same id twice with
         // different arguments. Anything else means an operation borrowed the wrong identity.
         let forward = attempts
@@ -257,26 +257,31 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let compensating = format!("{forward}r");
         let operation_contract_held = !attempts.is_empty()
             && attempts.iter().all(|(operation, id)| {
-                matches!(operation.as_str(), "apply" | "healthcheck" | "rollback")
+                matches!(operation.as_str(), "converge" | "healthcheck" | "rollback")
                     && (*id == forward || *id == compensating)
             })
-            && attempts.iter().any(|(operation, _)| operation == "apply")
+            && attempts
+                .iter()
+                .any(|(operation, _)| operation == "converge")
             && attempts
                 .iter()
                 .all(|(operation, id)| operation != "rollback" || *id == compensating);
         compensated |= attempts
             .iter()
             .any(|(operation, _)| operation == "rollback");
-        // Wherever the recovery reached the compensating hook it must also have converged the
-        // predecessor first, under that same compensating identity: a `rollback` with no
-        // compensating `apply` behind it is a rollback the machine never actually performed.
-        let compensating_apply = attempts
+        // Candidate compensation must complete before the predecessor is converged. Both use the
+        // compensating identity, but the payload subject differs and the operation order is the
+        // durable recovery contract.
+        let rollback_index = attempts
             .iter()
-            .any(|(operation, id)| operation == "apply" && *id == compensating);
-        let converged_before_compensating = !attempts
+            .position(|(operation, id)| operation == "rollback" && *id == compensating);
+        let predecessor_converge_index = attempts
             .iter()
-            .any(|(operation, _)| operation == "rollback")
-            || compensating_apply;
+            .position(|(operation, id)| operation == "healthcheck" && *id == compensating);
+        let compensation_precedes_restore = matches!(
+            (rollback_index, predecessor_converge_index),
+            (Some(rollback), Some(converge)) if rollback < converge
+        );
         let log = node.captured_log();
         drop(node);
         drop(server);
@@ -285,13 +290,13 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             || !live
             || !rejected
             || !operation_contract_held
-            || !converged_before_compensating
+            || !compensation_precedes_restore
         {
             return fail(format!(
                 "rollback recovery at {point} was incomplete (crash_seen={crash_seen}, \
                  durable={durable}, live={live}, rejected={rejected}, \
                  operation_contract_held={operation_contract_held}, \
-                 converged_before_compensating={converged_before_compensating}); \
+                 compensation_precedes_restore={compensation_precedes_restore}); \
                  attempts:\n{attempts:?}\nlog:\n{log}"
             ));
         }
@@ -321,7 +326,7 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     // attempt, so containment must hold indefinitely rather than being papered over by a lucky
     // retry. The rollback case additionally fails the recovery itself.
     let mode = if phase == "rollback" {
-        format!("workload={svc},fail=apply,fail=rollback")
+        format!("workload={svc},fail=converge,fail=rollback")
     } else {
         format!("workload={svc},fail={phase}")
     };
@@ -329,9 +334,9 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .mode(&mode)
-        .launcher()?;
+        .command()?;
     // The single rollback path is boot recovery, so the node runs under the init model: the
-    // failed candidate ends the disposable agent and the launcher's relaunch is what recovers.
+    // failed candidate ends the disposable agent and the service wrapper's relaunch recovers it.
     let node = Service::spawn("provider-failure", &command);
     if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
         let log = node.captured_log();
@@ -392,7 +397,7 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     Ok(())
 }
 
-/// Fuzz the timeout-bounded-*hang* failure mode across every forward lifecycle hook. The clean
+/// Fuzz the timeout-bounded-*hang* failure mode across every forward reconciler hook. The clean
 /// exit-nonzero failure at each operation is covered by [`provider_failure_case`]; this covers the
 /// other way a hook goes wrong — it wedges and never returns. Each hook must be killed by the
 /// agent's hook timeout and recovered from, leaving a *live* predecessor. A stall (no
@@ -401,11 +406,11 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
 /// (Rollback is excluded: its hooks run with the candidate/predecessor reversed, so the forward
 /// hang guard cannot target them.)
 pub(crate) fn provider_hook_hangs_are_bounded(ctx: &Ctx) -> R {
-    const PHASES: &[&str] = &["apply", "healthcheck"];
+    const PHASES: &[&str] = &["converge", "healthcheck"];
     for (index, phase) in PHASES.iter().enumerate() {
         provider_hang_case(ctx, phase, index as u16)?;
     }
-    ok("every forward lifecycle hook hang was bounded by the hook timeout and recovered with the predecessor live");
+    ok("every forward reconciler hook hang was bounded by the hook timeout and recovered with the predecessor live");
     Ok(())
 }
 
@@ -425,7 +430,7 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .mode(&format!("workload={svc},hang={phase}"))
-        .launcher()?;
+        .command()?;
     let node = Service::spawn("provider-hang", &command);
     if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
         let log = node.captured_log();
@@ -461,25 +466,25 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
 }
 
 /// The double-execution window, as a first-class scenario: crash the agent after a successful
-/// `apply` but before its checkpoint lands, so recovery must drive the same transaction's
+/// `converge` but before its checkpoint lands, so recovery must drive the same transaction's
 /// compensating direction and then converge the machine again. This is the exact case the
 /// protocol's execution contract makes the hook author's obligation, so it gets its own named
 /// proof rather than riding inside the boundary sweep. Three claims, each of which the refactor
 /// can break independently:
 ///
 ///  * the two directions of one transaction carry DIFFERENT attempt identities, so a reconciler
-///    that marks completion under the attempt id never mistakes the compensating `apply` for the
+///    that marks completion under the attempt id never mistakes predecessor `converge` for the
 ///    forward one it already ran;
 ///  * every operation of the compensating direction shares ONE identity, so the hook's per-attempt
 ///    state is findable across a resume boot;
 ///  * the migration-shaped release's one-way effect lands exactly once however many invocations it
 ///    takes — the restore point the interrupted attempt took still holds the pre-migration bytes,
 ///    which is precisely what a hook that double-executed would have clobbered.
-pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
+pub(crate) fn converge_replay_converges_exactly_once(ctx: &Ctx) -> R {
     // Disjoint from the hang range (23300..) and the health-failure range (22100..).
     let srv = "127.0.0.1:23400";
     let svc = "127.0.0.1:23450";
-    let dir = ctx.work.join("apply-replay");
+    let dir = ctx.work.join("converge-replay");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
@@ -487,7 +492,7 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let server = ctx.serve(&dir, srv)?;
     let fixture_root = fixture::root(&dir);
-    // A migration-shaped release, so the replayed `apply` re-enters a genuinely one-way effect: a
+    // A migration-shaped release, so replayed `converge` re-enters a genuinely one-way effect: a
     // hook that double-executes copies already-migrated content over its own restore point, which
     // the backup assertions below catch.
     seed_migration_baseline(&dir)?;
@@ -495,10 +500,10 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .mode(&format!("workload={svc},migration-shaped"))
-        .launcher()?;
-    // One-shot crash exactly between the successful apply hook and its durable checkpoint.
-    command.env(updated::env::CHAOS_POINT, "candidate-lifecycle-applied");
-    let node = Proc::spawn("apply-replay", &mut command)?;
+        .command()?;
+    // One-shot crash exactly between successful converge and its durable checkpoint.
+    command.env(updated::env::CHAOS_POINT, "candidate-converge-finished");
+    let node = Service::spawn("converge-replay", &command);
     if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
         let log = node.captured_log();
         drop(node);
@@ -508,7 +513,7 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
         ));
     }
     let crash_seen = node.wait_for_log(
-        "CHAOS: exiting at boundary \"candidate-lifecycle-applied\"",
+        "CHAOS: exiting at boundary \"candidate-converge-finished\"",
         RECOVERY_TIMEOUT,
     );
     let state_path = node_paths(&dir).installed;
@@ -523,7 +528,7 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
     let attempts = fixture::attempts(&fixture_root);
     // The attempt the crash interrupted is the first one recorded. Its compensating direction is a
     // distinct, derived identity, and everything the recovery does to undo that attempt runs under
-    // it: the predecessor's `apply`, its health gate, and the `rollback`.
+    // it: candidate `rollback`, predecessor `converge`, and the predecessor health gate.
     let interrupted = attempts
         .first()
         .map(|(_, id)| id.clone())
@@ -535,7 +540,9 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
         .map(|(operation, _)| operation.as_str())
         .collect();
     let directions_are_distinct = !interrupted.is_empty()
-        && compensating_operations.contains(&"apply")
+        && !compensating_operations.contains(&"converge")
+        && compensating_operations.contains(&"healthcheck")
+        && compensating_operations.contains(&"rollback")
         && attempts
             .iter()
             .all(|(operation, id)| operation != "rollback" || *id == compensating);
@@ -555,7 +562,7 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
     if !crash_seen || !durable || !directions_are_distinct || !effect_landed_once {
         let state = migration.display().to_string();
         return fail(format!(
-            "the interrupted apply did not converge exactly once (crash_seen={crash_seen}, \
+            "the interrupted converge did not land its effect exactly once (crash_seen={crash_seen}, \
              durable={durable}, directions_are_distinct={directions_are_distinct} (forward \
              {interrupted}, compensating {compensating} ran {compensating_operations:?}), \
              effect_landed_once={effect_landed_once}); migration state under {state}: live \
@@ -566,12 +573,12 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
             read(backup.join("app.war")),
         ));
     }
-    ok("an interrupted apply was compensated under its own attempt identity and its one-way effect landed exactly once");
+    ok("an interrupted converge was compensated under its own attempt identity and its one-way effect landed exactly once");
     Ok(())
 }
 
-pub(crate) fn provider_apply_failure(ctx: &Ctx) -> R {
-    provider_failure_case(ctx, "apply", 0)
+pub(crate) fn provider_converge_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "converge", 0)
 }
 pub(crate) fn provider_healthcheck_failure(ctx: &Ctx) -> R {
     provider_failure_case(ctx, "healthcheck", 1)
@@ -581,7 +588,7 @@ pub(crate) fn provider_rollback_failure(ctx: &Ctx) -> R {
 }
 
 /// Seed the baseline a migration-shaped release upgrades from: the live content and application
-/// archive its `apply` must back up before migrating.
+/// archive its `converge` must back up before migrating.
 fn seed_migration_baseline(dir: &Path) -> R<PathBuf> {
     let live = fixture::root(dir).join("migration-state/live");
     std::fs::create_dir_all(&live).map_err(str_err)?;
@@ -602,13 +609,13 @@ pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
     let fixture_root = fixture::root(&dir);
     let live = seed_migration_baseline(&dir)?;
-    let mut node = Node::new(ctx, &dir, srv, "app")
+    let node = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
         .mode(&format!("workload={svc},migration-shaped"))
-        .launcher()?;
-    let process = Proc::spawn("migration-shaped", &mut node)?;
+        .command()?;
+    let process = Proc::spawn("migration-shaped", node)?;
     if !wait_for_version(svc, "1.0.0", TRANSACTION_START_TIMEOUT) {
         return fail("the migration-shaped baseline did not become healthy");
     }
@@ -619,9 +626,9 @@ pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
             "the migration-shaped upgrade never began its transaction; log:\n{log}"
         ));
     }
-    // The reconciler owns all domain-specific sequencing inside one apply operation.
+    // The reconciler owns all domain-specific sequencing inside one converge operation.
     //
-    // The workload answers as 2.0.0 from inside `apply`, so waiting on the service alone would read
+    // The workload answers as 2.0.0 from inside `converge`, so waiting on the service alone would read
     // the recorded history before the transaction's healthcheck had run. The committed upgrade is
     // the barrier that means every operation of this transaction is behind us.
     let upgraded = wait_until(RECOVERY_TIMEOUT, || {
@@ -635,7 +642,7 @@ pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
     let ordered = attempts
         .iter()
         .map(|(operation, _)| operation.as_str())
-        .eq(["apply", "healthcheck"]);
+        .eq(["converge", "healthcheck"]);
     let one_attempt = attempts
         .first()
         .is_some_and(|(_, id)| attempts.iter().all(|(_, candidate)| candidate == id));
@@ -654,7 +661,7 @@ pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
             "the migration-shaped wrapper violated its lifecycle/state contract in {state:?}:\n{attempts:?}"
         ));
     }
-    ok("the migration-shaped reconciler applied its migration, passed healthcheck, and retained an exact rollback backup");
+    ok("the migration-shaped reconciler converged its migration, passed healthcheck, and retained an exact rollback backup");
     Ok(())
 }
 
@@ -670,13 +677,13 @@ pub(crate) fn sample_to_migration_shaped_and_back(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
     let fixture_root = fixture::root(&dir);
     seed_migration_baseline(&dir)?;
-    let mut node = Node::new(ctx, &dir, srv, "app")
+    let node = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
         .mode(&format!("workload={svc},migration-shaped-transition"))
-        .launcher()?;
-    let process = Proc::spawn("artifact-transition", &mut node)?;
+        .command()?;
+    let process = Proc::spawn("artifact-transition", node)?;
     let migrated = wait_until(RECOVERY_TIMEOUT, || {
         wait_for_version(svc, "2.0.0", 1)
             && fixture_root
@@ -698,7 +705,7 @@ pub(crate) fn sample_to_migration_shaped_and_back(ctx: &Ctx) -> R {
         wait_for_version(svc, "3.0.0", 1)
             && fixture::attempts(&fixture_root)
                 .iter()
-                .filter(|(operation, _)| operation == "apply")
+                .filter(|(operation, _)| operation == "converge")
                 .map(|(_, id)| id.clone())
                 .collect::<std::collections::HashSet<_>>()
                 .len()
@@ -732,9 +739,9 @@ pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
     let cmd = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
-        .mode(&format!("workload={svc},migration-shaped-fail-apply"))
-        .launcher()?;
-    // A failed apply is recovered by the launcher's relaunch into boot recovery — the single
+        .mode(&format!("workload={svc},migration-shaped-fail-converge"))
+        .command()?;
+    // A failed converge is recovered by the service wrapper's relaunch into boot recovery — the single
     // rollback path — so this node runs under the init model.
     let node = Service::spawn("migration-rollback", &cmd);
     if !wait_for_version(svc, "1.0.0", TRANSACTION_START_TIMEOUT) {
@@ -773,13 +780,13 @@ pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
 
 /// A machine reboot in the middle of a rollback, which is a different fault from an agent kill: the
 /// hook-managed workload dies with the machine, so the restored predecessor is NOT already running
-/// when the next boot's health gate observes it. Only the predecessor's own `apply` can put it
-/// back, and the resume gate must therefore owe that `apply` until the rollback actually completes —
+/// when the next boot's health gate observes it. Only the predecessor's own `converge` can put it
+/// back, and the resume gate must therefore owe that operation until rollback actually completes —
 /// not merely until it has run once.
 ///
 /// The rest of the suite structurally cannot see this: the fixture's workload is designed to
 /// survive an agent crash, so every other rollback case finds the predecessor already serving.
-pub(crate) fn a_reboot_mid_rollback_still_converges_the_predecessor(ctx: &Ctx) -> R {
+pub(crate) fn a_reboot_mid_rollback_holds_when_predecessor_health_is_lost(ctx: &Ctx) -> R {
     let srv = "127.0.0.1:23410";
     let svc = "127.0.0.1:23460";
     let dir = ctx.work.join("rollback-reboot");
@@ -794,11 +801,11 @@ pub(crate) fn a_reboot_mid_rollback_still_converges_the_predecessor(ctx: &Ctx) -
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .hold_unconfirmed()
-        .faulty_workload(svc, "degrade-after-ready")
-        .launcher()?;
-    // Crash the agent immediately after the predecessor's `apply` — the point at which a resume
-    // boot has "already run" that apply once.
-    cmd.env(updated::env::CHAOS_POINT, "predecessor-lifecycle-applied");
+        .faulty_upgrade(svc, "degrade-after-ready")
+        .command()?;
+    // Crash the agent immediately after predecessor `converge` — the point at which a resume boot
+    // has already run that convergence once.
+    cmd.env(updated::env::CHAOS_POINT, "predecessor-converge-finished");
     let node = Service::spawn("rollback-reboot", &cmd);
     let abandon = |node: Service, server: Proc, message: String| -> R {
         let log = node.captured_log();
@@ -814,25 +821,25 @@ pub(crate) fn a_reboot_mid_rollback_still_converges_the_predecessor(ctx: &Ctx) -
             "the reboot case never committed its degrading candidate".into(),
         );
     }
-    let Some(agent) = pid_after(&node.captured_log(), "launched agent") else {
+    let Some(agent) = pid_after(&node.captured_log(), "service launched agent") else {
         return abandon(
             node,
             server,
-            "the launcher never reported an agent PID".into(),
+            "the service never reported an agent PID".into(),
         );
     };
     kill_pid(agent);
     if !node.wait_for_log(
-        "CHAOS: exiting at boundary \"predecessor-lifecycle-applied\"",
+        "CHAOS: exiting at boundary \"predecessor-converge-finished\"",
         RECOVERY_TIMEOUT,
     ) {
         return abandon(
             node,
             server,
-            "the rollback never reached the predecessor's apply".into(),
+            "the rollback never reached predecessor converge".into(),
         );
     }
-    // The reboot: the workload the predecessor's `apply` had just started dies too. From the next
+    // The reboot: the workload predecessor `converge` had just started dies too. From the next
     // boot's point of view the machine is unconverged, exactly as it would be after a power cycle.
     match fixture::workload_pid(&dir) {
         Some(pid) => kill_pid(pid),
@@ -845,26 +852,23 @@ pub(crate) fn a_reboot_mid_rollback_still_converges_the_predecessor(ctx: &Ctx) -
         }
     }
 
-    let converged = wait_until(RECOVERY_TIMEOUT, || {
-        matches!(
-            updated::state::read_installed(&node_paths(&dir).installed),
-            updated::state::Installed::Present(ref state)
-                if state.release.version == "1.0.0" && state.pending.is_none()
-        ) && !node_paths(&dir).journal.exists()
-    }) && wait_for_version(svc, "1.0.0", RECOVERY_TIMEOUT);
+    let held = wait_until(RECOVERY_TIMEOUT, || {
+        updated::command_adapter::read_attention(&node_paths(&dir).install_root)
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    let preserved = node_paths(&dir).journal.exists();
+    let attempts = fixture::attempts(&fixture::root(&dir));
+    let repeated_deploy = attempts
+        .iter()
+        .any(|(operation, id)| operation == "converge" && id.ends_with('r'));
     let log = node.captured_log();
-    // A healthy predecessor must never be charged a health failure: the bound exists for a
-    // predecessor that cannot come up, and counting an unconverged machine against it would reject
-    // perfectly good bytes after three reboots.
-    let charged = log.contains("unhealthy (attempt");
     drop(node);
     drop(server);
-    if !converged || charged {
-        return fail(format!(
-            "a reboot mid-rollback did not converge the predecessor (converged={converged}, \
-             charged_a_health_failure={charged}):\n{log}"
-        ));
+    if !held || !preserved || repeated_deploy {
+        return fail(format!("lost recovery health must preserve the journal and require attention (held={held}, preserved={preserved}, repeated_deploy={repeated_deploy}):\n{log}"));
     }
-    ok("a reboot mid-rollback re-ran the predecessor's apply and completed the rollback");
+    ok("lost predecessor health held recovery without implicitly running its deployment");
     Ok(())
 }

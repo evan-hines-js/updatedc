@@ -10,6 +10,9 @@ cd "$ROOT"
 printf '\n==> Rust formatting\n'
 cargo fmt --all --check
 
+printf '\n==> Agent archive extraction boundary\n'
+bash scripts/test-agent-archive.sh
+
 printf '\n==> Fleet fuzz release plan\n'
 # shellcheck source=scripts/lib/publish-fuzz-plan.sh
 . scripts/lib/publish-fuzz-plan.sh

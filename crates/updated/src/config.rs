@@ -128,9 +128,6 @@ impl Timeouts {
             health_interval: Duration::from_secs(runtime.timeouts.health_interval_seconds),
             refresh_retry: Duration::from_secs(runtime.timeouts.refresh_retry_seconds),
             confirmation_window: Duration::from_secs(runtime.timeouts.confirmation_window_seconds),
-            agent_check_interval: Duration::from_secs(
-                runtime.timeouts.agent_check_interval_seconds,
-            ),
         }
     }
 }
@@ -183,7 +180,7 @@ pub struct Application {
 pub struct Timeouts {
     /// How often to check for an application update.
     pub check_interval: Duration,
-    /// Window for the `healthcheck` hook to report the deployed release ready after an apply. The
+    /// Window for the `healthcheck` hook to report the deployed release ready after `converge`. The
     /// hook is the only health source (see the Execution contract in
     /// `docs/node-reconciler-protocol.md`), so this is also the full detection latency for a release
     /// that never comes up — a longer grace buys a slow starter more room, and costs exactly that
@@ -203,8 +200,6 @@ pub struct Timeouts {
     /// `healthcheck` verdict on the next agent boot — reverts to the predecessor (one strike);
     /// surviving it confirms the update and drops the rollback image.
     pub confirmation_window: Duration,
-    /// How often to check for an agent release.
-    pub agent_check_interval: Duration,
 }
 
 impl Default for Timeouts {
@@ -220,7 +215,6 @@ impl Default for Timeouts {
             health_interval: Duration::from_secs(1),
             refresh_retry: Duration::from_secs(5),
             confirmation_window: Duration::from_secs(120),
-            agent_check_interval: Duration::from_secs(3600),
         }
     }
 }
@@ -231,12 +225,6 @@ pub struct Paths {
     pub install_root: PathBuf,
     pub versions: PathBuf,
     pub staging: PathBuf,
-    /// Per-release writable working directories for the managed application — the launch `cwd`.
-    /// Deliberately a sibling of `versions/`, never a child of it: `versions/<release>` is the
-    /// content-addressed tree `bundle::verify_release` re-hashes on every check, so a single file
-    /// an ordinary application writes to its own working directory would make the agent
-    /// condemn, re-download and republish the release forever. See [`crate::provider::BundleStore`].
-    pub work: PathBuf,
     pub active_release: PathBuf,
     pub download: PathBuf,
     /// The durable-state directory itself. Every record below that lives directly in it is also
@@ -253,24 +241,25 @@ pub struct Paths {
     pub rejected: PathBuf,
     /// Durable platform-owned evidence for the latest successful state-changing reconciler run.
     pub last_reconciliation: PathBuf,
-    pub provider_versions: PathBuf,
-    pub provider_staging: PathBuf,
-    pub provider_download: PathBuf,
+    /// Private authenticated inputs and their transaction pin, beside enrollment authority.
+    pub runtime_inputs: PathBuf,
+    pub recovery_inputs: PathBuf,
+    /// An OS reboot obligation that survives agent restarts.
+    pub pending_reboot: PathBuf,
     /// The same writable working directories for lifecycle-provider releases, which are re-verified
     /// on exactly the same terms every time one is invoked.
-    pub provider_work: PathBuf,
     /// Root of the reconcilers' private per-product state directories — the parent of every
     /// `--state-dir`. Part of the layout rather than an invoker-local string because
     /// `docs/node-reconciler-protocol.md` promises a hook this directory is "preserved across
     /// replays and boots": moving it silently discards every hook's durable sub-progress.
-    pub provider_state_root: PathBuf,
+    pub execution_state_root: PathBuf,
     /// Where the agent's internal snapshots of reconciler output directories land, partitioned by
     /// the candidate's immutable archive identity. Hooks see only fresh ordinary directories.
-    pub provider_outputs: PathBuf,
+    pub execution_outputs: PathBuf,
 }
 
 /// Where the last live routing assignment is kept: beside the enrollment material in the
-/// launcher's state directory, never under `install_root`.
+/// agent's persistent state directory, never under `install_root`.
 ///
 /// This file is read *before any network fetch* to decide what the managed application is
 /// launched with — its args, assigned input selection, and acceptable product/channel. Nothing
@@ -284,6 +273,12 @@ pub fn persisted_assignment_path(enrollment_state: &Path) -> PathBuf {
 }
 
 impl Paths {
+    /// Serialize agent execution and offline operator decisions through the same installation
+    /// lock. Callers acquire ownership here rather than deriving a second lock-file name.
+    pub fn lock_installation(&self) -> std::io::Result<crate::lock::InstanceLock> {
+        crate::lock::InstanceLock::acquire(&with_suffix(&self.installed, ".lock"))
+    }
+
     /// The canonical layout, derived from the only two roots it depends on: the install root that
     /// holds every replaceable artifact, and the enrollment state directory that holds every
     /// boot-time input. This is the single definition — production, tooling and tests all call it,
@@ -294,7 +289,6 @@ impl Paths {
             install_root: install_root.to_path_buf(),
             versions: install_root.join("versions"),
             staging: install_root.join("staging"),
-            work: install_root.join("work"),
             active_release: install_root.join("active-release"),
             download: install_root.join("staging/bundle.download"),
             installed: state_dir.join("installed.json"),
@@ -309,26 +303,25 @@ impl Paths {
             install_journal: state_dir.join("install.json"),
             rejected: state_dir.join("rejected"),
             last_reconciliation: state_dir.join("reconciliation.json"),
-            provider_versions: install_root.join("providers/versions"),
-            provider_staging: install_root.join("providers/staging"),
-            provider_download: install_root.join("providers/staging/bundle.download"),
-            provider_work: install_root.join("providers/work"),
-            provider_state_root: install_root.join("providers/state"),
-            provider_outputs: install_root.join("providers/outputs"),
+            runtime_inputs: enrollment_state.join("runtime-inputs.json"),
+            recovery_inputs: enrollment_state.join("recovery-inputs.json"),
+            pending_reboot: state_dir.join("pending-reboot.json"),
+            execution_state_root: install_root.join("execution/state"),
+            execution_outputs: install_root.join("execution/outputs"),
         }
     }
 
-    /// One reconciler's `--state-dir`: private to the product, so two lifecycle providers on one
+    /// One reconciler's `--state-dir`: private to the product, so two reconcilers on one
     /// node never share scratch.
     pub fn reconciler_state_dir(&self, product: &str) -> PathBuf {
-        self.provider_state_root.join(product)
+        self.execution_state_root.join(product)
     }
 
     /// Agent-internal canonical snapshot for one release manifest's last successful output
     /// directory. The manifest digest is the identity every lifecycle invocation already carries,
     /// so writers, telemetry readers, and retention all name this file the same way.
     pub fn reconciler_output_snapshot(&self, manifest_sha256: &str) -> PathBuf {
-        self.provider_outputs
+        self.execution_outputs
             .join(format!("{manifest_sha256}.json"))
     }
 }
@@ -347,7 +340,7 @@ impl Config {
 }
 
 /// Append `suffix` to a path's final component. Used for independent lock/download
-/// siblings in the agent self-update path.
+/// siblings in the agent's persistent state directory.
 pub fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
     let mut value = base.as_os_str().to_os_string();
     value.push(suffix);

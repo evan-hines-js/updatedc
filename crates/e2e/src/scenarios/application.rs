@@ -1,7 +1,7 @@
 use super::super::*;
 
-/// A cold node holds only the launcher and the agent. The agent installs the first trusted release
-/// and the release's own `apply` hook starts its workload — the agent never launches a process.
+/// A cold node holds only the agent. It installs the first trusted release
+/// and the release's own `converge` hook starts its workload — the agent never launches a process.
 pub(crate) fn cold_install_applies_the_first_release(ctx: &Ctx) -> R {
     let srv = "127.0.0.1:21079";
     let svc = "127.0.0.1:21074";
@@ -11,15 +11,15 @@ pub(crate) fn cold_install_applies_the_first_release(ctx: &Ctx) -> R {
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     let _server = ctx.serve(&dir, srv)?;
-    let mut node = Node::new(ctx, &dir, srv, "app")
+    let node = Node::new(ctx, &dir, srv, "app")
         .cold_install()
         .workload(svc)
         .check_interval("1s")
-        .launcher()?;
+        .command()?;
     if node_paths(&dir).installed.exists() || node_paths(&dir).active_release.exists() {
         return fail("cold-install fixture accidentally contained a preinstalled application");
     }
-    let process = Proc::spawn("cold-install", &mut node)?;
+    let process = Proc::spawn("cold-install", node)?;
     let installed = process.wait_for_log(
         "cold-installed application 1.0.0 from the first trusted assignment",
         CONVERGE_TIMEOUT,
@@ -30,10 +30,10 @@ pub(crate) fn cold_install_applies_the_first_release(ctx: &Ctx) -> R {
     drop(process);
     if !installed {
         return fail(format!(
-            "the agent did not cold-install the first release and converge it through apply:\n{log}"
+            "the agent did not cold-install the first release and converge it through converge:\n{log}"
         ));
     }
-    ok("a cold node installed the trusted bundle and the release's apply hook brought it into service");
+    ok("a cold node installed the trusted bundle and the release's converge hook brought it into service");
     Ok(())
 }
 /// The install and update state machines share a node but never overlap. This cold-installs v1
@@ -54,7 +54,7 @@ pub(crate) fn cold_install_hands_off_to_update(ctx: &Ctx) -> R {
         .check_interval("2s")
         .health_grace("2s")
         .workload(svc)
-        .launcher()?;
+        .command()?;
     let node = Service::spawn("handoff", &cmd);
     let fail_log = |msg: &str| -> R { fail(format!("{msg}\nlog:\n{}", node.captured_log())) };
 
@@ -117,17 +117,17 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
         // v1 -> v2 edge has been confirmed.
         .confirmation_window("3s")
         .workload(svc)
-        .launcher()?;
+        .command()?;
     // Under a simulated init system: a candidate that fails after activation is rolled back by
     // boot recovery on the next launch, not by an in-process rollback.
     let node = Service::spawn("node", &cmd);
-    // On any failure, attach the node's captured log (launcher + agent). The install
+    // On any failure, attach the node's captured agent log. The install
     // state is already dumped by the runner, so between the two a hang or wrong-state is
     // diagnosable from the failure alone rather than needing a re-run.
     let fail_log = |msg: &str| -> R { fail(format!("{msg}\nlog:\n{}", node.captured_log())) };
 
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        return fail_log("the release's apply hook never brought v1.0.0 into service");
+        return fail_log("the release's converge hook never brought v1.0.0 into service");
     }
     ok("v1.0.0 live from the TUF repository, started by the release's own hook");
 
@@ -165,7 +165,7 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     ) {
         return fail_log("boot recovery did not reject the failing v3.0.0");
     }
-    // 3. ...and the predecessor's own apply hook puts v2.0.0 back into service.
+    // 3. ...and the predecessor's own converge hook puts v2.0.0 back into service.
     if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         return fail_log("service did not recover to v2.0.0 after the failing v3.0.0");
     }
@@ -200,7 +200,7 @@ pub(crate) fn zero_downtime_upgrade(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
 
-    let mut cmd = Node::new(ctx, &dir, srv, "app")
+    let cmd = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace("2s")
         // The window the stand-in load balancer gets to observe the withdrawal. A worker is only
@@ -209,10 +209,10 @@ pub(crate) fn zero_downtime_upgrade(ctx: &Ctx) -> R {
         // scenario still fails outright if the ordering were stop-then-withdraw, because then no
         // hold length excuses a request sent to a node that was still in rotation.
         .draining_workload(svc, 1000)
-        .launcher()?;
-    let _node = Proc::spawn("zero-downtime", &mut cmd)?;
+        .command()?;
+    let _node = Proc::spawn("zero-downtime", cmd)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        return fail("the release's apply hook never brought v1.0.0 into service");
+        return fail("the release's converge hook never brought v1.0.0 into service");
     }
     if !wait_until(EVENT_TIMEOUT, || !fixture::draining(&dir)) {
         return fail("the hook never put v1.0.0 into rotation");
@@ -339,7 +339,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
                 1
             })
             .faulty_workload(&svc, fault)
-            .launcher()?;
+            .command()?;
         let node = Service::spawn("chaotic-app", &command);
         let rejected = node_paths(&dir).rejected;
 
@@ -351,7 +351,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
                 || !wait_until(EVENT_TIMEOUT, || {
                     matches!(
                         updated::state::read_installed(&node_paths(&dir).installed),
-                        updated::state::Installed::Present(ref state) if state.confirmed
+                        updated::state::Installed::Present(ref state) if state.is_proven()
                     )
                 })
             {
@@ -393,7 +393,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
 
 /// A stateless node whose *first* (cold) assignment is a broken head must not strand crash-looping
 /// it. This is the pod-kill-onto-a-broken-rollout case: an emptyDir node returns cold with no
-/// rejection history, cold-installs its assigned head, the release's own `apply` cannot start it —
+/// rejection history, cold-installs its assigned head, the release's own `converge` cannot start it —
 /// and, because cold-install fallback is signed in — rejects it and descends to the newest
 /// healthy release below it. Two broken heads are stacked above the good 1.0.0, so recovery must
 /// descend past BOTH. Run under the init model so the reject → descend cycle plays out exactly as it
@@ -406,7 +406,7 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     ctx.init_repo(&dir)?;
     // The good release below the broken heads.
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
-    // Two heads whose apply hook fails: bytes that verify and stage but whose entrypoint cannot
+    // Two heads whose converge hook fails: bytes that verify and stage but whose entrypoint cannot
     // exec, exactly like the fleet e2e's broken rollout versions. The assigned head is the newest
     // (3.0.0), so recovery must descend past both 3.0.0 and 2.0.0 to reach the healthy 1.0.0.
     let broken = dir.join("broken-app");
@@ -417,10 +417,12 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
         .cold_install_fallback()
-        .workload(svc)
+        // v3 exercises health failure; v2 explicitly exits nonzero from converge on every
+        // platform, rather than relying on how the OS launches a malformed executable.
+        .mode(&format!("workload={svc},fail=converge"))
         .check_interval("1s")
         .health_grace("2s")
-        .launcher()?;
+        .command()?;
     let node = Service::spawn("cold-install-fallback", &command);
     // Recovery is proven when the descended-to 1.0.0 actually serves — the node recovered rather
     // than crash-looping the broken head forever. A working descent takes a few boots (~30s); cap
@@ -436,13 +438,16 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     // Durability: the committed install record names the descended-to 1.0.0, so a further restart
     // converges 1.0.0 and never climbs back onto a rejected broken head.
     let settled = wait_for_installed_version(&dir, "1.0.0", CONVERGE_TIMEOUT);
+    if !node.captured_log().contains("injected converge failure") {
+        return fail("cold-install fallback never exercised a nonzero converge result");
+    }
     drop(node);
     if !settled {
         return fail(
             "descended app served 1.0.0 but the committed install record never settled on it",
         );
     }
-    ok("a cold node rejected two assigned heads whose apply hook failed and descended to the healthy 1.0.0");
+    ok("a cold node rejected two assigned heads whose converge hook failed and descended to the healthy 1.0.0");
     Ok(())
 }
 
@@ -465,7 +470,7 @@ pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &C
         .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
-        .launcher()?;
+        .command()?;
     let node = Service::spawn("cold-install-exhausted", &command);
     let failed_closed = node.wait_for_log(
         "the first trusted assignment contains no installable application",
@@ -490,7 +495,7 @@ pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &C
 
 /// A cold node whose assigned head is a *malformed* bundle — one that verifies its signed archive
 /// hash but cannot be extracted or validated (a corrupt or truncated tar.zst, not merely a bad
-/// entrypoint) — must reject it at ingest and descend, exactly like a head whose apply fails. Two
+/// entrypoint) — must reject it at ingest and descend, exactly like a head whose converge fails. Two
 /// distinct corruption kinds are stacked above the healthy 1.0.0, so cold-install fallback must reject
 /// two independent malformed hashes *before any hook runs* and land on 1.0.0. This guards the
 /// cold-install analogue of the update path's malformed-bundle rejection, which previously did not
@@ -516,7 +521,7 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
         .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
-        .launcher()?;
+        .command()?;
     let node = Service::spawn("cold-install-corrupt", &command);
     // The malformed heads are rejected at ingest (no hook), so the descent is fast; keep a
     // generous cap so a regression surfaces its diagnostics instead of hanging.
@@ -559,7 +564,7 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
 /// The failure both halves use is a release that passes its first health observation and fails every
 /// one after it. That, and not a killed process, is what the evidence has to be built from: a
 /// reconciler that owns its workload restarts a process that merely died — the boot converge's
-/// `apply` would heal it before the gate ever ran — so "the workload is gone" is not by itself
+/// `converge` would heal it before the gate ever ran — so "the workload is gone" is not by itself
 /// evidence of anything. A release that is running and unhealthy is.
 pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
     // Half one: a still-unconfirmed 2.0.0 whose workload dies is reverted and rejected.
@@ -575,8 +580,8 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
         .check_interval("2s")
         .health_grace("2s")
         .hold_unconfirmed()
-        .faulty_workload(svc, "degrade-after-ready")
-        .launcher()?;
+        .faulty_upgrade(svc, "degrade-after-ready")
+        .command()?;
     let node = Service::spawn("unconfirmed", &cmd);
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("v1.0.0 never came into service");
@@ -590,10 +595,9 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
             node.captured_log()
         ));
     }
-    // The agent has no process to watch: the evidence only arrives at the next boot's gate, so
-    // crash the agent (the launcher relaunches it) to reach one.
-    let agent = pid_after(&node.captured_log(), "launched agent")
-        .ok_or("the launcher never reported the agent PID")?;
+    // Crash immediately to exercise the boot gate, independently of the steady confirmation gate.
+    let agent = pid_after(&node.captured_log(), "service launched agent")
+        .ok_or("the service never reported the agent PID")?;
     kill_pid(agent);
     let reverted = node.wait_for_log(
         "failed its boot health gate inside its confirmation window; reverting to 1.0.0",
@@ -624,8 +628,8 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
         .check_interval("2s")
         .health_grace("2s")
         .confirmation_window("2s")
-        .faulty_workload(svc, "degrade-after-ready")
-        .launcher()?;
+        .mode(&format!("workload={svc},health-marker"))
+        .command()?;
     let node = Service::spawn("confirmed", &cmd);
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("v1.0.0 never came into service");
@@ -640,8 +644,15 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
             node.captured_log()
         ));
     }
-    let agent = pid_after(&node.captured_log(), "launched agent")
-        .ok_or("the launcher never reported the agent PID")?;
+    // The release must stay healthy THROUGH confirmation. Only now make its hook fail;
+    // degrading after the first probe used to encode the unhealthy-confirmation bug itself.
+    std::fs::write(
+        fixture::root(&dir).join("unhealthy"),
+        b"fail confirmed health",
+    )
+    .map_err(str_err)?;
+    let agent = pid_after(&node.captured_log(), "service launched agent")
+        .ok_or("the service never reported the agent PID")?;
     kill_pid(agent);
     let reported = node.wait_for_log(
         "the committed release 2.0.0 is unhealthy; reporting it and continuing to reconcile",
@@ -704,11 +715,11 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
         // Only the failing peer's release degrades after its first health observation; the two
         // nodes are otherwise identical, so what separates them is the release's own health.
         node = if fails {
-            node.faulty_workload(service_addr, "degrade-after-ready")
+            node.faulty_upgrade(service_addr, "degrade-after-ready")
         } else {
             node.workload(service_addr)
         };
-        let command = node.launcher()?;
+        let command = node.command()?;
         services.push((dir, service_addr, Service::spawn(name, &command)));
     }
 
@@ -730,8 +741,8 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
             failing.captured_log()
         ));
     }
-    let agent = pid_after(&failing.captured_log(), "launched agent")
-        .ok_or("the failing peer's launcher never reported an agent PID")?;
+    let agent = pid_after(&failing.captured_log(), "service launched agent")
+        .ok_or("the failing peer's service never reported an agent PID")?;
     kill_pid(agent);
     if !failing.wait_for_log(
         "failed its boot health gate inside its confirmation window; reverting to 1.0.0",

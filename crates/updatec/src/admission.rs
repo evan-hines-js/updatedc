@@ -48,7 +48,6 @@ pub struct AdmissionSubject {
     /// SHA-256 of this canonical subject's policy-bearing facts.
     pub id: String,
     pub application_sha256: String,
-    pub provider_set_sha256: String,
 }
 
 impl AdmissionSubject {
@@ -73,19 +72,16 @@ impl AdmissionSubject {
         struct Facts<'a> {
             schema: u32,
             application_sha256: &'a str,
-            provider_set_sha256: &'a str,
         }
 
         let facts = Facts {
             schema: ADMISSION_SCHEMA,
             application_sha256: &deployment.application.sha256,
-            provider_set_sha256: &deployment.provider_set.sha256,
         };
         let encoded = serde_json::to_vec(&facts).expect("admission facts contain only strings");
         Self {
             id: updated_contracts::digest::sha256_bytes(&encoded),
             application_sha256: deployment.application.sha256.clone(),
-            provider_set_sha256: deployment.provider_set.sha256.clone(),
         }
     }
 }
@@ -1288,7 +1284,7 @@ mod tests {
         );
         assert_eq!(status.reason, "NonCompliantAllowed");
 
-        // Actions are local interpretation, not remote authority. An operator edit applies to the
+        // Actions are local interpretation, not remote authority. An operator edit converges to the
         // cached signed verdict immediately and must not manufacture a second webhook refresh.
         policy.spec.actions.non_compliant = AdmissionAction::Block;
         policy.metadata.resource_version = Some("13".into());

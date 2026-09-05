@@ -1,9 +1,16 @@
 #!/bin/sh
 set -eu
 
+# Model a machine's init: reap detached workload children and keep the agent signalable.
+# Namespace PID 1 ignores SIGSTOP from peers, which otherwise makes the stale-report fault
+# injection silently leave the agent running. Every test node uses this same entrypoint.
+if [ "$$" -eq 1 ]; then
+  exec /usr/bin/tini -- "$0" "$@"
+fi
+
 install=/var/lib/updated
-launcher="$install/launcher"
-mkdir -p "$launcher"
+state="$install/state"
+mkdir -p "$state"
 # This node's self-asserted enrollment name — the `CN` the gateway mints and the `UpdateAgent` it
 # creates. Derived deterministically from the hostname so it is stable across restarts, and read
 # from the single definition of that derivation (`resource_name`, crates/updatec-e2e/src/cluster.rs)
@@ -24,5 +31,5 @@ client_cert = "/etc/agent-tls/tls.crt"
 client_key = "/etc/agent-tls/tls.key"
 EOF
 
-exec /usr/local/bin/updated-launcher --state-dir "$launcher" --config /tmp/config.toml \
-  --agent /usr/local/bin/updated-agent --ready-timeout 30 --confirm-timeout 2
+export UPDATED_STATE_DIR="$state"
+exec /usr/local/bin/updated-agent --config /tmp/config.toml

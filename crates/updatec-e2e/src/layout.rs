@@ -184,7 +184,7 @@ pub(crate) const FLEET_VALUE: &str = "managed";
 pub(crate) const REPORT_FRESHNESS_SECS: usize =
     updated_contracts::telemetry::REPORT_FRESHNESS.as_secs() as usize;
 /// How long the staleness scenario watches a wedged rollout before accepting that it is genuinely
-/// held. Long enough to cover several reconciles and several agent check intervals (both are
+/// held. Long enough to cover several reconciliation intervals (which are
 /// ~1s here), so "it did not advance" is a property of the planner and not of the sampling.
 pub(crate) const STALENESS_HOLD_SECS: usize = 30;
 

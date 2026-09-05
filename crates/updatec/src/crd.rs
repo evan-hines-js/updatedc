@@ -8,11 +8,11 @@
 //! how a node acts on a meaning it was never taught. `schemars` faithfully renders that as
 //! `additionalProperties: false` — and the Kubernetes API server refuses exactly that beside
 //! `properties` in a structural schema. A custom resource gets its closedness from structural
-//! pruning, which the server applies regardless, so the pair is not merely illegal but redundant.
+//! pruning, which the server converges regardless, so the pair is not merely illegal but redundant.
 //!
 //! Stripping it at generation time is therefore correct, and doing it *here* is what makes it
 //! reliable: the chart's `crdgen` and the test that enforces structural-ness now read from one
-//! function, so the YAML an operator applies is the YAML that was checked.
+//! function, so the YAML an operator converges is the YAML that was checked.
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::CustomResourceExt;

@@ -3,6 +3,56 @@
 
 use super::*;
 
+/// Different repositories have independent publishers even when they share a namespace.
+/// A fixed-length digest also handles maximum-length Kubernetes repository names.
+pub fn publisher_lease_name(repository: &str) -> String {
+    let digest = updated_contracts::digest::sha256_bytes(repository.as_bytes());
+    format!("updatec-publisher-{}", &digest[..32])
+}
+
+pub async fn acquire_or_renew_publisher_lease(
+    client: Client,
+    namespace: &str,
+    repository: &str,
+    identity: &str,
+) -> Result<bool, kube::Error> {
+    acquire_or_renew_lease(
+        client,
+        namespace,
+        &publisher_lease_name(repository),
+        identity,
+    )
+    .await
+}
+
+pub(crate) async fn holds_publisher_lease(
+    client: &Client,
+    namespace: &str,
+    repository: &str,
+    identity: &str,
+) -> Result<bool, kube::Error> {
+    holds_lease(
+        client,
+        namespace,
+        &publisher_lease_name(repository),
+        identity,
+    )
+    .await
+}
+
+/// The elected publisher additionally owns the shared state volume. Keep this lock for the
+/// entire leadership epoch, and terminate the process on lease loss BEFORE dropping it:
+/// cancelling an async reconcile does not stop its already-running blocking filesystem work.
+pub fn acquire_publisher_state(state_dir: &Path) -> std::io::Result<updated::lock::InstanceLock> {
+    updated::lock::InstanceLock::acquire(&state_dir.join("publisher.lock"))
+}
+
+/// End the writer epoch without unwinding and releasing its filesystem lock ahead of outstanding
+/// writes. The kernel stops all threads and releases the lock; Kubernetes restarts the replica.
+pub fn exit_publisher_epoch() -> ! {
+    std::process::exit(1)
+}
+
 /// Acquire or renew the Kubernetes single-writer lease. Conflicts are ordinary follower
 /// outcomes, not reconciliation failures.
 pub async fn acquire_or_renew_lease(
@@ -51,9 +101,9 @@ pub async fn acquire_or_renew_lease(
     *spec = next;
     // `lease` still carries the `resourceVersion` we read, so this PUT is a compare-and-swap: if any
     // other candidate acquired or renewed in the meantime, the apiserver rejects it with a 409 and we
-    // become a follower. That makes the lease a strict single writer — two candidates can never both
-    // believe they hold it — which, together with the in-cluster admitted set, is what serializes
-    // publication across a leader change.
+    // become a follower. This serializes changes to the lease record, but cannot stop a paused
+    // former holder from resuming work. The publisher's shared-state lock and process-ending
+    // epoch boundary additionally fence those outstanding writes across a leader change.
     match leases.replace(name, &PostParams::default(), &lease).await {
         Ok(_) => Ok(true),
         Err(kube::Error::Api(error)) if error.code == 409 => Ok(false),
@@ -122,6 +172,134 @@ pub(crate) async fn holds_lease(
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod lease_tests {
     use super::*;
+
+    #[test]
+    fn publisher_leases_are_repository_scoped_and_bounded() {
+        assert_eq!(publisher_lease_name("first"), publisher_lease_name("first"));
+        assert_ne!(
+            publisher_lease_name("first"),
+            publisher_lease_name("second")
+        );
+        let longest = publisher_lease_name(&"a".repeat(253));
+        assert!(longest.len() <= 63);
+        assert!(longest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
+    }
+
+    #[tokio::test]
+    async fn separate_repositories_can_hold_publisher_leases_together() {
+        use axum::http::{Method, StatusCode};
+        let leases = Arc::new(std::sync::Mutex::new(
+            BTreeMap::<String, serde_json::Value>::new(),
+        ));
+        let served = leases.clone();
+        let client = crate::tests::apiserver(move |method, path, body| {
+            let mut leases = served.lock().unwrap();
+            if *method == Method::POST || *method == Method::PUT {
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let name = value["metadata"]["name"].as_str().unwrap().to_owned();
+                leases.insert(name, value.clone());
+                return (StatusCode::OK, value);
+            }
+            let name = path.rsplit('/').next().unwrap();
+            match leases.get(name) {
+                Some(value) => (StatusCode::OK, value.clone()),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({
+                        "apiVersion":"v1", "kind":"Status", "status":"Failure",
+                        "reason":"NotFound", "message":"lease absent", "code":404
+                    }),
+                ),
+            }
+        });
+        assert!(
+            acquire_or_renew_publisher_lease(client.clone(), "default", "first", "pod-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            acquire_or_renew_publisher_lease(client.clone(), "default", "second", "pod-b")
+                .await
+                .unwrap()
+        );
+        assert!(holds_publisher_lease(&client, "default", "first", "pod-a")
+            .await
+            .unwrap());
+        assert!(holds_publisher_lease(&client, "default", "second", "pod-b")
+            .await
+            .unwrap());
+        assert!(
+            !acquire_or_renew_publisher_lease(client.clone(), "default", "first", "pod-c")
+                .await
+                .unwrap()
+        );
+        assert!(
+            acquire_or_renew_publisher_lease(client, "default", "first", "pod-a")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn publisher_epoch_exit_worker() {
+        let Some(dir) = std::env::var_os("UPDATED_TEST_PUBLISHER_EPOCH") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let _lock = acquire_publisher_state(&dir).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let writes = dir.clone();
+            let writer = tokio::task::spawn_blocking(move || {
+                for i in 0..1000 {
+                    std::fs::write(writes.join("writes"), i.to_string()).unwrap();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            while !dir.join("writes").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Model the old failure: cancelling the waiter leaves the write task alive.
+            drop(writer);
+            std::fs::write(dir.join("ready"), b"ready").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !dir.join("lose-lease").exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            exit_publisher_epoch();
+        });
+    }
+
+    #[test]
+    fn a_lost_epoch_cannot_write_after_its_successor_acquires_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runtime::lease::lease_tests::publisher_epoch_exit_worker",
+                "--nocapture",
+            ])
+            .env("UPDATED_TEST_PUBLISHER_EPOCH", dir.path());
+        let mut child = foundation::process::ContainedChild::spawn(command).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dir.path().join("ready").exists());
+        assert_eq!(
+            acquire_publisher_state(dir.path()).err().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        std::fs::write(dir.path().join("lose-lease"), b"lost").unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(1));
+        let _successor = acquire_publisher_state(dir.path()).unwrap();
+        let before = std::fs::read(dir.path().join("writes")).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(before, std::fs::read(dir.path().join("writes")).unwrap());
+    }
 
     #[tokio::test]
     async fn signing_key_materialization_requires_one_complete_rotatable_set() {
@@ -696,7 +874,7 @@ pub(crate) mod lease_tests {
         }
         assert_eq!(patch["observedGeneration"], 4);
         assert_eq!(patch["conditions"][0]["reason"], "ReconciliationFailed");
-        // A merge patch replaces the whole array, so the same rule applies inside it: the failure
+        // A merge patch replaces the whole array, so the same rule converges inside it: the failure
         // owns `Ready` and nothing else. Rewriting the array with only its own entry hid the
         // enrollment ceiling for as long as the failure lasted.
         let types: Vec<&str> = patch["conditions"]

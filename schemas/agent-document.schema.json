@@ -5,9 +5,14 @@
   "description": "The minimal routing document for one agent. Control-plane grouping is deliberately absent.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "config"],
+  "required": [
+    "schema",
+    "config"
+  ],
   "properties": {
-    "schema": { "const": 1 },
+    "schema": {
+      "const": 1
+    },
     "config": {
       "$ref": "https://updated.dev/schemas/target-reference.schema.json"
     }

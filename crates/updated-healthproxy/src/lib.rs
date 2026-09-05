@@ -693,7 +693,7 @@ impl Config {
         // Validate at the process boundary even though updatec also validates the CR before it
         // projects this environment variable. The binary is independently runnable, and this is
         // the one parser used by both paths rather than security inherited from a particular
-        // launcher.
+        // process host.
         let health_base = updated::http::network_endpoint(
             &health_base,
             updated::http::EndpointTransport::HttpOrHttps,
@@ -970,20 +970,14 @@ mod tests {
         )
         .unwrap();
         let transition = ReconciliationTransition::new(running.clone(), running);
-        let reconciler_release =
-            ReconciledRelease::new("1.0.0".into(), DIGEST.into(), DIGEST.into()).unwrap();
         report.reconciliation = Some(
             LastReconciliation::new(
-                MutationOperation::Apply,
+                MutationOperation::Converge,
                 Reason::Restart,
                 updated_contracts::reconciler::attempt::CONVERGE.into(),
                 transition,
-                ReconcilerIdentity::new(
-                    report.provider_set_sha256.clone(),
-                    "system".into(),
-                    reconciler_release,
-                )
-                .unwrap(),
+                ReconcilerIdentity::new(report.definition_sha256.clone(), "system".into(), 1)
+                    .unwrap(),
                 SuccessfulMutation::new(false, HostAction::None, None).unwrap(),
                 1,
             )

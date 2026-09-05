@@ -1,30 +1,33 @@
 //! The agent's pure domain: data in, data out.
 //!
 //! Nothing here touches the filesystem, the network, the clock, or a process. The
-//! decision logic is a state machine over durable state and the launcher's rejection
-//! marker; the shell gathers the inputs (a [`Situation`]), calls a planner, and
+//! decision logic is a state machine over durable state; the shell gathers the inputs (a
+//! [`Situation`]), calls a planner, and
 //! performs the returned plan through its adapters. Because the core is pure, every
 //! branch is provable in a unit test with hand-built data — no real time, files, or
 //! subprocesses.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use updated::bundle::ReleaseId;
 use updated::config::Timeouts;
-pub(crate) use updated::state::{Installed, InstalledState, Pending};
+pub(crate) use updated::state::{Installed, InstalledState, Maturity, RollbackGuard};
 pub(crate) use updated::transaction::{Phase as TransactionPhase, Transaction};
 use updated_contracts::reconciler::Reason;
 
-/// Whether a [`Pending`] update's confirmation window has passed as of `now` (unix secs).
-pub(crate) fn window_passed(pending: &Pending, window: Duration, now: u64) -> bool {
-    now >= pending.committed_at.saturating_add(window.as_secs())
+/// Whether a [`RollbackGuard`] update's confirmation window has passed as of `now` (unix secs).
+pub(crate) fn window_passed(rollback_guard: &RollbackGuard, window: Duration, now: u64) -> bool {
+    now >= rollback_guard.committed_at.saturating_add(window.as_secs())
 }
 
-/// Wall-clock time left in a [`Pending`] update's window as of `now`, so the loop can
+/// Wall-clock time left in a [`RollbackGuard`] update's window as of `now`, so the loop can
 /// wake to confirm even when the update interval is longer.
-pub(crate) fn window_remaining(pending: &Pending, window: Duration, now: u64) -> Duration {
-    let ends_at = pending.committed_at.saturating_add(window.as_secs());
+pub(crate) fn window_remaining(
+    rollback_guard: &RollbackGuard,
+    window: Duration,
+    now: u64,
+) -> Duration {
+    let ends_at = rollback_guard.committed_at.saturating_add(window.as_secs());
     // Clamped to the window itself: more than that is never a legitimate answer, and a
     // `committed_at` in the future — a backward clock step across a reboot, or a corrupt
     // record, the installed state being plain JSON with no integrity check — would otherwise
@@ -65,7 +68,6 @@ impl BoundedTimeouts {
             health_interval: timeouts.health_interval.min(MAX_WAIT),
             refresh_retry: timeouts.refresh_retry.min(MAX_WAIT),
             confirmation_window: timeouts.confirmation_window.min(MAX_WAIT),
-            agent_check_interval: timeouts.agent_check_interval.min(MAX_WAIT),
         })
     }
 }
@@ -79,13 +81,13 @@ impl std::ops::Deref for BoundedTimeouts {
 }
 
 /// The whole identity of the boot health gate's invocation: which attempt it belongs to, which
-/// release it observes, which release that one displaced, and the providers it must observe with.
+/// payload it observes, which payload that one displaced, and the reconciler it must observe with.
 ///
 /// These are one signed unit and must always be resolved together. During a crash-recovered
 /// rollback the predecessor's commit is deferred until *after* the gate, so the installed record
 /// still names the CANDIDATE while the restored PREDECESSOR is what the node is running: taking
 /// the providers from the transaction but the identity from the record would gate 1.0.0 with
-/// `--candidate 2.0.0`, and a reconciler that honours the documented argv contract reports
+/// `--payload-version 2.0.0`, and a reconciler that honours the documented argv contract reports
 /// unhealthy — eventually rejecting a perfectly good release and writing its outputs under the
 /// candidate's hash, where telemetry never looks.
 pub(crate) struct GateTarget {
@@ -99,14 +101,14 @@ pub(crate) struct GateTarget {
     pub candidate_archive_sha256: String,
     pub predecessor: ReleaseId,
     pub predecessor_archive_sha256: String,
-    pub lifecycle: Box<updated::state::ProviderRelease>,
+    pub reconciler: Box<updated::state::ReconcilerRelease>,
 }
 
 /// Resolve the boot gate's whole invocation identity from one source.
 ///
 /// A crash-recovered rollback's boot gate IS that transaction's health step — its verdict advances
-/// `RollbackApplied` -> `RollbackVerified` and bounds the rollback — so it carries the same
-/// compensating attempt identity as the transaction's predecessor `apply` and its `rollback`, and
+/// `Restored` -> `RollbackVerified` and bounds the rollback — so it carries the same
+/// compensating attempt identity as the transaction's predecessor `converge` and its `rollback`, and
 /// names the failed candidate as the predecessor. Every other boot gate belongs to no transaction
 /// and is a reserved-identity observation of the installed release.
 pub(crate) fn boot_gate_target(
@@ -122,7 +124,7 @@ pub(crate) fn boot_gate_target(
             candidate_archive_sha256: tx.previous_archive_sha256.clone(),
             predecessor: tx.candidate_release.clone(),
             predecessor_archive_sha256: tx.candidate_archive_sha256.clone(),
-            lifecycle: tx.previous_lifecycle.clone(),
+            reconciler: tx.previous_reconciler.clone(),
         },
         _ => GateTarget {
             attempt: updated_contracts::reconciler::attempt::BOOT.to_string(),
@@ -131,7 +133,7 @@ pub(crate) fn boot_gate_target(
             candidate_archive_sha256: installed.archive_sha256.clone(),
             predecessor: installed.release.clone(),
             predecessor_archive_sha256: installed.archive_sha256.clone(),
-            lifecycle: installed.lifecycle.clone(),
+            reconciler: installed.reconciler.clone(),
         },
     }
 }
@@ -147,12 +149,21 @@ pub(crate) struct Situation {
     pub active: Option<ReleaseId>,
     /// The in-flight update transaction, if a journal is present.
     pub journal: Option<Transaction>,
-    /// A candidate agent the launcher rolled back (reject its content hash).
-    pub bad_agent: Option<PathBuf>,
-    /// How long a committed update stays unconfirmed.
-    pub confirm_window: Duration,
-    /// Unix seconds now (the only clock input; kept explicit so the planner stays pure).
-    pub now: u64,
+}
+
+impl Situation {
+    /// A payload pointer proves an interrupted revert only if it moved away from the
+    /// installed payload. Reconciler-only updates share that pointer with their predecessor;
+    /// their rollback direction must come from an explicit transaction journal.
+    pub(crate) fn predecessor_is_active(&self) -> bool {
+        let Installed::Present(installed) = &self.installed else {
+            return false;
+        };
+        installed.rollback_guard.as_ref().is_some_and(|guard| {
+            guard.previous_release != installed.release
+                && self.active.as_ref() == Some(&guard.previous_release)
+        })
+    }
 }
 
 /// The boot planner's decision — a pure description the executor performs in order.
@@ -168,10 +179,7 @@ pub(crate) struct Plan {
     pub clear_journal: bool,
     /// Candidate verdict identities to add to the rejected set.
     pub reject_candidate: Vec<(updated::state::RepositoryLineage, String)>,
-    /// A rolled-back candidate agent to reject, by its content-addressed path.
-    pub reject_agent: Option<PathBuf>,
-    /// Installed-state to (re)write — set to confirm an update (clear pending) or to
-    /// commit the predecessor on a revert.
+    /// Installed-state to (re)write when committing the predecessor on a revert.
     pub commit: Option<InstalledState>,
     pub notes: Vec<Note>,
 }
@@ -218,17 +226,14 @@ mod tests {
     use super::*;
     use crate::test_support::{deployment_rejection, digest, lineage, provider, release};
 
-    fn pending() -> Pending {
-        Pending {
-            lifecycle_attempt_id: digest("attempt"),
-            candidate_rejection_sha256: deployment_rejection(
-                &digest("candidate-archive"),
-                &provider().provider_set_sha256,
-            ),
+    fn rollback_guard() -> RollbackGuard {
+        RollbackGuard {
+            attempt_id: digest("attempt"),
+            candidate_rejection_sha256: deployment_rejection(&digest("candidate-archive")),
             previous_release: release("1.0.0", "one"),
             previous_archive_sha256: digest("archive-one"),
             previous_repository_lineage: lineage(),
-            lifecycle: provider(),
+            reconciler: provider(),
             committed_at: 1000,
         }
     }
@@ -237,33 +242,39 @@ mod tests {
     fn window_remaining_and_passed_track_the_confirmation_deadline() {
         let window = Duration::from_secs(120); // deadline at committed_at + 120 = 1120
         assert_eq!(
-            window_remaining(&pending(), window, 1000),
+            window_remaining(&rollback_guard(), window, 1000),
             Duration::from_secs(120)
         );
         assert_eq!(
-            window_remaining(&pending(), window, 1100),
+            window_remaining(&rollback_guard(), window, 1100),
             Duration::from_secs(20)
         );
-        assert!(!window_passed(&pending(), window, 1119));
+        assert!(!window_passed(&rollback_guard(), window, 1119));
         // A `committed_at` in the future must not produce a duration that panics the
         // loop's `Instant + Duration`; at most one window of waiting is ever correct.
-        let future = Pending {
-            lifecycle_attempt_id: digest("attempt"),
+        let future = RollbackGuard {
+            attempt_id: digest("attempt"),
             committed_at: u64::MAX - 1,
-            ..pending()
+            ..rollback_guard()
         };
         assert_eq!(window_remaining(&future, window, 1000), window);
         let _ = std::time::Instant::now() + window_remaining(&future, window, 1000);
         // At and past the deadline: no time remains, and it counts as passed.
-        assert_eq!(window_remaining(&pending(), window, 1120), Duration::ZERO);
-        assert_eq!(window_remaining(&pending(), window, 5000), Duration::ZERO);
-        assert!(window_passed(&pending(), window, 1120));
+        assert_eq!(
+            window_remaining(&rollback_guard(), window, 1120),
+            Duration::ZERO
+        );
+        assert_eq!(
+            window_remaining(&rollback_guard(), window, 5000),
+            Duration::ZERO
+        );
+        assert!(window_passed(&rollback_guard(), window, 1120));
     }
 
     /// The installed record as it looks mid-rollback: the CANDIDATE, because its predecessor's
     /// commit is deferred until after the boot health gate.
     fn deferred_candidate_record() -> InstalledState {
-        InstalledState::confirmed(
+        InstalledState::proven(
             lineage(),
             release("2.0.0", "two"),
             digest("archive-two"),
@@ -273,7 +284,7 @@ mod tests {
 
     fn rollback_of(predecessor: ReleaseId) -> Transaction {
         let mut predecessor_provider = provider();
-        predecessor_provider.release = release("0.9.0", "predecessor-provider");
+        predecessor_provider.definition_sha256 = digest("predecessor-execution");
         Transaction {
             id: digest("attempt"),
             previous_release: predecessor,
@@ -281,16 +292,13 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: release("2.0.0", "two"),
             candidate_archive_sha256: digest("archive-two"),
-            candidate_rejection_sha256: deployment_rejection(
-                &digest("archive-two"),
-                &provider().provider_set_sha256,
-            ),
+            candidate_rejection_sha256: deployment_rejection(&digest("archive-two")),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
-            previous_lifecycle: predecessor_provider,
-            candidate_lifecycle: provider(),
+            previous_reconciler: predecessor_provider,
+            candidate_reconciler: provider(),
             rollback_health_failures: 0,
-            phase: TransactionPhase::RollbackActivating,
+            phase: TransactionPhase::RollbackPlanned,
         }
     }
 
@@ -298,17 +306,17 @@ mod tests {
     fn the_boot_gate_targets_the_release_that_is_actually_running() {
         // A crash-recovered rollback restored 1.0.0 but the installed record still names the
         // candidate. Both the identity AND the providers must come from the transaction: gating
-        // 1.0.0 with `--candidate 2.0.0` makes a conforming reconciler report unhealthy.
+        // 1.0.0 with `--payload-version 2.0.0` makes a conforming reconciler report unhealthy.
         let predecessor = release("1.0.0", "one");
         let tx = rollback_of(predecessor.clone());
         let record = deferred_candidate_record();
 
         let target = boot_gate_target(Some(&tx), &record, Reason::Restart);
         assert_eq!(target.candidate, predecessor);
-        assert_eq!(target.lifecycle, tx.previous_lifecycle);
+        assert_eq!(target.reconciler, tx.previous_reconciler);
         // The gate is this rollback's health step, so it carries the transaction's own compensating
         // identity and names the failed candidate as the predecessor — the same three arguments its
-        // predecessor `apply` and its `rollback` carry.
+        // predecessor `converge` and its `rollback` carry.
         assert_eq!(target.attempt, tx.rollback_attempt_id());
         assert_eq!(target.reason, Reason::Update);
         assert_eq!(target.predecessor, tx.candidate_release);
@@ -322,14 +330,14 @@ mod tests {
         let target = boot_gate_target(None, &record, Reason::Restart);
         assert_eq!(target.candidate, record.release);
         assert_eq!(target.predecessor, record.release);
-        assert_eq!(target.lifecycle, record.lifecycle);
+        assert_eq!(target.reconciler, record.reconciler);
         assert_eq!(target.attempt, updated_contracts::reconciler::attempt::BOOT);
         assert_eq!(target.reason, Reason::Restart);
 
         // A forward transaction is not a rollback: nothing was restored, the record still governs
         // and the gate is still a reserved-identity observation.
         let mut forward = rollback_of(release("1.0.0", "one"));
-        forward.phase = TransactionPhase::Activating;
+        forward.phase = TransactionPhase::Activated;
         let target = boot_gate_target(Some(&forward), &record, Reason::Install);
         assert_eq!(target.candidate, record.release);
         assert_eq!(target.predecessor, record.release);
@@ -347,7 +355,6 @@ mod tests {
             health_interval: Duration::MAX,
             refresh_retry: Duration::MAX,
             confirmation_window: Duration::MAX,
-            agent_check_interval: Duration::MAX,
             ..Timeouts::default()
         });
         let now = std::time::Instant::now();
@@ -357,7 +364,6 @@ mod tests {
             bounded.health_interval,
             bounded.refresh_retry,
             bounded.confirmation_window,
-            bounded.agent_check_interval,
         ] {
             assert_eq!(wait, MAX_WAIT);
             let _ = now + wait;

@@ -1,4 +1,4 @@
-# systemd unit for the self-updating agent (Linux). This is the ONE unit definition:
+# systemd unit for the externally supervised agent (Linux). This is the ONE unit definition:
 # the `updated-agent` .deb/.rpm ships this exact file, install.sh places this exact
 # file from the release archive, and the Ansible role installs either that package or
 # that same archived file — it templates no copy of its own, so a node can never run a
@@ -11,59 +11,36 @@
 #   systemctl daemon-reload
 #   systemctl enable --now updated-agent
 #
-# systemd manages the lifecycle of the tiny, installer-owned LAUNCHER (launcher).
-# The launcher runs the committed agent pointer and advances it only after a
-# content-addressed candidate proves it can run; the agent deploys releases by
-# invoking each release's own reconciler hooks. Workload processes belong to the
-# hooks (typically their own systemd units), never to the launcher or the agent,
+# systemd manages the lifecycle of the installer-owned agent directly. Agent binary upgrades are
+# ordinary package/configuration-management operations; systemd restarts the service onto the new
+# bytes. The agent deploys releases by invoking each release's own reconciler hooks. Workload
+# processes belong to those hooks (typically their own systemd units), never to the agent,
 # so this unit's restarts can never disturb a workload:
 #
-#   systemd --manages--> launcher --activates--> agent --invokes--> release hooks
-#                            |
-#                      pointer-swaps the agent (readiness-gated); never itself
-#
-#     package manager --replaces--> launcher/agent   (out-of-band alternative)
-#
-# The launcher runs continuously: when the agent stages a self-update and exits,
-# the launcher (not systemd) activates the candidate under a readiness gate,
-# committing its path or retaining the previous pointer. systemd only relaunches
-# the launcher itself, on the rare event that it crashes.
+#   systemd --manages--> agent --invokes--> release hooks
+#        ^
+#   package manager --replaces--> agent
 
 [Unit]
-Description=Self-updating release agent (via launcher)
+Description=Updated release agent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 
-# The launcher is installer-owned and read-only; it never updates itself, so it
-# lives outside the writable state directory. The initial agent is installer-owned;
-# later verified candidates live content-addressed under the state directory.
-#
-# No --agent-config: the launcher reads the canonical /etc/updated/config.toml.
-# Pass it only if this deployment puts the config somewhere else.
-#
-# The defaults below are the unit's own, so the unit is complete on its own; the
-# optional environment file overrides them. That is the one place to widen
-# --ready-timeout for a fleet whose first cold install pulls a large bundle over a
-# slow link — editing a conf file, never a second copy of this unit.
+# The package-owned binary is read-only. Persistent enrollment, identity, and update transaction
+# state live in StateDirectory; the optional environment file may relocate either path.
 Environment=UPDATED_STATE_DIR=/var/lib/updated
-Environment=UPDATED_AGENT=/usr/lib/updated/updated-agent
-Environment=UPDATED_READY_TIMEOUT=60
-Environment=UPDATED_CONFIRM_TIMEOUT=30
+Environment=UPDATED_CONFIG=/etc/updated/config.toml
 EnvironmentFile=-/etc/updated/agent.env
-ExecStart=/usr/lib/updated/updated-launcher --state-dir ${UPDATED_STATE_DIR} --agent ${UPDATED_AGENT} --ready-timeout ${UPDATED_READY_TIMEOUT} --confirm-timeout ${UPDATED_CONFIRM_TIMEOUT}
+ExecStart=/usr/lib/updated/updated-agent --config ${UPDATED_CONFIG}
 
-# Relaunch the launcher if it ever crashes. The start-limit defaults stop a
-# crash-looping build after a few tries.
+# Relaunch the agent when it exits, including after certificate renewal or a boot-recovery handoff.
 Restart=always
 RestartSec=2
 
-# Signal only the launcher first; it coordinates a clean agent shutdown. If that
-# coordination wedges, mixed mode kills every residual process in this service's
-# cgroup after TimeoutStopSec instead of leaving an orphan agent updating in the
-# background. Workloads live in separate units and are not members of this cgroup.
+# Workloads live in separate units and are not members of this cgroup.
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30

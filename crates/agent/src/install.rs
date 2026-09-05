@@ -6,7 +6,7 @@
 //! node wedged (enrollment consumed, nothing installed).
 //!
 //! Placement is the versioned active pointer and nothing else. Bringing the release into service
-//! is the public `apply --reason install` operation, which the boot path runs once this has
+//! is the public `converge --reason install` operation, which the boot path runs once this has
 //! committed.
 
 use super::*;
@@ -59,7 +59,7 @@ fn advance_install(
 ///
 /// Safety of the interaction with the update state machine rests on one invariant this
 /// function upholds: it runs before the boot/update recovery ([`gather_situation`] +
-/// [`apply_update`]) and, on `Ok`, always leaves *no* install journal on disk (on `Err` the
+/// [`execute_update`]) and, on `Ok`, always leaves *no* install journal on disk (on `Err` the
 /// boot never proceeds). So the two journals are temporally disjoint: the install journal exists
 /// on an empty node or while descending from a rejected provisional head, always with no update
 /// journal; the update journal exists only after a confirmed install. During fallback the old
@@ -98,17 +98,17 @@ pub(crate) async fn ensure_installed(
 
     match (
         store.installed()?,
-        updated::state::read_enrollment(&opts.paths.installed),
+        updated::state::read_install_history(&opts.paths.installed),
     ) {
-        (updated::state::Installed::Missing, updated::state::EnrollmentState::Missing) => {
+        (updated::state::Installed::Missing, updated::state::InstallHistory::Missing) => {
             apply_install(opts, store).await?;
             Ok(true)
         }
         (updated::state::Installed::Missing, _) => Err(
-            "installed state is missing after enrollment with no recoverable install journal; refusing to cold-install"
+            "installed state is missing after a previous installation with no recoverable install journal; refusing to cold-install"
                 .into(),
         ),
-        (updated::state::Installed::Present(state), updated::state::EnrollmentState::Present) => {
+        (updated::state::Installed::Present(state), updated::state::InstallHistory::Present) => {
             // A *provisional* head (`confirmed == false`, never passed a health gate) that has
             // been rejected must not be relaunched into a crash loop. This is the first-install
             // case: a fresh node cold-installs its (broken) assigned head, the boot rejects it on
@@ -120,13 +120,9 @@ pub(crate) async fn ensure_installed(
             // later rejects is recovered by the update state machine (its journal restores the
             // predecessor). Re-installing there would preempt that recovery and strand the node. So
             // defer whenever the head has proven healthy, or an update transaction is mid-flight.
-            if !state.confirmed
+            if !state.is_proven()
                 && store.journal()?.is_none()
-                && store.rejects_deployment(
-                    &state.repository_lineage,
-                    &state.archive_sha256,
-                    &state.lifecycle.provider_set_sha256,
-                )
+                && store.rejects_deployment(&state.repository_lineage, &state.archive_sha256)
             {
                 warn(&format!(
                     "provisional head {} is rejected; re-installing so cold-install fallback descends past it",
@@ -147,7 +143,7 @@ pub(crate) async fn ensure_installed(
     }
 }
 
-/// Resolve the first trusted assignment, stage the application and its lifecycle provider,
+/// Resolve the first trusted assignment, stage the payload and its reconciler,
 /// then drive the durable install to a committed, cleared journal.
 async fn apply_install(
     opts: &Options,
@@ -178,9 +174,7 @@ async fn apply_install(
         };
         let selected = match crate::acquire::select_assigned_application(
             &request,
-            |application_sha256, provider_set_sha256| {
-                store.rejects_selection(&lineage, application_sha256, provider_set_sha256)
-            },
+            |application_sha256| store.rejects_deployment(&lineage, application_sha256),
         ) {
             Ok(Some(selected)) => selected,
             Ok(None) => {
@@ -195,9 +189,7 @@ async fn apply_install(
                 let diagnostics = repo.selection_diagnostics(
                     &policy,
                     updated_tuf::select::Stance::Nothing,
-                    |application_sha256, provider_set_sha256| {
-                        store.rejects_selection(&lineage, application_sha256, provider_set_sha256)
-                    },
+                    |application_sha256| store.rejects_deployment(&lineage, application_sha256),
                 );
                 return Err(format!(
                     "the first trusted assignment contains no installable application; cold-install \
@@ -209,54 +201,10 @@ async fn apply_install(
             // nothing is rejected: the boot retries the whole cold install later.
             Err(error) => return Err(format!("preparing the first application: {error}").into()),
         };
-        // The set signed into the version just selected, decided once with it.
-        let version_provider_set = selected.provider_set.clone();
-        let provider_set_sha256 = version_provider_set
-            .as_ref()
-            .unwrap_or(&assignment.document().provider_set)
-            .sha256
-            .clone();
         match crate::acquire::prepare_assigned_application(&request, selected).await {
             Ok(prepared) => {
-                // Stage the operator's providers *for this app version* — its own signed provider
-                // set governs (app + providers are one signed rollback unit, see `stage_providers`).
-                // A content-rejected provider set makes this deployed-unit candidate
-                // uninstallable. Selection now checks both halves, so retrying the loop descends
-                // without falsely attaching that provider verdict to healthy application bytes.
-                match stage_providers(opts, &repo, store, version_provider_set.as_ref()).await {
-                    Ok(providers) => break (prepared, providers),
-                    Err(crate::selection::ProviderStagingError::Unusable(message)) => {
-                        if store.is_rejected(&lineage, &provider_set_sha256) {
-                            warn(&format!(
-                                "first-install deployed unit for {} has a rejected provider set \
-                                 ({message}); cold-install fallback will select the next complete unit",
-                                prepared.version
-                            ));
-                            continue;
-                        }
-                        // Metadata resolution/custom-field failures may be repaired without
-                        // changing any content digest. No permanent evidence exists, so do not
-                        // spin the in-process selector or poison either artifact; retry after the
-                        // repository is corrected.
-                        return Err(format!(
-                            "staging the provider set for {} found a repairable repository error: \
-                             {message}",
-                            prepared.version
-                        )
-                        .into());
-                    }
-                    // A network or disk failure says nothing about this release. Rejection is
-                    // durable and never expires, so rejecting here would let one CDN blip walk the
-                    // cold-install-fallback descent to the bottom and permanently exclude every version
-                    // on the node. Fail the cold install instead and retry it on the next boot.
-                    Err(error @ crate::selection::ProviderStagingError::Transient(_)) => {
-                        return Err(format!(
-                            "staging the provider set for {} failed transiently: {error}",
-                            prepared.version
-                        )
-                        .into());
-                    }
-                }
+                let execution = prepared.reconciler.clone();
+                break (prepared, execution);
             }
             Err(error) => {
                 // A malformed bundle carries a rejectable archive hash; reject it and descend. A
@@ -282,7 +230,7 @@ async fn apply_install(
         release: prepared.release.clone(),
         archive_sha256: prepared.archive_sha256.clone(),
         repository_lineage: lineage,
-        lifecycle: Box::new(providers),
+        reconciler: Box::new(providers),
         phase: InstallPhase::Started,
     };
     let chaos = Chaos::from_env();
@@ -310,7 +258,7 @@ async fn place_and_commit(
     }
 
     // Place: point the active release at the staged bytes. Any operator first-install setup runs
-    // later, in the reconciler's `apply` on the first launch (`reason=install`).
+    // later, in the reconciler's `converge` on the first launch (`reason=install`).
     store.activate(&tx.release)?;
     if tx.phase == InstallPhase::Prepared {
         advance_install(store, &mut tx, InstallPhase::Placed)?;
@@ -321,10 +269,10 @@ async fn place_and_commit(
     // the authoritative installed record, record the terminal phase, and clear the journal.
     // Enrollment is one-way (`create_new`); a resume that already consumed it skips this.
     if matches!(
-        updated::state::read_enrollment(&opts.paths.installed),
-        updated::state::EnrollmentState::Missing
+        updated::state::read_install_history(&opts.paths.installed),
+        updated::state::InstallHistory::Missing
     ) {
-        updated::state::enroll(&opts.paths.installed)?;
+        updated::state::record_first_install(&opts.paths.installed)?;
     }
     // Commit the head *provisional*: it has never launched, let alone proven healthy. If it turns
     // out to be a broken assigned head (crashes or wedges before its first passing gate) the boot
@@ -334,7 +282,7 @@ async fn place_and_commit(
         tx.repository_lineage.clone(),
         tx.release.clone(),
         tx.archive_sha256.clone(),
-        tx.lifecycle.clone(),
+        tx.reconciler.clone(),
     ))?;
     // A valid but machine-inconsistent terminal journal can only come from external corruption,
     // not [`Store::write_install_journal`]. Still converge it: recommit the exact unit above, then

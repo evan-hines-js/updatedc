@@ -1,7 +1,7 @@
 # The only node-local configuration, and the one file you must edit before the agent can enroll.
-# The launcher reads it from this canonical path. It holds paths and a name — no secret.
+# The agent reads it from this canonical path. It holds paths and a name — no secret.
 #
-# Once enrollment.json exists in launcher state, enrollment is never retried: this file is read at
+# Once enrollment.json exists in agent state, enrollment is never retried: this file is read at
 # first boot and is not a live control surface afterwards.
 
 [enrollment]

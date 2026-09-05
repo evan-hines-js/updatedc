@@ -262,28 +262,15 @@ pub(crate) fn referenced_metadata_version(
         })
 }
 
-/// Build the deterministic application archive. A directory is bundled as-is; a single file
-/// is wrapped into a fresh tree at `--entrypoint` (matching `server publish-app`). Both the
-/// wrapping shorthand and the archive format live in `updated::bundle` so every publish front end
-/// emits byte-identical trees.
-pub(crate) fn build_bundle(
+/// Build an opaque payload bundle from a prepared directory tree.
+pub(crate) fn build_payload_bundle(
     source: &Path,
     archive: &Path,
-    scratch: &Path,
     product: &str,
     version: &str,
     platform: &str,
-    entrypoint: &str,
 ) -> Result<(), Error> {
-    updated::bundle::create_bundle_from_source(
-        source,
-        archive,
-        &scratch.join("tree"),
-        product,
-        version,
-        platform,
-        entrypoint,
-    )
-    .map_err(|error| format!("building bundle: {error}"))?;
+    updated::bundle::create_bundle(source, archive, product, version, platform)
+        .map_err(|error| format!("building bundle: {error}"))?;
     Ok(())
 }

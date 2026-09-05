@@ -40,8 +40,8 @@ pub enum Stopped {
 }
 
 /// A spawned child plus the OS mechanism that binds its descendants into one killable
-/// tree. Dropping it releases that mechanism (on Windows, closing the job handle kills
-/// the tree via kill-on-close; on Unix the group is left to exit on its own).
+/// tree. Dropping it kills the tree on Windows and macOS. Other Unix callers must
+/// explicitly wait or stop it; the process group alone is not a drop guard.
 pub struct ContainedChild {
     child: Child,
     /// Set once the root child has been reaped by [`try_wait`](Self::try_wait) or
@@ -50,6 +50,8 @@ pub struct ContainedChild {
     reaped: bool,
     #[cfg(windows)]
     job: windows::Job,
+    #[cfg(target_os = "macos")]
+    _parent_liveness: std::os::unix::net::UnixStream,
 }
 
 impl ContainedChild {
@@ -142,10 +144,14 @@ impl ContainedChild {
         // containment. No caller can remember one while forgetting the other.
         #[cfg(target_os = "linux")]
         unix::arrange_parent_death_signal(&mut command);
+        #[cfg(target_os = "macos")]
+        let parent_liveness = unix::arrange_parent_death_watchdog(&mut command)?;
         let child = command.spawn()?;
         Ok(ContainedChild {
             child,
             reaped: false,
+            #[cfg(target_os = "macos")]
+            _parent_liveness: parent_liveness,
         })
     }
 
@@ -341,6 +347,133 @@ fn kill_and_reap(child: &mut Child) {
 mod unix {
     use std::io;
 
+    /// Darwin has no parent-death signal. Arm a watchdog inside the child's group BEFORE
+    /// allowing the hook to exec. Its private socket reaches EOF when this owner's descriptor
+    /// closes, including SIGKILL; it then kills the entire group. Normal tree cleanup kills the
+    /// watchdog too, while the unreaped leader still pins the group identity.
+    ///
+    /// The watchdog execs the platform shell with a fixed program (never caller-supplied text).
+    /// Exec discards inherited CLOEXEC descriptors, particularly the agent's instance lock and
+    /// Rust's spawn-error pipe. A fork-only watcher would retain them and deadlock recovery.
+    #[cfg(target_os = "macos")]
+    pub(super) fn arrange_parent_death_watchdog(
+        command: &mut std::process::Command,
+    ) -> io::Result<std::os::unix::net::UnixStream> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{net::UnixStream, process::CommandExt};
+        let (owner, watcher) = UnixStream::pair()?;
+        // Command may replace descriptors 0..2 when it installs the requested stdio. Keep
+        // the liveness channel outside that range even when the caller closed its own stdio.
+        let above_stdio = |socket: UnixStream| -> io::Result<UnixStream> {
+            if socket.as_raw_fd() >= 3 {
+                return Ok(socket);
+            }
+            let fd = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fcntl returned a newly owned descriptor for this socket.
+            Ok(unsafe { UnixStream::from_raw_fd(fd) })
+        };
+        let owner = above_stdio(owner)?;
+        let watcher = above_stdio(watcher)?;
+        let owner_fd = owner.as_raw_fd();
+        // Darwin's pipe/socket creation and CLOEXEC assignment are separate syscalls. A
+        // concurrent fork can inherit another spawn's error pipe before that assignment,
+        // blocking the other spawn indefinitely. Sanitize the child's actual descriptor
+        // table, not a parent snapshot; this needs no process-wide spawn lock.
+        let estimated_bytes = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if estimated_bytes <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+        // Allocate before fork. Leave room for concurrent opens; if even that is exhausted,
+        // fail this spawn rather than execute with an incomplete descriptor inventory.
+        let mut descriptors = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            estimated_bytes as usize / entry_size + 1024
+        ];
+        let capacity_bytes = i32::try_from(descriptors.len() * entry_size)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EMFILE))?;
+        // SAFETY: after fork this callback uses only raw descriptor/process operations and
+        // stack arithmetic; it never allocates, locks Rust state, or unwinds in the watchdog.
+        unsafe {
+            command.pre_exec(move || {
+                // proc_pidinfo is a thin syscall wrapper: no allocation or user-space lock.
+                let bytes = libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    descriptors.as_mut_ptr().cast(),
+                    capacity_bytes,
+                );
+                if bytes <= 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if bytes >= capacity_bytes || !(bytes as usize).is_multiple_of(entry_size) {
+                    return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+                }
+                for descriptor in &descriptors[..bytes as usize / entry_size] {
+                    let fd = descriptor.proc_fd;
+                    if fd >= 3 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                libc::close(owner_fd);
+                let group = libc::getpid();
+                let watchdog = libc::fork();
+                if watchdog < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if watchdog == 0 {
+                    if libc::dup2(watcher.as_raw_fd(), 0) < 0
+                        || libc::fcntl(0, libc::F_SETFD, 0) < 0
+                    {
+                        libc::kill(-group, libc::SIGKILL);
+                        libc::_exit(127);
+                    }
+                    libc::close(1);
+                    libc::close(2);
+                    // A decimal PID is the only dynamic argument; the command is fixed.
+                    let mut digits = [0u8; 32];
+                    let mut offset = digits.len() - 1;
+                    let mut number = group as u32;
+                    while number != 0 {
+                        offset -= 1;
+                        digits[offset] = b'0' + (number % 10) as u8;
+                        number /= 10;
+                    }
+                    let args = [
+                        c"sh".as_ptr(),
+                        c"-c".as_ptr(),
+                        c"while IFS= read -r line; do :; done; /bin/kill -KILL -- \"-$1\"".as_ptr(),
+                        c"updated-parent-watchdog".as_ptr(),
+                        digits.as_ptr().add(offset).cast(),
+                        std::ptr::null(),
+                    ];
+                    let environment = [std::ptr::null()];
+                    libc::execve(c"/bin/sh".as_ptr(), args.as_ptr(), environment.as_ptr());
+                    // No watchdog means no permission to run an uncontained hook.
+                    libc::kill(-group, libc::SIGKILL);
+                    libc::_exit(127);
+                }
+                Ok(())
+            });
+        }
+        Ok(owner)
+    }
+
     /// Tie every contained Linux child to its parent in the kernel, including the fork/exec race
     /// where the parent dies before `PR_SET_PDEATHSIG` is armed. This is private because the only
     /// valid parent-death-contained process is one spawned through [`ContainedChild`], which also
@@ -360,7 +493,7 @@ mod unix {
                     0,
                     0,
                 );
-                // If the launcher already died between fork and here, the signal will never
+                // If the parent already died between fork and here, the signal will never
                 // arrive; check the parent is still who we expect and self-exit if not.
                 if libc::getppid() != expected_ppid {
                     libc::_exit(0);
@@ -605,9 +738,8 @@ mod windows {
     /// away (`CREATE_BREAKAWAY_FROM_JOB`) is permitted to leave it. That permission is the only
     /// supported way for a reconciler hook to hand a workload to the release rather than to the
     /// agent's disposable hook attempt: this one helper builds every job in the nested chain
-    /// (service -> launcher -> agent -> hook), so the workload can leave all of them. Containment is
-    /// unweakened for everything that does not ask, since neither the agent nor the launcher ever
-    /// sets the flag.
+    /// (service -> agent -> hook), so the workload can leave all of them. Containment is
+    /// unweakened for everything that does not ask, since the agent never sets the flag.
     pub fn create_kill_on_close_job() -> io::Result<HANDLE> {
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -703,6 +835,94 @@ mod tests {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_parent_death_worker() {
+        let Some(root) = std::env::var_os("FOUNDATION_PARENT_DEATH_PROBE") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        if std::env::var_os("FOUNDATION_PROBE_CLOSED_STDIO").is_some() {
+            // Exercise socketpair returning descriptors that Command will replace for stdio.
+            unsafe {
+                libc::close(0);
+                libc::close(1);
+                libc::close(2);
+            }
+        }
+        let lock = crate::file::open_lock_file(
+            &root.join("lock"),
+            crate::file::LockFileDisposition::OpenOrCreate,
+        )
+        .unwrap();
+        lock.lock().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(sleep 1; echo stale > \"$1/stale\") & touch \"$1/started\"; wait",
+                "hook",
+            ])
+            .arg(&root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _child = ContainedChild::spawn(command).unwrap();
+        std::fs::write(root.join("spawned"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_parent_death_stops_hooks_and_releases_the_owner_lock() {
+        check_macos_parent_death(false);
+        check_macos_parent_death(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_macos_parent_death(closed_stdio: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if closed_stdio {
+            command.env("FOUNDATION_PROBE_CLOSED_STDIO", "1");
+        }
+        let mut parent = command
+            .args([
+                "--exact",
+                "process::tests::macos_parent_death_worker",
+                "--nocapture",
+            ])
+            .env("FOUNDATION_PARENT_DEATH_PROBE", root.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(root.path().join("spawned").exists() && root.path().join("started").exists())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = root.path().join("started").exists();
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        assert!(started, "the hook must start before its owner is killed");
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !root.path().join("stale").exists(),
+            "the orphan hook kept mutating after owner death"
+        );
+        let lock = crate::file::open_lock_file(
+            &root.path().join("lock"),
+            crate::file::LockFileDisposition::OpenOrCreate,
+        )
+        .unwrap();
+        assert!(
+            lock.try_lock().is_ok(),
+            "watchdog retained the dead owner's instance lock"
+        );
+    }
+
     #[test]
     fn kill_tree_reaps_a_shell_and_its_backgrounded_grandchild() {
         // A shell that backgrounds a long sleep and exits would, without group
@@ -774,6 +994,36 @@ mod tests {
         contained.wait().unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_children_cannot_inherit_another_spawns_descriptors() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let file = tempfile::tempfile().unwrap();
+        // Deterministically model the interval between pipe() and std setting CLOEXEC.
+        // A high descriptor avoids collision with descriptors the shell opens itself.
+        let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(raw >= 200);
+        let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let mut command = Command::new("/bin/sh");
+                    command.args(["-c", &format!("test ! -e /dev/fd/{raw}")]);
+                    assert!(ContainedChild::spawn(command)
+                        .unwrap()
+                        .wait()
+                        .unwrap()
+                        .success());
+                });
+            }
+        });
+        assert_eq!(
+            unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) },
+            0,
+            "child sanitization must not change the parent's descriptors"
+        );
+    }
+
     #[test]
     fn a_graceful_stop_terminates_a_live_child_and_ignores_a_reaped_one() {
         // The graceful stop lives on the same reap-aware type as the kill, so no caller has a
@@ -833,9 +1083,8 @@ mod windows_tests {
         // Through its own module: the function is private to `windows`, and a child of `process`
         // may reach it there. It carried a `pub use` re-export for years so this line could say
         // `super::`, which made an internal helper part of `foundation`'s public API for the sake
-        // of one test. The re-export's doc claimed the launcher's Windows adapter needed it; that
-        // adapter has no job-object code at all — it contains its agent through `ContainedChild`,
-        // which assigns the job itself.
+        // of one test. The Windows service adapter contains its agent through `ContainedChild`,
+        // which assigns the job itself, so it does not need a public job-object helper.
         let job = super::windows::create_kill_on_close_job().unwrap();
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         let mut returned = 0u32;
@@ -859,5 +1108,38 @@ mod windows_tests {
             0,
             "a hook-started workload could not leave the agent's disposable tree"
         );
+    }
+}
+
+/// Run one contained command under an absolute deadline. Every exit path reaps its process tree.
+/// Shared by package commands and migration helpers; no lock or pipe join is involved.
+pub fn run_to_exit(
+    command: std::process::Command,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<i32>> {
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "command deadline exceeded",
+        ));
+    }
+    let mut child = ContainedChild::spawn(command)?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.code()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            outcome => {
+                child.stop(std::time::Duration::ZERO);
+                return Err(match outcome {
+                    Err(error) => error,
+                    _ => std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "command deadline exceeded",
+                    ),
+                });
+            }
+        }
     }
 }

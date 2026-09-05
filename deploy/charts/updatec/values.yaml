@@ -57,7 +57,7 @@ rbac:
   create: true
 
 controller:
-  # Every replica acquires or renews the `updatec-publisher` lease before it reconciles, and a
+  # Every replica acquires its repository-scoped publisher lease and shared-state file lock, and a
   # follower reconciles nothing — so more than one replica is SAFE, and buys failover rather than
   # throughput. It is the volume that decides whether it is possible: with the default
   # ReadWriteOnce claim a second replica cannot bind the same PVC, so raising this requires a

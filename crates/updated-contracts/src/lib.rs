@@ -13,12 +13,14 @@
 
 pub mod artifact;
 pub mod assignment;
+pub mod attention;
 pub mod backend;
 pub mod bounded;
 pub mod dataflow;
 pub mod digest;
 pub mod endpoint;
 pub mod enrollment;
+pub mod helper;
 pub mod identity;
 pub mod key;
 pub mod path;
@@ -131,8 +133,6 @@ mod dependency_isolation {
     const UPDATEC_LIB: &str = include_str!("../../updatec/src/lib.rs");
     const PRODUCTION_MANIFESTS: &[(&str, &str)] = &[
         ("foundation", include_str!("../../foundation/Cargo.toml")),
-        ("control", include_str!("../../control/Cargo.toml")),
-        ("launcher", include_str!("../../launcher/Cargo.toml")),
         ("updated", include_str!("../../updated/Cargo.toml")),
         ("updated-tuf", include_str!("../../updated-tuf/Cargo.toml")),
         ("agent", include_str!("../../agent/Cargo.toml")),
@@ -178,7 +178,6 @@ mod dependency_isolation {
         for field in [
             "inactive_releases",
             "inactive_providers",
-            "inactive_agents",
             "inactive_bytes",
             "inactive_repository_caches",
         ] {
@@ -211,7 +210,6 @@ mod dependency_isolation {
             // ManagedStorage
             "inactive_releases",
             "inactive_providers",
-            "inactive_agents",
             "inactive_bytes",
             "inactive_repository_caches",
             // ManagedTimeouts
@@ -221,7 +219,6 @@ mod dependency_isolation {
             "health_interval_seconds",
             "refresh_retry_seconds",
             "confirmation_window_seconds",
-            "agent_check_interval_seconds",
         ] {
             assert!(
                 !UPDATEC_LIB.contains(field),

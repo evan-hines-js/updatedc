@@ -166,11 +166,16 @@ impl Fleet {
 /// a rollback assertion evidence rather than a guess: a cohort that merely never received the
 /// broken release carries no such record.
 pub(crate) fn rejected_release(node: &str, artifact_sha256: &str) -> bool {
+    let Some(rejection) = updated_contracts::digest::deployment_rejection_sha256(artifact_sha256)
+    else {
+        return false;
+    };
     output(agent_exec(node).args(["cat", "/var/lib/updated/state/rejected"])).is_ok_and(|record| {
-        // Each line is `repository-lineage-sha256:artifact-sha256`.
+        // Runtime rejection is domain-separated from rejection of a malformed archive.
+        // Read the identity through the same contract as the agent's journal writer.
         record
             .lines()
-            .any(|line| line.trim().split(':').nth(1) == Some(artifact_sha256))
+            .any(|line| line.trim().split(':').nth(1) == Some(rejection.as_str()))
     })
 }
 

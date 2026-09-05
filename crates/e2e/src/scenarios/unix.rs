@@ -2,7 +2,7 @@ use super::super::*;
 use updated_contracts::reconciler::{attempt, Operation};
 
 /// The never-healthy twin of `cold_install_descends_past_broken_head`. There the assigned heads
-/// fail their `apply`; here `apply` succeeds — the workload starts and stays alive — but the
+/// fail their `converge`; here `converge` succeeds — the workload starts and stays alive — but the
 /// release never becomes healthy, so its `healthcheck` never passes. The node must reject each such
 /// head and descend, and the workload each rejected head left running must be stopped by the hook
 /// that replaces it: a descent that left the wedged process holding the service address would
@@ -15,7 +15,7 @@ pub(crate) fn cold_install_descends_past_unhealthy_head(ctx: &Ctx) -> R {
     ctx.init_repo(&dir)?;
     // The healthy release below the wedged heads.
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
-    // Two "wedged" heads: an entrypoint that stays alive but binds nothing, so `apply` succeeds and
+    // Two "wedged" heads: an entrypoint that stays alive but binds nothing, so `converge` succeeds and
     // the health gate fails forever. The assigned head is the newest (3.0.0), so recovery must stop
     // and descend past both 3.0.0 and 2.0.0 to reach the healthy 1.0.0.
     let wedged = dir.join("wedged-app");
@@ -31,14 +31,14 @@ pub(crate) fn cold_install_descends_past_unhealthy_head(ctx: &Ctx) -> R {
         // A short grace keeps the per-head wedge detection quick; the head never becomes healthy,
         // so the gate fails after the grace and the boot rejects it and descends.
         .health_grace("3s")
-        .launcher()?;
+        .command()?;
     let node = Service::spawn("cold-install-wedge", &command);
     // Catch the wedged head's own process while it is running, so the descent can be shown to have
     // ended it rather than merely to have installed something else.
     let wedged_pid = wait_until(CONVERGE_TIMEOUT, || fixture::workload_pid(&dir).is_some())
         .then(|| fixture::workload_pid(&dir))
         .flatten()
-        .ok_or("the wedged head's apply never started a workload")?;
+        .ok_or("the wedged head's converge never started a workload")?;
     // Recovery is proven only when the healthy 1.0.0 actually serves.
     if !wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT) {
         let log = node.captured_log();
@@ -79,13 +79,13 @@ pub(crate) fn lifecycle_healthcheck_gates_readiness(ctx: &Ctx) -> R {
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
-    let mut cmd = Node::new(ctx, &dir, srv, "app")
+    let cmd = Node::new(ctx, &dir, srv, "app")
         .cold_install()
         .check_interval("1s")
         .health_grace("5s")
         .workload(svc)
-        .launcher()?;
-    let _node = Proc::spawn("lifecycle-verify", &mut cmd)?;
+        .command()?;
+    let _node = Proc::spawn("lifecycle-verify", cmd)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("the lifecycle-gated deployment never came up at v1.0.0");
     }
@@ -93,7 +93,7 @@ pub(crate) fn lifecycle_healthcheck_gates_readiness(ctx: &Ctx) -> R {
     if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         return fail("the lifecycle-gated deployment never upgraded to v2.0.0");
     }
-    // The upgrade's readiness gate runs AFTER its workload is already serving 2.0.0: `apply` starts
+    // The upgrade's readiness gate runs AFTER its workload is already serving 2.0.0: `converge` starts
     // the candidate, and only then does the transaction's `healthcheck` run under the attempt id.
     // So the version probe above returns strictly before the gate is recorded, and reading the
     // receipt once only ever passed by out-racing that window — which on a slower machine it loses.

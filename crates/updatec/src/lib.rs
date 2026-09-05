@@ -231,7 +231,6 @@ pub struct DeploymentSpec {
     /// off so a group only descends versions when the publisher explicitly allows it.
     #[serde(default)]
     pub cold_install_fallback: bool,
-    pub provider_set: TargetSpec,
     pub runtime: RuntimeSpec,
 }
 
@@ -304,7 +303,6 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                 },
             application,
             cold_install_fallback,
-            provider_set,
             runtime:
                 RuntimeSpec {
                     product,
@@ -324,7 +322,6 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
             targets_url,
             application: application.into(),
             cold_install_fallback,
-            provider_set: provider_set.into(),
             release_root,
             runtime: updated_contracts::assignment::ManagedRuntime {
                 product,
@@ -887,9 +884,9 @@ impl From<&updated_contracts::reconciler::ReconciledRelease> for ReconciledRelea
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconcilerStatus {
-    pub provider_set_sha256: String,
+    pub definition_sha256: String,
     pub product: String,
-    pub release: ReconciledReleaseStatus,
+    pub api: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -916,9 +913,9 @@ impl From<&updated_contracts::reconciler::LastReconciliation> for Reconciliation
             candidate: record.candidate().into(),
             predecessor: record.predecessor().into(),
             reconciler: ReconcilerStatus {
-                provider_set_sha256: record.reconciler().provider_set_sha256().into(),
+                definition_sha256: record.reconciler().definition_sha256().into(),
                 product: record.reconciler().product().into(),
-                release: record.reconciler().release().into(),
+                api: record.reconciler().api(),
             },
             changed: record.result().changed(),
             host_action: record.result().host_action().as_str().into(),
@@ -1865,10 +1862,6 @@ mod tests {
                 sha256: "1".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: ExactTarget {
-                path: "providers".into(),
-                sha256: "2".repeat(64),
-            },
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: managed_runtime(),
         }
@@ -1924,10 +1917,6 @@ mod tests {
                 sha256: "1".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: TargetSpec {
-                path: "providers".into(),
-                sha256: "2".repeat(64),
-            },
             runtime: runtime_spec(),
         }
     }

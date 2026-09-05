@@ -1,5 +1,10 @@
 # Workspace cargo aliases.
-[build]
+[target.'cfg(all())']
 # cargo-llvm-cov defines this cfg on nightly so inline test modules can opt out of the shipped-code
 # denominator. Declaring it here keeps ordinary stable builds strict about every other cfg name.
 rustflags = ["--check-cfg=cfg(coverage_nightly)"]
+
+[target.'cfg(target_os = "macos")']
+# FIPS uses an unmodified shared crypto module. Relocated agents and pinned helpers load their
+# packaged copy beside the executable, without ambient DYLD_* variables entering customer code.
+rustflags = ["-C", "link-arg=-Wl,-rpath,@executable_path"]

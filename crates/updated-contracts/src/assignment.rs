@@ -25,7 +25,6 @@ pub struct RepositoryAssignment {
     pub targets_url: String,
     pub application: TargetReference,
     pub cold_install_fallback: bool,
-    pub provider_set: TargetReference,
     pub release_root: serde_json::Value,
     pub runtime: ManagedRuntime,
 }
@@ -60,8 +59,6 @@ pub struct ManagedRepositoryLimits {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedStorage {
     pub inactive_releases: usize,
-    pub inactive_providers: usize,
-    pub inactive_agents: usize,
     pub inactive_bytes: u64,
     pub inactive_repository_caches: usize,
 }
@@ -75,13 +72,12 @@ pub struct ManagedTimeouts {
     pub health_interval_seconds: u64,
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
-    pub agent_check_interval_seconds: u64,
 }
 
 impl RepositoryAssignment {
     /// The one assignment shape this build reads and writes. Every nested struct denies unknown
     /// fields, and validation requires exact schema equality; no compatibility or alias path exists.
-    pub const SCHEMA: u32 = 4;
+    pub const SCHEMA: u32 = 5;
     /// Whole signed configuration ceiling. The bounded input selection is at most one dataflow
     /// document; the additional MiB covers the pinned TUF root and fixed runtime fields.
     pub const MAX_DOCUMENT_BYTES: usize = crate::dataflow::MAX_DATAFLOW_BODY_BYTES + 1024 * 1024;
@@ -104,13 +100,8 @@ impl RepositoryAssignment {
             canonical_repository_base(location)
                 .map_err(|error| format!("repository assignment {name} is invalid: {error}"))?;
         }
-        for (name, reference) in [
-            ("application", &self.application),
-            ("providerSet", &self.provider_set),
-        ] {
-            if !reference.is_valid() {
-                return Err(format!("repository assignment {name} reference is invalid"));
-            }
+        if !self.application.is_valid() {
+            return Err("repository assignment application reference is invalid".into());
         }
         if !self.release_root.is_object() {
             return Err("repository assignment releaseRoot must be a JSON object".into());
@@ -274,7 +265,6 @@ impl ManagedRuntime {
             || self.timeouts.health_interval_seconds == 0
             || self.timeouts.refresh_retry_seconds == 0
             || self.timeouts.confirmation_window_seconds == 0
-            || self.timeouts.agent_check_interval_seconds == 0
         {
             return Err("managed runtime limits and timeouts must be non-zero".into());
         }
@@ -301,10 +291,6 @@ impl ManagedRuntime {
             (
                 "timeouts.confirmation_window_seconds",
                 self.timeouts.confirmation_window_seconds,
-            ),
-            (
-                "timeouts.agent_check_interval_seconds",
-                self.timeouts.agent_check_interval_seconds,
             ),
         ] {
             if seconds > MAX_INTERVAL_SECONDS {
@@ -394,8 +380,6 @@ pub mod testing {
             },
             storage: ManagedStorage {
                 inactive_releases: 1,
-                inactive_providers: 1,
-                inactive_agents: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
@@ -406,7 +390,6 @@ pub mod testing {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
-                agent_check_interval_seconds: 1,
             },
             ..runtime()
         }
@@ -429,8 +412,6 @@ pub mod testing {
             },
             storage: ManagedStorage {
                 inactive_releases: 2,
-                inactive_providers: 2,
-                inactive_agents: 2,
                 inactive_bytes: 1 << 30,
                 inactive_repository_caches: 2,
             },
@@ -441,7 +422,6 @@ pub mod testing {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
-                agent_check_interval_seconds: 3600,
             },
         }
     }
@@ -475,10 +455,6 @@ mod tests {
                 sha256: "a".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: TargetReference {
-                path: "providers".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: runtime(),
         }
@@ -662,7 +638,7 @@ mod tests {
         type SetSeconds = fn(&mut ManagedRuntime, u64);
         // The report-cadence fields are absent deliberately: they answer to the tighter,
         // freshness-derived ceiling instead (see below).
-        let fields: [(&str, SetSeconds); 5] = [
+        let fields: [(&str, SetSeconds); 4] = [
             ("transport_timeout", |r, v| {
                 r.repository.transport_timeout_seconds = v
             }),
@@ -675,9 +651,6 @@ mod tests {
             }),
             ("confirmation_window", |r, v| {
                 r.timeouts.confirmation_window_seconds = v
-            }),
-            ("agent_check_interval", |r, v| {
-                r.timeouts.agent_check_interval_seconds = v
             }),
         ];
         for (name, set) in fields {
@@ -863,13 +836,10 @@ mod tests {
                 schema["properties"]["schema"]["const"],
                 Value::from(RepositoryAssignment::SCHEMA)
             );
-            for reference in ["application", "providerSet"] {
-                assert_eq!(
-                    schema["properties"][reference]["$ref"],
-                    Value::from("https://updated.dev/schemas/target-reference.schema.json"),
-                    "{reference}"
-                );
-            }
+            assert_eq!(
+                schema["properties"]["application"]["$ref"],
+                Value::from("https://updated.dev/schemas/target-reference.schema.json"),
+            );
             // `validate` demands a JSON object here, so the schema must not admit a bare string.
             assert_eq!(schema["properties"]["releaseRoot"]["type"], "object");
             assert_eq!(schema["properties"]["runtime"]["$ref"], "#/$defs/runtime");
@@ -966,7 +936,6 @@ mod tests {
                 "healthGraceSeconds",
                 "healthIntervalSeconds",
                 "confirmationWindowSeconds",
-                "agentCheckIntervalSeconds",
             ] {
                 assert_eq!(
                     timeouts["properties"][bounded]["maximum"],

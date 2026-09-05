@@ -20,7 +20,7 @@ usage() {
   cat <<'EOF'
 usage: packaging/build.sh [--bindir DIR] [--version V] [--arch amd64|arm64] [--out DIR]
 
-  --bindir   package existing updated-launcher/updated-agent binaries instead of compiling
+  --bindir   package an existing updated-agent binary instead of compiling
   --version  package version (default: the workspace version from Cargo.toml)
   --arch     target package architecture (default: the host's)
   --out      where the packages land (default: dist/)
@@ -60,12 +60,12 @@ if [[ -z "$ARCH" ]]; then
 fi
 
 if [[ -z "$BINDIR" ]]; then
-  echo "==> building updated-launcher and updated-agent"
-  (cd "$ROOT" && cargo build --release -p launcher -p agent)
+  echo "==> building updated-agent"
+  (cd "$ROOT" && cargo build --release -p agent)
   BINDIR="$ROOT/target/release"
 fi
 BINDIR="$(cd "$BINDIR" && pwd)"
-for binary in updated-launcher updated-agent; do
+for binary in updated-agent; do
   [[ -x "$BINDIR/$binary" ]] || { echo "FAIL: missing binary $BINDIR/$binary" >&2; exit 1; }
 done
 

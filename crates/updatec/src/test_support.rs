@@ -18,24 +18,13 @@ pub(crate) fn bind_reconciliation(report: &mut NodeReport) {
     )
     .unwrap();
     let transition = ReconciliationTransition::new(running.clone(), running);
-    let reconciler_release = ReconciledRelease::new(
-        "1.0.0".into(),
-        MANIFEST_SHA256.into(),
-        MANIFEST_SHA256.into(),
-    )
-    .unwrap();
     report.reconciliation = Some(
         LastReconciliation::new(
-            MutationOperation::Apply,
+            MutationOperation::Converge,
             Reason::Restart,
             updated_contracts::reconciler::attempt::CONVERGE.into(),
             transition,
-            ReconcilerIdentity::new(
-                report.provider_set_sha256.clone(),
-                "system".into(),
-                reconciler_release,
-            )
-            .unwrap(),
+            ReconcilerIdentity::new(report.definition_sha256.clone(), "system".into(), 1).unwrap(),
             SuccessfulMutation::new(false, HostAction::None, None).unwrap(),
             1,
         )

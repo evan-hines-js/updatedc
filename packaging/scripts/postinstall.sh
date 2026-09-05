@@ -13,7 +13,7 @@ case "$1" in
     [ "$1" = "2" ] && upgrade=1
     [ "$1" = "configure" ] && [ -n "$2" ] && upgrade=1
     if [ "$upgrade" = "1" ]; then
-      # Restarting the launcher never disturbs a workload: workload processes belong to each
+      # Restarting the agent never disturbs a host-managed workload: workload processes belong to each
       # release's own reconciler hooks and their own units, not to this one.
       systemctl try-restart updated-agent.service >/dev/null 2>&1 || true
       exit 0
@@ -30,6 +30,6 @@ updated-agent is installed but NOT started. Bootstrap this node:
      (mode 0600, owned by root).
   3. systemctl enable --now updated-agent
 
-From then on this package is done: every later agent version and every workload arrives
-through the fleet's signed TUF channel, not through apt or yum.
+Use the host package manager to upgrade this agent. Workload releases continue to arrive through
+the fleet's signed TUF channel.
 EOF

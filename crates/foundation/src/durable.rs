@@ -26,9 +26,9 @@ const EXECUTABLE_TEMP_PREFIX: &str = ".executable-";
 const FILESYSTEM_CONTENTION_RETRIES: u32 = 50;
 
 /// Who may read a durable file once it is committed. Every file this module creates commits to
-/// exactly one of these at `open(2)`/`CreateFileW` time — permissions are never widened and then
-/// narrowed, and no caller ever chmods (or `icacls`es) afterwards, which is the property that
-/// makes "write it durably" a single operation rather than a write plus a repair.
+/// exactly one of these before its handle reaches a caller — permissions are never widened and
+/// then narrowed, and no caller chmods (or `icacls`es) afterwards, which is the property that makes
+/// "write it durably" a single operation rather than a write plus a repair.
 ///
 /// The ladder is *who*, not *how much*: the writer alone, the principals the deployment's own
 /// ACL names, or everybody.
@@ -75,7 +75,7 @@ pub fn create_private_new(path: &Path) -> io::Result<File> {
 /// Plaintext exchanges use directories as their first access-control boundary: a reconciler
 /// creates output files itself, so protecting only files the agent creates would leave those
 /// outputs readable through an inherited `%ProgramData%` ACL on Windows. Like
-/// [`create_private_new`], this applies the final policy at creation time—`0o700` on Unix and a
+/// [`create_private_new`], this converges the final policy at creation time—`0o700` on Unix and a
 /// protected owner/SYSTEM/Administrators DACL with private child inheritance on Windows.
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -105,28 +105,36 @@ pub fn create_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// [`create_temp_managed`], but world-readable (`0o644` on unix; the directory's ACL on Windows) at
-/// creation — for a signed repository object that the whole fleet fetches. The mode is set when
-/// the file is created rather than repaired before the rename, so it is identical on the platform
-/// where `set_permissions` is a no-op.
+/// [`create_temp_managed`], but world-readable (`0o644` on unix; the directory's ACL on Windows)
+/// before it is returned — for a signed repository object that the whole fleet fetches. The final
+/// mode is fixed before any bytes are written, so it cannot be lost at the atomic rename boundary.
 pub fn create_temp_published(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
     create_temp_with(dir, prefix, |path| create(path, Visibility::Published))
 }
 
 #[cfg(unix)]
 fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mode = match visibility {
         // The state directory's own ACL is a Windows concept; on unix a managed file is as
         // private as a secret, because only the privileged runtime is inside that tree.
         Visibility::Private | Visibility::Managed => 0o600,
         Visibility::Published => 0o644,
     };
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
-        .open(path)
+        .open(path)?;
+    // `open(2)` always filters its requested mode through the process umask. Normalize the still
+    // empty, uniquely named temp through its open descriptor before exposing it to a writer; this
+    // keeps private files private while making published artifacts reliably fleet-readable under
+    // hardened service umasks such as 0077.
+    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(mode)) {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
 }
 
 /// Windows has no `mode`, and a file created without an explicit security descriptor INHERITS
@@ -280,10 +288,23 @@ pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
     durable_write(path, prefix, data, Visibility::Private)
 }
 
+/// Publish a complete private file only if the destination is absent. Linking a synced sibling
+/// makes creation atomic without exposing a partially written identity or replacing a winner.
+pub fn atomic_write_new(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
+    let dir = parent_dir(path);
+    let (mut tmp, tmp_path) = create_temp_with(dir, prefix, |p| create(p, Visibility::Private))?;
+    let written = tmp.write_all(data).and_then(|_| tmp.sync_all());
+    drop(tmp);
+    let published = written.and_then(|_| fs::hard_link(&tmp_path, path));
+    let _ = fs::remove_file(&tmp_path);
+    published?;
+    sync_dir(dir).map_err(unsynced)
+}
+
 /// [`atomic_write`] for a non-secret file under the node's state directory: identical durability,
 /// but the committed file keeps whatever access its directory confers (on Windows the deployment's
-/// inheritable directory ACL; on unix still `0o600`). An agent pointer, a
-/// launcher marker, a journal — anything a differently-privileged principal may legitimately have
+/// inheritable directory ACL; on unix still `0o600`). A state marker or journal — anything a
+/// differently-privileged principal may legitimately have
 /// to read or replace later.
 pub fn atomic_write_managed(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
     durable_write(path, prefix, data, Visibility::Managed)
@@ -351,11 +372,8 @@ fn unsynced(error: io::Error) -> io::Error {
 /// prove that effect durable: the rename or unlink is visible to every reader, and the
 /// directory fsync behind it is what failed (`EMFILE`, an fsync `EIO`).
 ///
-/// The distinction exists for callers that undo their own state when a durable write fails.
-/// The launcher rolls its committed-agent pointer back to the predecessor and records the
-/// candidate rejected — which, for a pointer that actually moved, would leave a rejection
-/// marker about the very binary the next boot launches as the committed agent. Every other
-/// caller is right to treat this as the plain failure it also is.
+/// The distinction exists for callers that undo their own state when a durable write fails. Undoing
+/// a write whose rename already landed can otherwise invert the state visible to the next process.
 pub fn committed_unsynced(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<Unsynced>())
 }
@@ -681,6 +699,34 @@ mod tests {
         assert_eq!(fs::read(p).unwrap(), b"second-longer");
     }
 
+    #[test]
+    fn atomic_creation_preserves_the_winner_and_cleans_staging_files() {
+        let (_guard, d) = dir("create-once");
+        let path = d.join("identity");
+        atomic_write_new(&path, ".test-", b"winner").unwrap();
+        assert_eq!(
+            atomic_write_new(&path, ".test-", b"loser")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"winner");
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_creation_refuses_even_a_dangling_destination_symlink() {
+        let (_guard, d) = dir("create-symlink");
+        let path = d.join("identity");
+        let target = d.join("absent");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(atomic_write_new(&path, ".test-", b"key").is_err());
+        assert_eq!(fs::read_link(&path).unwrap(), target);
+        assert!(!target.exists());
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_filesystem_contention_has_one_raw_code_policy() {
@@ -708,9 +754,8 @@ mod tests {
     fn a_failure_after_the_rename_reports_the_write_as_committed() {
         // The rename is already visible when the directory fsync runs, so reporting that failure
         // as a plain Err claims the old content is still there while the new content is what
-        // every reader sees. The launcher rolls its agent pointer back to the predecessor
-        // on a failed commit; rolling back a pointer that moved rejects the binary the next boot
-        // launches as the committed agent.
+        // every reader sees. A caller that compensates for a plain failure must be able to avoid
+        // undoing a write whose rename already landed.
         use std::os::unix::fs::PermissionsExt;
         let (_guard, d) = dir("unsynced");
         let p = d.join("pointer");
@@ -878,16 +923,16 @@ mod tests {
         fs::write(d.join("state"), b"committed").unwrap();
         fs::write(d.join("other-9-9-9.tmp"), b"not ours").unwrap();
         // A fresh temp under our prefix is an in-flight write — spare it.
-        fs::write(d.join(".launcher-1-2-3.tmp"), b"in flight").unwrap();
-        let in_flight_stage = d.join(".launcher-generation-live.tmp");
+        fs::write(d.join(".writer-1-2-3.tmp"), b"in flight").unwrap();
+        let in_flight_stage = d.join(".writer-generation-live.tmp");
         fs::create_dir(&in_flight_stage).unwrap();
         let in_flight_lease = lease_temp_directory(&in_flight_stage).unwrap();
         // An aged temp under our prefix is a crash leftover — reap it, file or directory.
         let aged = SystemTime::now() - (STALE_TEMP_AGE + Duration::from_secs(1));
-        let stale = d.join(".launcher-4-5-6.tmp");
+        let stale = d.join(".writer-4-5-6.tmp");
         fs::write(&stale, b"orphan").unwrap();
         filetime_set(&stale, aged);
-        let stale_stage = d.join(".launcher-generation-dead.tmp");
+        let stale_stage = d.join(".writer-generation-dead.tmp");
         fs::create_dir(&stale_stage).unwrap();
         let stale_lease = lease_temp_directory(&stale_stage).unwrap();
         fs::write(stale_stage.join("timestamp.json"), b"{}").unwrap();
@@ -901,21 +946,31 @@ mod tests {
         // `STALE_TEMP_AGE` of wall clock passing before the sweep, which is a thing a loaded
         // machine or a clock step can violate without the code being wrong.
         let fresh = SystemTime::now();
-        filetime_set(&d.join(".launcher-1-2-3.tmp"), fresh);
+        filetime_set(&d.join(".writer-1-2-3.tmp"), fresh);
         filetime_set(&in_flight_stage, fresh);
 
         // The count is asserted LAST, deliberately. It came first once and failed under a loaded
         // parallel run with nothing but `2 != n` to go on, while the four specific assertions that
         // would have named the survivor sat below it and never ran. Which entry the sweep got wrong
         // is the whole diagnosis; the total is a summary of it.
-        let removed = sweep_stale_temps(&d, ".launcher-");
+        let mut removed = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            removed += sweep_stale_temps(&d, ".writer-");
+            if !stale_stage.exists() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            // Parallel process tests can fork while the lease is open. Until that child execs,
+            // its inherited descriptor legitimately keeps the lock live; the sweeper must spare it.
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(d.join("state").exists(), "a committed file was swept");
         assert!(
             d.join("other-9-9-9.tmp").exists(),
             "a temp under someone else's prefix was swept"
         );
         assert!(
-            d.join(".launcher-1-2-3.tmp").exists(),
+            d.join(".writer-1-2-3.tmp").exists(),
             "a fresh in-flight temp file was swept"
         );
         assert!(in_flight_stage.exists(), "an in-flight stage was yanked");
@@ -955,11 +1010,11 @@ mod tests {
     #[test]
     fn sweep_spares_temps_whose_age_is_unknown() {
         let (_guard, d) = dir("sweep-future-mtime");
-        let in_flight = d.join(".launcher-7-8-9.tmp");
+        let in_flight = d.join(".writer-7-8-9.tmp");
         fs::write(&in_flight, b"in flight").unwrap();
         filetime_set(&in_flight, SystemTime::now() + Duration::from_secs(600));
 
-        assert_eq!(sweep_stale_temps(&d, ".launcher-"), 0);
+        assert_eq!(sweep_stale_temps(&d, ".writer-"), 0);
         assert!(in_flight.exists());
     }
 
@@ -1033,9 +1088,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn each_visibility_commits_its_mode_at_creation() {
-        // A published artifact is world-readable the instant it exists; nothing repairs a mode
-        // after the fact, so the unix and Windows paths agree on who may read what.
+    fn each_visibility_commits_its_mode_before_use() {
+        // The handle returned to a writer already has its final mode, so the unix and Windows paths
+        // agree on who may read the committed file regardless of the service's ambient umask.
         use std::os::unix::fs::PermissionsExt;
         let (_guard, d) = dir("visibility");
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -1048,7 +1103,7 @@ mod tests {
         atomic_write(&secret, ".key-", b"k").unwrap();
         assert_eq!(mode(&secret), 0o600);
         let state = d.join("state");
-        atomic_write_managed(&state, ".launcher-", b"s").unwrap();
+        atomic_write_managed(&state, ".writer-", b"s").unwrap();
         assert_eq!(mode(&state), 0o600, "state stays owner-only on unix");
         let private_directory = d.join("private-directory");
         create_private_directory(&private_directory).unwrap();
@@ -1069,7 +1124,7 @@ mod tests {
         let (_file, published) = create_temp_published(&d, ".publish-").unwrap();
         assert!(!dacl_sddl(&published).starts_with("D:P"));
         let state = d.join("state");
-        atomic_write_managed(&state, ".launcher-", b"s").unwrap();
+        atomic_write_managed(&state, ".writer-", b"s").unwrap();
         assert!(!dacl_sddl(&state).starts_with("D:P"));
         let secret = d.join("secret");
         atomic_write(&secret, ".key-", b"k").unwrap();

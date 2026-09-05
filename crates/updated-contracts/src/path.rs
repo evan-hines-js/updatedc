@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn safe_component_confines_a_single_segment() {
-        for ok in ["app", "agent-7", "lifecycle", "v1.2.3-deadbeef"] {
+        for ok in ["app", "agent-7", "reconciler", "v1.2.3-deadbeef"] {
             assert!(is_safe_component(ok), "{ok} should be a safe component");
         }
         for bad in ["", ".", "..", "a/b", "a\\b", "C:", "a:b", "a\0b", "..\\x"] {
@@ -142,7 +142,7 @@ mod tests {
                 "{empty_segment:?} has an empty component and must be refused"
             );
         }
-        // ...and the same relative-name lookahead applies to EVERY segment, not just the first.
+        // ...and the same relative-name lookahead converges to EVERY segment, not just the first.
         for traversal in ["./a", "../a", "a/./b", "a/../b", "a/.", "a/.."] {
             assert!(
                 !is_confined_relative(traversal),

@@ -180,6 +180,17 @@ That is why the claim carries `helm.sh/resource-policy: keep`, why `persistence.
 only appropriate for a repository that never has to survive a restart, and why multiple replicas
 require a *shared* (ReadWriteMany) volume rather than one volume each.
 
+The volume must support cross-client advisory file locks. The elected controller holds
+`publisher.lock` for its entire writer epoch; on lease loss it exits without unwinding, so blocking
+filesystem writes cannot outlive that lock. A successor waits for exclusive ownership before
+reading or mutating publisher state. Lease names are repository-scoped, so separate repositories
+can publish independently in the same namespace.
+
+When upgrading from a controller using the old fixed `updatec-publisher` lease, stop all old
+controller replicas in that namespace before starting the new version. Old binaries do not participate in the new
+shared-state locking protocol. Preserve the state PVC during this transition; gateways and node
+workloads can remain running.
+
 ## Notes
 
 - The gateway opens `/livez` immediately but keeps `/readyz` closed until its `UpdateRepository`

@@ -31,6 +31,13 @@ impl InstanceLock {
     }
 }
 
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Release explicitly: a concurrent fork may briefly inherit the open description.
+        let _ = self._file.unlock();
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

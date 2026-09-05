@@ -148,10 +148,6 @@ mod fixture {
                 sha256: "a".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: updated_contracts::artifact::TargetReference {
-                path: "providers".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: serde_json::json!({}),
             runtime: runtime(),
         }
@@ -428,10 +424,6 @@ mod error_tests {
                 sha256: "a".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: updated_contracts::artifact::TargetReference {
-                path: "provider-sets/web.json".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: serde_json::json!({}),
             runtime,
         };
@@ -527,7 +519,7 @@ impl DownloadedTarget {
     /// Install a bundle from this exact verified handle.
     pub fn install_bundle(
         &mut self,
-        store: &updated::provider::BundleStore,
+        store: &updated::bundle_store::BundleStore,
         expected: &updated::bundle::ExpectedBundle<'_>,
     ) -> Result<updated::bundle::ReleaseId, updated::bundle::InstallError> {
         self.verify_handle()
@@ -709,7 +701,7 @@ impl LiveAssignment {
 /// actually fetch from, and leaves the node where the enrollment bundle put it. The persisted file
 /// is local state this boot cannot re-verify, so it may refine the assignment the enrollment
 /// bundle authenticated but never relocate the node: an `install_root` read out of it would move
-/// the binary, state, journal, and rejection set the launcher and agent operate on.
+/// the application artifact, state, journal, and rejection set the agent operates on.
 fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAssignment {
     let path = updated::config::persisted_assignment_path(enrollment_state);
     let bytes = match foundation::file::read_bounded_regular(
@@ -750,7 +742,7 @@ fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAss
 /// remaining fact that decides whether this node can boot on it is node-local and no publisher can
 /// check it: whether the assignment leaves the node where the enrollment bundle put it. An
 /// `install_root` taken out of such a document would move the binary, state, journal and rejection
-/// set the launcher and agent operate on.
+/// set the agent operates on.
 ///
 /// The writer that commits a freshly resolved document and the reader that boots on the committed
 /// one both come through here, so no document can become the live config by a route that skips a
@@ -1050,11 +1042,11 @@ impl TrustedRepository {
         // This write REPLACES the node's live boot config — the document the next boot launches the
         // managed application from, before any network. So everything that decides whether a node
         // can boot on it is proven here, ahead of the write, through the same check the reader
-        // applies: afterwards the last good assignment is already gone, and a document rejected
+        // converges: afterwards the last good assignment is already gone, and a document rejected
         // later fails non-retryably with nothing to roll back to.
         //
         // Rejecting here is deliberately loud, and wider than it looks: this is the one refresh both
-        // the application check and the self-update ride on, so an unusable published assignment now
+        // application selection rides on, so an unusable published assignment now
         // stops the node updating at all until an operator republishes. That is the direction to
         // fail — a document the node cannot boot on must never become the document it boots on — but
         // it is a real escalation from persisting it and ignoring it at the next boot, which kept

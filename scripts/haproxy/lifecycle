@@ -1,51 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Signed HAProxy node reconciler. The agent supplies the operation and context as ordinary argv;
+# Package entrypoint. The runtime supplies optional context through environment variables;
 # this script contains only HAProxy-specific machine-state policy.
 #
 # The agent never touches a workload process, so this reconciler owns the HAProxy process outright.
-# `apply` (and `rollback`) start the release when no master of ours is running and re-exec the live
-# master in place when one is — see `converge_release`.
+# `converge` starts the payload when no master of ours is running and re-execs the live master in
+# place when one is — see `converge_release`. Recovery explicitly restores the prior release.
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/haproxy/lib.sh
 source "$here/lib.sh"
 
-operation=${1:?missing reconciler operation}
-shift
-
-protocol=
-attempt=unknown
-root=
-candidate=
-result_file=
-
-while (($#)); do
-  case "$1" in
-    --protocol) protocol=$2; shift 2 ;;
-    --attempt-id) attempt=$2; shift 2 ;;
-    --reason) shift 2 ;;
-    --install-root) root=$2; shift 2 ;;
-    --candidate) candidate=$2; shift 2 ;;
-    # This reconciler keeps no cross-invocation state of its own: HAProxy's own runtime
-    # tree under `--install-root` is the whole state. Accept and discard the agent's
-    # scratch directory.
-    --state-dir) shift 2 ;;
-    --candidate-version) shift 2 ;;
-    --result-file) result_file=$2; shift 2 ;;
-    --input-dir | --output-dir) shift 2 ;;
-    # This HAProxy reconciler needs only the one direction-independent target (`--candidate`), but
-    # still consumes the protocol's compensation context so the argv grammar stays exact.
-    --predecessor) shift 2 ;;
-    --predecessor-version) shift 2 ;;
-    --) shift; break ;;
-    *) die "unknown reconciler argument '$1'" ;;
-  esac
-done
-
-[[ $protocol == 1 ]] || die "unsupported reconciler protocol '$protocol'"
-[[ -n $root ]] || die "missing --install-root"
+operation=${UPDATED_OPERATION:?}
+attempt=${UPDATED_ATTEMPT_ID:?}
+root=${UPDATED_INSTALL_ROOT:?}
+payload=${UPDATED_PAYLOAD_ROOT:?}
+result_file=${UPDATED_RESULT_FILE:?}
+state_dir=${UPDATED_STATE_DIR:?}
+backup="$state_dir/before-${attempt%r}"
+mkdir -p "$state_dir"
 runtime="$root/runtime"
 
 publish_result() {
@@ -58,26 +32,32 @@ publish_result() {
 audit "$root" "$operation" "$attempt" started
 
 case "$operation" in
-  apply | rollback)
-    # The protocol has one direction rule for both mutation operations: --candidate is the release
-    # to converge onto. During rollback that is the restored release; --predecessor is available
-    # only to reconcilers whose compensation needs to inspect what it undoes. HAProxy does not, so
-    # apply and rollback intentionally share this entire validation-and-convergence path.
+  converge)
+    if [[ ! -f $backup ]]; then
+      cat "$runtime/live-release.path" 2>/dev/null >"$backup.tmp" || true
+      mv "$backup.tmp" "$backup"
+    fi
     changed=true
-    if live_master "$runtime" && [[ $(cat "$runtime/live-release.path" 2>/dev/null || true) == "$candidate" ]]; then
+    if live_master "$runtime" && [[ $(cat "$runtime/live-release.path" 2>/dev/null || true) == "$payload" ]]; then
       changed=false
     fi
-    [[ -x "$candidate/bin/haproxy" ]] || die "candidate $candidate has no executable bin/haproxy"
-    "$candidate/bin/haproxy" -c -f "$candidate/config/haproxy.cfg" >/dev/null \
-      || die "candidate HAProxy configuration failed validation"
-    converge_release "$candidate" "$root"
+    [[ -x "$payload/bin/haproxy" ]] || die "payload $payload has no executable bin/haproxy"
+    "$payload/bin/haproxy" -c -f "$payload/config/haproxy.cfg" >/dev/null \
+      || die "payload HAProxy configuration failed validation"
+    converge_release "$payload" "$root"
     publish_result "$changed"
+    ;;
+  rollback)
+    previous=$(cat "$backup" 2>/dev/null || true)
+    if [[ -n $previous ]]; then converge_release "$previous" "$root"; fi
+    publish_result true
     ;;
   healthcheck)
     # The agent owns no workload process, so a running, identified master under the runtime pid
     # file is the whole of "healthy" — before the first upgrade as much as after one.
     [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"
     live_master "$runtime" || die "no HAProxy master is running"
+    [[ $(cat "$runtime/live-release.path") == "$payload" ]] || die "wrong release is running"
     ;;
   inspect)
     [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"

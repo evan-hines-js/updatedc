@@ -1,4 +1,4 @@
-//! The sole application artifact format: an immutable, manifested tar.zst release.
+//! The immutable, manifested tar.zst format shared by payload and reconciler bundles.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +14,7 @@ pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 /// The one manifest shape this build reads and writes. Unknown fields and every non-current schema
 /// are refused. A malformed manifest is an [`InstallError::Archive`] and is durably rejected by
 /// content digest.
-pub(crate) const MANIFEST_SCHEMA: u32 = 1;
+pub(crate) const MANIFEST_SCHEMA: u32 = 2;
 const MANIFEST_BYTES_LIMIT: usize = 4 << 20;
 const ACTIVE_RELEASE_BYTES_LIMIT: usize = 4 << 10;
 const BUNDLE_TEMP_PREFIX: &str = ".bundle-";
@@ -60,7 +60,6 @@ pub(crate) struct BundleManifest {
     pub product: String,
     pub version: String,
     pub platform: String,
-    pub entrypoint: String,
     pub files: Vec<ManifestFile>,
 }
 
@@ -101,7 +100,7 @@ pub struct ExpectedBundle<'a> {
     pub platform: &'a str,
 }
 
-/// Build the canonical deterministic application archive from a prepared release tree.
+/// Build a canonical deterministic bundle from a prepared source tree.
 /// `source` must not itself contain `manifest.json`; the publisher generates it from the
 /// exact files that will be archived.
 pub fn create_bundle(
@@ -110,10 +109,9 @@ pub fn create_bundle(
     product: &str,
     version: &str,
     platform: &str,
-    entrypoint: &str,
 ) -> io::Result<()> {
     let limits = BundleLimits::default();
-    validate_bundle_identity(product, version, platform, entrypoint, limits.path_bytes)?;
+    validate_bundle_identity(product, version, platform)?;
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(invalid("bundle source is not a regular directory"));
@@ -153,7 +151,7 @@ pub fn create_bundle(
             if metadata.len() > limits.file_bytes {
                 return Err(invalid("bundle member exceeds file-size limit"));
             }
-            let executable = relative == entrypoint || is_executable(&metadata);
+            let executable = is_executable(&metadata);
             let (sha256, size) = crate::hash::sha256_file_handle(&mut input)?;
             if size > limits.file_bytes {
                 return Err(invalid("bundle member exceeds file-size limit"));
@@ -178,7 +176,6 @@ pub fn create_bundle(
             product: product.to_string(),
             version: version.to_string(),
             platform: platform.to_string(),
-            entrypoint: entrypoint.to_string(),
             files,
         };
         let expected = ExpectedBundle {
@@ -201,84 +198,6 @@ pub fn create_bundle(
         return Err(error);
     }
     foundation::durable::sync_dir(archive_dir)
-}
-
-/// Build the canonical archive from a `source` that is *either* a prepared directory tree or a
-/// single executable file. A directory is bundled as-is; a lone file is first wrapped into a fresh
-/// tree — the file placed at `entrypoint`, plus a generated `config/release.toml`
-/// carrying the version — built as an exclusively-created child of `wrap_root`, then bundled. This is the one definition of the
-/// "wrap a lone binary" publishing shorthand, shared by every publish front end so the generated
-/// tree layout (and its `release.toml`) cannot drift between them. The caller's root is never
-/// deleted or replaced; this function removes only the fresh child it successfully created.
-pub fn create_bundle_from_source(
-    source: &Path,
-    archive: &Path,
-    wrap_root: &Path,
-    product: &str,
-    version: &str,
-    platform: &str,
-    entrypoint: &str,
-) -> io::Result<()> {
-    validate_bundle_identity(
-        product,
-        version,
-        platform,
-        entrypoint,
-        BUNDLE_PATH_BYTES_LIMIT,
-    )?;
-    let metadata = fs::symlink_metadata(source)?;
-    if !metadata.is_file() {
-        return create_bundle(source, archive, product, version, platform, entrypoint);
-    }
-    let wrap = WrappedSource::create(wrap_root)?;
-    let destination = wrap.path().join(entrypoint);
-    let parent = destination
-        .parent()
-        .ok_or_else(|| invalid("bundle entrypoint has no parent directory"))?;
-    fs::create_dir_all(parent)?;
-    fs::create_dir_all(wrap.path().join("config"))?;
-    fs::copy(source, &destination)?;
-    fs::write(
-        wrap.path().join("config/release.toml"),
-        format!("version = {version:?}\n"),
-    )?;
-    create_bundle(wrap.path(), archive, product, version, platform, entrypoint)
-}
-
-struct WrappedSource {
-    path: PathBuf,
-}
-
-impl WrappedSource {
-    fn create(root: &Path) -> io::Result<Self> {
-        fs::create_dir_all(root)?;
-        let metadata = fs::symlink_metadata(root)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(invalid("bundle wrapper root is not a real directory"));
-        }
-        for _ in 0..16 {
-            let path = root.join(format!(".bundle-tree-{}.tmp", crate::rand::token()?));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique bundle wrapper",
-        ))
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for WrappedSource {
-    fn drop(&mut self) {
-        let _ = foundation::durable::remove_path(&self.path);
-    }
 }
 
 impl BundleManifest {
@@ -332,7 +251,7 @@ impl BundleManifest {
         if !updated_contracts::identity::is_segment(&self.platform) {
             return Err(invalid("bundle platform is invalid"));
         }
-        validate_relative(&self.entrypoint, 1024)?;
+
         let mut exact = BTreeSet::new();
         let mut folded = BTreeSet::new();
         for file in &self.files {
@@ -345,14 +264,7 @@ impl BundleManifest {
                 return Err(invalid("duplicate or case-colliding manifest path"));
             }
         }
-        let file = self
-            .files
-            .iter()
-            .find(|file| file.path == self.entrypoint)
-            .ok_or_else(|| invalid("bundle entrypoint is not declared"))?;
-        if !file.executable {
-            return Err(invalid("bundle entrypoint is not executable"));
-        }
+
         Ok(())
     }
 
@@ -377,7 +289,7 @@ impl BundleManifest {
 /// execution-time trust boundary (see `crate::provider`), so every launch and every pre-refresh
 /// integrity check pays for it deliberately. There is one read path for a release, and it is this
 /// one.
-pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, PathBuf)> {
+pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<BundleManifest> {
     id.validate()?;
     let directory = root.join(id.directory_name());
     let directory_meta = fs::symlink_metadata(&directory)?;
@@ -395,12 +307,12 @@ pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleMan
         return Err(invalid("release identity does not match its manifest"));
     }
     verify_tree(&directory, &manifest)?;
-    let entrypoint = directory.join(&manifest.entrypoint);
-    Ok((manifest, entrypoint))
+    Ok(manifest)
 }
 
-/// Re-hash a committed release without exposing its manifest internals. Agents use
-/// this before every network refresh so local tampering is detected while fully offline.
+/// Re-hash a committed release and reassert its bundle class without exposing other manifest
+/// internals. Agents use this before activation and every network refresh so local tampering — or
+/// a bundle of the wrong executable/data class placed in the store — is detected while offline.
 pub fn verify_release(root: &Path, id: &ReleaseId) -> io::Result<()> {
     read_release(root, id).map(|_| ())
 }
@@ -605,8 +517,8 @@ const CLAIM_ATTEMPTS: usize = 4;
 /// One staging attempt's private extraction directory.
 ///
 /// Isolation is by construction, not by exclusion: the directory is named with a fresh random
-/// token, so no two attempts — in this process, in another agent generation across a
-/// self-update, or in a tool run by hand — can ever name the same path. There is no lock to
+/// token, so no two attempts — in this process, in a restarted agent, or in a tool run by hand —
+/// can ever name the same path. There is no lock to
 /// contend on, no heartbeat to miss and no staleness threshold to tune, so concurrent staging
 /// cannot fail, cannot delete another attempt's tree, and cannot be refused.
 ///
@@ -1069,21 +981,13 @@ fn validate_relative(path: &str, max: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_bundle_identity(
-    product: &str,
-    version: &str,
-    platform: &str,
-    entrypoint: &str,
-    max_path_bytes: usize,
-) -> io::Result<()> {
-    if !updated_contracts::identity::is_segment(product) {
-        return Err(invalid("bundle product is invalid"));
+fn validate_bundle_identity(product: &str, version: &str, platform: &str) -> io::Result<()> {
+    if !updated_contracts::identity::is_segment(product)
+        || !updated_contracts::identity::is_segment(platform)
+    {
+        return Err(invalid("invalid package product or platform"));
     }
-    ReleaseId::validate_version(version)?;
-    if !updated_contracts::identity::is_segment(platform) {
-        return Err(invalid("bundle platform is invalid"));
-    }
-    validate_relative(entrypoint, max_path_bytes)
+    ReleaseId::validate_version(version)
 }
 
 fn validate_digest(value: &str) -> io::Result<()> {
@@ -1183,10 +1087,9 @@ mod tests {
         create_bundle(
             &source,
             &archive,
-            "app",
+            "invalid/product",
             "1.0.0",
             "test-platform",
-            "bin/missing",
         )
         .unwrap_err();
         assert_eq!(fs::read(&archive).unwrap(), b"previous complete archive");
@@ -1197,51 +1100,6 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(BUNDLE_TEMP_PREFIX)),
             "a handled failure must not leave its private publication temp behind"
-        );
-    }
-
-    #[test]
-    fn lone_file_wrapping_owns_only_a_fresh_child_and_validates_before_mutating() {
-        let (_dir, root) = root("safe-wrapper");
-        let source = root.join("app");
-        fs::write(&source, b"application").unwrap();
-        let wrap_root = root.join("wrap-root");
-        fs::create_dir(&wrap_root).unwrap();
-        fs::write(wrap_root.join("caller-owned"), b"keep").unwrap();
-        let archive = root.join("app.tar.zst");
-
-        create_bundle_from_source(
-            &source,
-            &archive,
-            &wrap_root,
-            "app",
-            "1.0.0",
-            "test-platform",
-            "../../outside",
-        )
-        .unwrap_err();
-        assert_eq!(
-            fs::read(wrap_root.join("caller-owned")).unwrap(),
-            b"keep",
-            "invalid identity is refused before touching the caller's scratch root"
-        );
-        assert!(!root.join("outside").exists());
-
-        create_bundle_from_source(
-            &source,
-            &archive,
-            &wrap_root,
-            "app",
-            "1.0.0",
-            "test-platform",
-            "bin/app",
-        )
-        .unwrap();
-        assert_eq!(fs::read(wrap_root.join("caller-owned")).unwrap(), b"keep");
-        assert_eq!(
-            fs::read_dir(&wrap_root).unwrap().count(),
-            1,
-            "the exclusively-created wrapper is removed after publication"
         );
     }
 
@@ -1257,15 +1115,7 @@ mod tests {
         let archive = root.join("app.tar.zst");
         std::os::unix::fs::symlink(&outside, &archive).unwrap();
 
-        create_bundle(
-            &source,
-            &archive,
-            "app",
-            "1.0.0",
-            "test-platform",
-            "bin/app",
-        )
-        .unwrap();
+        create_bundle(&source, &archive, "app", "1.0.0", "test-platform").unwrap();
 
         assert_eq!(fs::read(&outside).unwrap(), b"must remain untouched");
         assert!(
@@ -1293,15 +1143,7 @@ mod tests {
             fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let archive = root.join("bundle.tar.zst");
-        create_bundle(
-            &source,
-            &archive,
-            "app",
-            "2.0.0",
-            "test-platform",
-            "bin/app",
-        )
-        .unwrap();
+        create_bundle(&source, &archive, "app", "2.0.0", "test-platform").unwrap();
         let staged = stage_bundle(
             &archive,
             &root.join("staging"),
@@ -1319,8 +1161,7 @@ mod tests {
             fs::read(dir.join("config/release.toml")).unwrap(),
             b"version = \"2.0.0\"\n"
         );
-        let (_, entrypoint) = read_release(&root.join("versions"), &staged).unwrap();
-        assert_eq!(entrypoint, dir.join("bin/app"));
+        read_release(&root.join("versions"), &staged).unwrap();
 
         // The committed tree is only trusted while it still matches the authenticated manifest.
         fs::write(dir.join("undeclared"), b"drift").unwrap();
@@ -1332,15 +1173,7 @@ mod tests {
         fs::create_dir_all(source.join("bin")).unwrap();
         fs::write(source.join("bin/app"), b"executable").unwrap();
         let archive = root.join(format!("bundle-{version}.tar.zst"));
-        create_bundle(
-            &source,
-            &archive,
-            "app",
-            version,
-            "test-platform",
-            "bin/app",
-        )
-        .unwrap();
+        create_bundle(&source, &archive, "app", version, "test-platform").unwrap();
         archive
     }
 
@@ -1392,8 +1225,8 @@ mod tests {
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }
 
-    /// Two attempts staging into one staging root at the same time — two agent generations
-    /// across a self-update, or a hand-run tool — must not interact at all: neither is refused,
+    /// Two attempts staging into one staging root at the same time — two agent processes or a
+    /// hand-run tool — must not interact at all: neither is refused,
     /// and neither's live tree is touched by the other's sweep.
     #[test]
     fn concurrent_attempts_are_isolated_rather_than_serialized() {
@@ -1779,7 +1612,7 @@ mod tests {
             fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let good = root.join("good.tar.zst");
-        create_bundle(&source, &good, "app", "1.0.0", "test-platform", "bin/app").unwrap();
+        create_bundle(&source, &good, "app", "1.0.0", "test-platform").unwrap();
         stage_bundle(
             &good,
             &staging,
@@ -1897,10 +1730,16 @@ mod tests {
             version: "1.0.0",
             platform: "test",
         };
-        let unknown = br#"{"schema":1,"product":"app","version":"1.0.0","platform":"test","entrypoint":"bin/app","files":[],"legacy":true}"#;
+        let unknown = br#"{"schema":2,"product":"app","version":"1.0.0","platform":"test","kind":"reconciler","entrypoint":"bin/app","files":[],"legacy":true}"#;
         assert!(BundleManifest::parse(unknown, &expected).is_err());
-        let escaping = br#"{"schema":1,"product":"app","version":"1.0.0","platform":"test","entrypoint":"../app","files":[]}"#;
+        let escaping = br#"{"schema":2,"product":"app","version":"1.0.0","platform":"test","kind":"reconciler","entrypoint":"../app","files":[]}"#;
         assert!(BundleManifest::parse(escaping, &expected).is_err());
+
+        let payload_expected = ExpectedBundle { ..expected.clone() };
+        let executable_payload = br#"{"schema":2,"product":"app","version":"1.0.0","platform":"test","kind":"payload","entrypoint":"bin/app","files":[]}"#;
+        assert!(BundleManifest::parse(executable_payload, &payload_expected).is_err());
+        let entrypointless_reconciler = br#"{"schema":2,"product":"app","version":"1.0.0","platform":"test","kind":"reconciler","files":[]}"#;
+        assert!(BundleManifest::parse(entrypointless_reconciler, &expected).is_err());
     }
 
     #[test]
@@ -1916,7 +1755,6 @@ mod tests {
             product: "app".into(),
             version: "1.0.0".into(),
             platform: "test-platform".into(),
-            entrypoint: "bin/app".into(),
             files: vec![file.clone()],
         };
 

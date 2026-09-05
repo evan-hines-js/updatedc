@@ -2,16 +2,16 @@
 //! OWNS a workload process.
 //!
 //! The agent is a package runner: it never launches, adopts, signals, or holds a workload. This
-//! fixture is the other half of that contract. In `workload` mode its `apply` converges the sample
-//! application onto the release it is pointed at, its `rollback` converges back onto the restored
-//! predecessor, and its `healthcheck` observes the running workload — so every scenario that needs a
-//! live service gets one from the release's own hook, exactly as an operator's script would.
+//! fixture is the other half of that contract. In `workload` mode it converges the sample
+//! application onto the supplied payload, its `rollback` compensates failed-payload effects, and
+//! its `healthcheck` observes the running workload. The agent separately invokes predecessor
+//! `converge` after compensation, so every scenario exercises the same explicit recovery order.
 //!
 //! Two properties the execution contract demands, and this fixture demonstrates:
 //!
-//! * **Convergence, not restart.** `apply` leaves an already-correct workload alone (same release,
+//! * **Convergence, not restart.** `converge` leaves an already-correct workload alone (same release,
 //!   same environment, still running). That is what makes a workload's PID provably stable across
-//!   agent boots, restarts, crashes and self-updates — the agent has no means to disturb it, and
+//!   agent boots, restarts and crashes — the agent has no means to disturb it, and
 //!   its own reconciler does not either unless something actually changed.
 //! * **Idempotence keyed to the attempt.** Every operation is recorded, and the migration adapter —
 //!   the fixture's one genuinely one-way effect — inspects what is already on disk before doing its
@@ -31,10 +31,10 @@ use updated_contracts::reconciler::{Operation, Reason};
 /// The provider argument that selects this fixture, followed by its state root and its mode.
 pub const FLAG: &str = "--lifecycle-fixture";
 
-/// The version every failure-injecting mode targets: the forward candidate a scenario publishes
-/// over its 1.0.0 baseline. A rollback reverses the candidate/predecessor variables, so keying the
-/// injection to this version leaves the recovery path free to restore the predecessor.
-const FORWARD_CANDIDATE: &str = "2.0.0";
+/// The version every failure-injecting mode targets: the forward payload a scenario publishes
+/// over its 1.0.0 baseline. Keying forward failures to this version leaves predecessor convergence
+/// free to complete recovery.
+const FORWARD_PAYLOAD: &str = "2.0.0";
 
 /// Whether this process was invoked as the reconciler fixture rather than as its own driver. Both
 /// drivers that publish this binary as a provider (the scenario runner and the kill fuzzer) must
@@ -95,7 +95,7 @@ pub fn operations(root: &Path) -> Vec<Invocation> {
             let operation: Operation = fields.next()?.parse().ok()?;
             let id = fields.next()?.to_string();
             let reason: Reason = fields.next()?.parse().ok()?;
-            // The recorded candidate version is for a human reading a failed run's log and is not
+            // The recorded payload version is for a human reading a failed run's log and is not
             // part of the assertion shape. Requiring it still rejects truncated records.
             fields.next()?;
             Some(Invocation {
@@ -134,7 +134,7 @@ pub fn transactions(attempts: &[(String, String)]) -> std::collections::BTreeSet
 
 /// The invocations recorded after `since` that no agent-only event may ever produce: any deployment
 /// operation (a non-reserved attempt id) and any `rollback`. An agent legitimately runs
-/// `apply`/`healthcheck` under `boot`, another pair under `converge`, and steady observations under
+/// `converge`/`healthcheck` under `boot`, another pair under `converge`, and steady observations under
 /// `periodic`/`fingerprint`; a deployment or a rollback means it reached for the workload.
 pub fn disturbances(root: &Path, since: usize) -> Vec<String> {
     operations(root)
@@ -163,6 +163,7 @@ struct Mode {
     workload: Option<String>,
     /// A `--fault` to launch the workload with.
     fault: Option<String>,
+    fault_version: Option<String>,
     /// How long the hook withdraws the workload from traffic before stopping it, for a release that
     /// sits behind a load balancer. Draining is the hook's job — the agent has no workload to
     /// withdraw — so a scenario that cares about in-flight requests asks for it here. Unset means
@@ -172,6 +173,7 @@ struct Mode {
     fail: Vec<Operation>,
     /// The operation that wedges past every hook timeout.
     hang: Option<Operation>,
+    health_marker: bool,
     migration: Migration,
 }
 
@@ -182,11 +184,11 @@ struct Mode {
 enum Migration {
     #[default]
     Off,
-    /// Every candidate runs the adapter.
+    /// Every payload runs the adapter.
     On,
     /// The adapter runs but its migration fails after writing, so rollback must restore the backup.
-    FailApply,
-    /// Only the migration-shaped candidate runs the adapter; the ordinary release after it returns
+    FailConverge,
+    /// Only the migration-shaped payload runs the adapter; the ordinary release after it returns
     /// to the generic path.
     Transition,
 }
@@ -198,11 +200,11 @@ impl Migration {
         self != Migration::Off
     }
 
-    fn runs_adapter(self, candidate_version: &str) -> bool {
+    fn runs_adapter(self, payload_version: &str) -> bool {
         match self {
             Migration::Off => false,
-            Migration::Transition => candidate_version == FORWARD_CANDIDATE,
-            Migration::On | Migration::FailApply => true,
+            Migration::Transition => payload_version == FORWARD_PAYLOAD,
+            Migration::On | Migration::FailConverge => true,
         }
     }
 }
@@ -224,6 +226,7 @@ impl Mode {
             match key {
                 // The default: record and succeed. Named so a mode is never an empty argument.
                 "inert" => {}
+                "health-marker" => mode.health_marker = true,
                 "workload" => {
                     mode.workload = Some(
                         value
@@ -238,6 +241,9 @@ impl Mode {
                             .to_string(),
                     )
                 }
+                "fault-version" => {
+                    mode.fault_version = Some(value.ok_or("fault-version needs a version")?.into())
+                }
                 "drain" => {
                     mode.drain = Some(Duration::from_millis(
                         value
@@ -249,7 +255,7 @@ impl Mode {
                 "fail" => mode.fail.push(operation(value)?),
                 "hang" => mode.hang = Some(operation(value)?),
                 "migration-shaped" => mode.migration = Migration::On,
-                "migration-shaped-fail-apply" => mode.migration = Migration::FailApply,
+                "migration-shaped-fail-converge" => mode.migration = Migration::FailConverge,
                 "migration-shaped-transition" => mode.migration = Migration::Transition,
                 other => return fail(format!("unknown fixture directive {other:?}")),
             }
@@ -258,97 +264,159 @@ impl Mode {
     }
 
     /// Whether this invocation is one of the injected failures. Forward operations fail only for
-    /// the forward candidate, so the recovery that follows can still restore the predecessor; a
+    /// the forward payload, so the recovery that follows can still restore the predecessor; a
     /// `rollback` failure is unconditional — it is how a durably-held failed recovery is proven.
-    fn fails(&self, operation: Operation, candidate_version: &str) -> bool {
+    fn fails(&self, operation: Operation, payload_version: &str) -> bool {
         self.fail.contains(&operation)
-            && (operation == Operation::Rollback || candidate_version == FORWARD_CANDIDATE)
+            && (operation == Operation::Rollback || payload_version == FORWARD_PAYLOAD)
     }
 }
 
 // ---------------------------------- invocation ------------------------------------
 
+/// Embed the same ordinary entrypoint in every test package; mode is application-owned fixture state.
+pub fn prepare_package(payload: &Path) -> R {
+    let name = if cfg!(windows) {
+        "fixture.exe"
+    } else {
+        "fixture"
+    };
+    std::fs::copy(
+        std::env::current_exe().map_err(str_err)?,
+        payload.join(name),
+    )
+    .map_err(str_err)?;
+    let command = serde_json::json!({"argv":[format!("./{name}"),FLAG],"timeoutSeconds":5});
+    let config = serde_json::json!({"schema":1,"deploy":command,"health":command,"inspect":command,
+        "replay":{"policy":"safe"},"recovery":{"policy":"command","command":command,"replay":{"policy":"safe"}}});
+    std::fs::write(
+        payload.join(updated::command_adapter::CONFIG),
+        serde_json::to_vec(&config).map_err(str_err)?,
+    )
+    .map_err(str_err)
+}
+
 /// Run one reconciler invocation. Called from a driver's `main` when [`is_invocation`] holds.
 pub fn run() -> R {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let operation: Operation = args
-        .first()
-        .ok_or("missing reconciler operation")?
+    let context: serde_json::Value = serde_json::from_str(
+        &std::env::var(updated_contracts::helper::CONTEXT_ENV).map_err(str_err)?,
+    )
+    .map_err(str_err)?;
+    let value = |name: &str| -> R<String> {
+        let key = match name {
+            "--protocol" => "protocol",
+            "--attempt-id" => "attemptId",
+            "--reason" => "reason",
+            "--payload-root" => "payloadRoot",
+            "--payload-version" => "payloadVersion",
+            "--result-file" => "resultFile",
+            "--input-dir" => "inputDir",
+            "--output-dir" => "outputDir",
+            "--state-dir" => "stateDir",
+            "--install-root" => "installRoot",
+            _ => return fail("unknown fixture context field"),
+        };
+        context[key]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("missing {key}"))
+    };
+    let operation: Operation = context["operation"]
+        .as_str()
+        .ok_or("missing operation")?
         .parse()
         .map_err(str_err)?;
-    let separator = args
-        .iter()
-        .position(|arg| arg == "--")
-        .ok_or("missing reconciler/provider argument separator")?;
-    let value = |name: &str| -> R<String> {
-        let index = args[..separator]
-            .iter()
-            .position(|arg| arg == name)
-            .ok_or_else(|| format!("missing {name}"))?;
-        args.get(index + 1)
-            .cloned()
-            .ok_or_else(|| format!("missing value for {name}"))
-    };
-    if value("--protocol")? != "1" {
-        return fail("unsupported reconciler protocol");
-    }
     let id = value("--attempt-id")?;
     let reason = value("--reason")?;
-    let candidate = PathBuf::from(value("--candidate")?);
-    let candidate_version = value("--candidate-version")?;
+    let payload = PathBuf::from(value("--payload-root")?);
+    let payload_version = value("--payload-version")?;
     let result_file = PathBuf::from(value("--result-file")?);
-    let provider_args = &args[separator + 1..];
-    let at = provider_args
-        .iter()
-        .position(|arg| arg == FLAG)
-        .ok_or("missing --lifecycle-fixture")?;
-    let root = provider_args
-        .get(at + 1)
-        .map(PathBuf::from)
-        .ok_or("missing fixture state directory")?;
-    let mode = Mode::parse(provider_args.get(at + 2).map_or("", String::as_str))?;
-
+    let install = PathBuf::from(value("--install-root")?);
+    let root = root(
+        install
+            .parent()
+            .ok_or("fixture install root has no parent")?,
+    );
+    let mode = Mode::parse(
+        &std::fs::read_to_string(root.join("mode")).unwrap_or_else(|_| "inert".into()),
+    )?;
     // The one recording chokepoint, ahead of every mode: nothing below may answer an operation
     // that this did not observe.
-    record(&root, operation, &id, &reason, &candidate_version)?;
+    record(&root, operation, &id, &reason, &payload_version)?;
 
+    let transaction = id.strip_suffix('r').unwrap_or(&id);
+    let backup = root.join(format!("workload-before-{transaction}.json"));
+    if operation == Operation::Converge && !backup.exists() {
+        foundation::durable::atomic_write(
+            &backup,
+            ".backup-",
+            &serde_json::to_vec(&read_workload(&root)).map_err(str_err)?,
+        )
+        .map_err(str_err)?;
+    }
     // Inspect is a steady-state observation, not a deployment transaction: deterministic
     // fingerprint material, no modeled side effect.
     if operation == Operation::Inspect {
-        println!("candidate-version={candidate_version}");
+        println!("payload-version={payload_version}");
         return Ok(());
     }
 
     // A hook that wedges rather than exiting non-zero must be bounded by the agent's hook timeout.
     // Sleep far past it so the agent kills this tree.
-    if mode.hang == Some(operation) && candidate_version == FORWARD_CANDIDATE {
+    if mode.hang == Some(operation) && payload_version == FORWARD_PAYLOAD {
         std::thread::sleep(Duration::from_secs(30));
     }
-    // Injected failures answer before any effect, so a contained failure never leaves the candidate
+    // Injected failures answer before any effect, so a contained failure never leaves the payload
     // half-applied.
-    if mode.fails(operation, &candidate_version) {
+    if mode.fails(operation, &payload_version) {
         return fail(format!("injected {} failure", operation.as_str()));
     }
+    if mode.health_marker
+        && operation == Operation::Healthcheck
+        && payload_version == FORWARD_PAYLOAD
+        && root.join("unhealthy").exists()
+    {
+        return fail("injected post-commit health failure");
+    }
 
-    if mode.migration.runs_adapter(&candidate_version) {
-        migrate(&root, mode.migration, operation, &id, &candidate_version)?;
+    if mode.migration.runs_adapter(&payload_version) {
+        migrate(&root, mode.migration, operation, &id, &payload_version)?;
     }
     if mode.migration.gates_health() && operation == Operation::Healthcheck {
-        migration_gate(&root, &candidate_version)?;
+        migration_gate(&root, &payload_version)?;
     }
 
     let outcome = match mode.workload.as_deref() {
         None => Ok(()),
-        // `--candidate` is the release to converge ONTO in both directions: on a rollback the agent
-        // passes the release being restored as the candidate and the failed one as the predecessor,
-        // so a hook that converges toward `--candidate` needs no direction-specific branch at all.
-        Some(address) if operation.mutation().is_some() => {
-            converge(&root, &candidate, address, &mode)
+        Some(address) if operation == Operation::Converge => {
+            converge(&root, &payload, &payload_version, address, &mode)
+        }
+        // Rollback compensates payload-owned durable effects above. The predecessor's own
+        // converge invocation is responsible for selecting and starting its workload.
+        Some(address) if operation == Operation::Rollback => {
+            let previous: Option<WorkloadRecord> =
+                serde_json::from_slice(&std::fs::read(&backup).map_err(str_err)?)
+                    .map_err(str_err)?;
+            match previous {
+                Some(previous) => converge(
+                    &root,
+                    Path::new(&previous.release),
+                    &previous.version,
+                    address,
+                    &mode,
+                ),
+                None => Ok(()),
+            }
         }
         Some(address) if operation == Operation::Healthcheck => {
+            if read_workload(&root)
+                .is_none_or(|workload| workload.release != payload.display().to_string())
+            {
+                return fail("the running workload belongs to a different package");
+            }
             probe(address)?;
             // A healthy observation is also the answer to "is this node fit to serve": a workload
-            // that came up after its `apply` stopped waiting rejoins rotation here.
+            // that came up after its `converge` stopped waiting rejoins rotation here.
             restore_rotation(&root, address, &mode)
         }
         Some(_) => Ok(()),
@@ -399,7 +467,7 @@ fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &s
 
 // ---------------------------------- the workload ----------------------------------
 
-/// The workload's recorded identity. `apply` compares the running release so an already-correct
+/// The workload's recorded identity. `converge` compares the running release so an already-correct
 /// workload is left strictly alone — the difference between convergence and restarting a healthy
 /// service on every boot. Configuration identity is not duplicated here: a real reconciler
 /// compares its managed files/state, while the fixture's workload consumes no assigned inputs.
@@ -407,6 +475,7 @@ fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &s
 struct WorkloadRecord {
     pid: u32,
     release: String,
+    version: String,
 }
 
 fn record_path(root: &Path) -> PathBuf {
@@ -420,12 +489,12 @@ fn read_workload(root: &Path) -> Option<WorkloadRecord> {
 /// Converge the workload onto `release`: leave it alone if it already runs these bytes under this
 /// fixture-managed state, otherwise withdraw it from traffic, stop it, and start the release's
 /// entrypoint.
-fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
+fn converge(root: &Path, release: &Path, version: &str, address: &str, mode: &Mode) -> R {
     let release_id = release.display().to_string();
     let replacing = match read_workload(root) {
         Some(current) if current.release == release_id && pid_alive(current.pid) => {
             // Already converged. Rotation is still derived rather than assumed: a workload that
-            // came up after a previous `apply` gave up waiting is put back in rotation here.
+            // came up after a previous `converge` gave up waiting is put back in rotation here.
             return restore_rotation(root, address, mode);
         }
         Some(current) => Some(current.pid),
@@ -449,7 +518,11 @@ fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
     // The sample application resolves its release identity from `config/release.toml` beside its
     // entrypoint, so the release directory is its working directory.
     command.current_dir(release).args(["--addr", address]);
-    if let Some(fault) = mode.fault.as_deref() {
+    if let Some(fault) = mode.fault.as_deref().filter(|_| {
+        mode.fault_version
+            .as_deref()
+            .is_none_or(|target| target == version)
+    }) {
         command.args(["--fault", fault]);
     }
     let log = foundation::file::open_append_file(&root.join("workload.log")).map_err(str_err)?;
@@ -468,6 +541,7 @@ fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
         .spawn()
         .map_err(|error| format!("starting {}: {error}", program.display()))?;
     let workload = WorkloadRecord {
+        version: version.into(),
         pid: child.id(),
         release: release_id,
     };
@@ -481,13 +555,13 @@ fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
     .map_err(str_err)?;
     if mode.drain.is_none() {
         // Without a rotation signal there is nothing to wait for: `healthcheck` is the agent's only
-        // health source, and an `apply` that probed here would consume an observation the release
+        // health source, and an `converge` that probed here would consume an observation the release
         // may only be able to answer once.
         return Ok(());
     }
-    // Back into rotation only once the replacement answers. A bound keeps `apply` inside its hook
+    // Back into rotation only once the replacement answers. A bound keeps `converge` inside its hook
     // timeout; a workload slower than the bound simply stays withdrawn until the next observation
-    // finds it healthy — every `healthcheck` and every later `apply` restores rotation — so the
+    // finds it healthy — every `healthcheck` and every later `converge` restores rotation — so the
     // marker can never outlive the condition it describes.
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -531,7 +605,7 @@ pub fn draining(dir: &Path) -> bool {
 
 /// Detach the workload from this hook invocation, as the Invocation section of
 /// `docs/node-reconciler-protocol.md` requires: a workload left inside the invocation's contained
-/// tree is killed by its own successful `apply`.
+/// tree is killed by its own successful `converge`.
 fn detach(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -691,7 +765,7 @@ fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version
     std::thread::sleep(Duration::from_millis(250));
     match operation {
         Operation::Healthcheck => Ok(()),
-        Operation::Apply => {
+        Operation::Converge => {
             if version == "1.0.0" {
                 return Ok(());
             }
@@ -715,7 +789,7 @@ fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version
                     != "baseline-content\n"
                     || std::fs::read_to_string(live.join("app.war")).map_err(str_err)? != "1.0.0\n"
                 {
-                    return fail("the migration-shaped apply found an invalid baseline");
+                    return fail("the migration-shaped converge found an invalid baseline");
                 }
                 let backup = backup(id);
                 std::fs::create_dir_all(&backup).map_err(str_err)?;
@@ -729,7 +803,7 @@ fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version
                 std::fs::write(live.join("content.db"), format!("migrated-{version}\n"))
                     .map_err(str_err)?;
             }
-            if mode == Migration::FailApply {
+            if mode == Migration::FailConverge {
                 return fail("injected migration failure");
             }
             std::fs::write(state.join("migration-finalized"), id.as_bytes()).map_err(str_err)
@@ -746,7 +820,7 @@ fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version
 }
 
 /// The migration-shaped healthcheck gate: the ordinary 1.0.0 predecessor has no migration state to
-/// inspect, while every check after the migrating apply requires the receipt that apply produced.
+/// inspect, while every check after the migrating converge requires the receipt that converge produced.
 fn migration_gate(root: &Path, version: &str) -> R {
     if version == "1.0.0" || root.join("migration-state/migration-finalized").is_file() {
         return Ok(());
@@ -761,18 +835,18 @@ mod tests {
 
     #[test]
     fn a_mode_composes_a_workload_with_an_injected_failure() {
-        let mode = Mode::parse("workload=127.0.0.1:1234,fault=unhealthy,fail=apply").unwrap();
+        let mode = Mode::parse("workload=127.0.0.1:1234,fault=unhealthy,fail=converge").unwrap();
         assert_eq!(mode.workload.as_deref(), Some("127.0.0.1:1234"));
         assert_eq!(mode.fault.as_deref(), Some("unhealthy"));
-        assert!(mode.fails(Operation::Apply, FORWARD_CANDIDATE));
+        assert!(mode.fails(Operation::Converge, FORWARD_PAYLOAD));
         // The forward injection must not fire on the rollback that restores the predecessor.
-        assert!(!mode.fails(Operation::Apply, "1.0.0"));
+        assert!(!mode.fails(Operation::Converge, "1.0.0"));
         assert!(!mode.fails(Operation::Rollback, "1.0.0"));
     }
 
     #[test]
     fn a_rollback_failure_is_unconditional() {
-        let mode = Mode::parse("fail=apply,fail=rollback").unwrap();
+        let mode = Mode::parse("fail=converge,fail=rollback").unwrap();
         assert!(mode.fails(Operation::Rollback, "1.0.0"));
     }
 
@@ -789,12 +863,12 @@ mod tests {
     }
 
     /// The double-execution window, at unit scope: a crash between the migrating write and the
-    /// agent's checkpoint replays `apply` under the SAME attempt id. The replay must succeed
+    /// agent's checkpoint replays `converge` under the SAME attempt id. The replay must succeed
     /// without touching the backup — a reference reconciler that rejected its own migrated state
-    /// would earn the candidate a spurious rejection in exactly the window the execution contract
+    /// would earn the payload a spurious rejection in exactly the window the execution contract
     /// exists for.
     #[test]
-    fn a_replayed_migrating_apply_succeeds_without_disturbing_its_backup() {
+    fn a_replayed_migrating_converge_succeeds_without_disturbing_its_backup() {
         let root =
             std::env::temp_dir().join(format!("e2e-migration-replay-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -804,9 +878,9 @@ mod tests {
         std::fs::write(live.join("app.war"), b"1.0.0\n").unwrap();
 
         let id = "attempt";
-        migrate(&root, Migration::On, Operation::Apply, id, "2.0.0").unwrap();
-        migrate(&root, Migration::On, Operation::Apply, id, "2.0.0")
-            .expect("a replayed apply converges rather than rejecting its own result");
+        migrate(&root, Migration::On, Operation::Converge, id, "2.0.0").unwrap();
+        migrate(&root, Migration::On, Operation::Converge, id, "2.0.0")
+            .expect("a replayed converge converges rather than rejecting its own result");
 
         let backup = root.join("migration-state/backups").join(id);
         assert_eq!(
@@ -829,7 +903,13 @@ mod tests {
 
     #[test]
     fn the_fixture_dispatch_marker_cannot_be_missed_by_a_driver() {
-        assert!(is_invocation(["apply", "--protocol", "1", "--", FLAG]));
+        assert!(is_invocation([
+            "converge",
+            "--protocol",
+            updated_contracts::reconciler::PROTOCOL,
+            "--",
+            FLAG,
+        ]));
         assert!(!is_invocation(["killfuzz"]));
     }
 }

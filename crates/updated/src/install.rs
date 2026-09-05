@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 use crate::bundle::ReleaseId;
-use crate::state::{InstalledState, ProviderRelease, RepositoryLineage};
+use crate::state::{InstalledState, ReconcilerRelease, RepositoryLineage};
 
 /// Durable intent for an in-flight first install of a single release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,9 +29,9 @@ pub struct InstallTransaction {
     pub release: ReleaseId,
     pub archive_sha256: String,
     pub repository_lineage: RepositoryLineage,
-    /// The operator lifecycle provider staged with the install, persisted so the committed
+    /// The reconciler staged with the payload, persisted so the committed
     /// record can reference it and so recovery replays placement with the same provider.
-    pub lifecycle: Box<ProviderRelease>,
+    pub reconciler: Box<ReconcilerRelease>,
     /// Last install step known to have completed durably. Recovery replays the next step;
     /// every step is idempotent across the action/journal-write gap.
     pub phase: InstallPhase,
@@ -73,10 +73,10 @@ impl InstallTransaction {
                 "install transaction repository lineage is invalid",
             ));
         }
-        if !self.lifecycle.is_valid() {
+        if !self.reconciler.is_valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "install transaction provider identity is invalid",
+                "install transaction reconciler identity is invalid",
             ));
         }
         Ok(())
@@ -120,7 +120,7 @@ impl InstallTransaction {
         self.release == installed.release
             && self.archive_sha256 == installed.archive_sha256
             && self.repository_lineage == installed.repository_lineage
-            && self.lifecycle == installed.lifecycle
+            && self.reconciler == installed.reconciler
     }
 }
 
@@ -195,7 +195,7 @@ mod tests {
             t.repository_lineage.clone(),
             t.release.clone(),
             t.archive_sha256.clone(),
-            t.lifecycle.clone(),
+            t.reconciler.clone(),
         );
         assert_eq!(
             classify_install_recovery(&t, Some(&exact)),
@@ -211,7 +211,7 @@ mod tests {
         wrong_lineage.repository_lineage =
             RepositoryLineage::from_metadata_url("https://other/metadata/").unwrap();
         let mut wrong_lifecycle = exact;
-        wrong_lifecycle.lifecycle.product = "other-reconciler".into();
+        wrong_lifecycle.reconciler.product = "other-reconciler".into();
         for substituted in [wrong_release, wrong_archive, wrong_lineage, wrong_lifecycle] {
             assert_eq!(
                 classify_install_recovery(&t, Some(&substituted)),

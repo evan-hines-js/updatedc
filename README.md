@@ -1,4 +1,4 @@
-# updatedc — signed, transactional configuration management for fleets of machines
+# updatedc — signed, transactional deployment procedures for fleets of machines
 
 [![CI](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml/badge.svg)](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
@@ -8,31 +8,34 @@
        alt="updatedc: the updatec control plane distributes signed releases to a fleet of updated-agent nodes." />
 </p>
 
-**updatedc** is a pull-based configuration-management and software-delivery system for arbitrary
-machines. You publish a directory of files — configuration, packages, certificates, scripts,
-binaries, assets, or a whole application tree — together with one executable that converges the
-host onto that desired state. A fleet pulls it, verifies every byte against signed metadata,
-applies it transactionally, gates the result on health, and rolls back to the exact predecessor
-when health does not arrive. Publishing a second bundle of the same shape is an update; wrapping an
-existing installer or operations script makes it a reconciler.
+**updatedc** safely executes deployment procedures across fleets of machines. Publish a signed
+payload and choose how to deploy it. Nodes verify the artifacts, execute under durable transactions
+and deadlines, check health, and report authenticated outcomes. Recovery follows the integration's
+explicit capabilities; restoring old files alone does not undo a database migration.
 
-The executable is the whole learning curve, and it is a Bash script, a PowerShell script, or any
-other program. It answers four operations — `apply`, `healthcheck`, `rollback`, `inspect` — in
-whatever terms the environment already uses: `systemctl restart`, `sc.exe`, a container runtime, a
-config reload, a package manager, a firmware tool, or an existing installer. Everything that must
-always happen belongs to the agent: delivery, signature and digest verification, single-writer
-locking, bounded retries and deadlines, process containment, durable transactions and crash
-recovery, health gating, rollback, reboot orchestration, rejection-by-hash so proven-bad bytes are
-never retried, continuous desired-state convergence, drift measurement, and signed reconciliation
-reporting.
+Run your existing entrypoint in any language:
+
+```sh
+updatectl deploy --source ./package --entrypoint install.sh \
+  --product my-app --version 4.0.0 --group production
+```
+
+With your repository and fleet configured, this packages, signs, and deploys the code. Add
+`--interpreter python3` or `--interpreter pwsh` when needed. The platform supplies execution metadata,
+protocol handling, durable receipts, deadlines, and process containment. No wrapper script or
+separate reconciler publication is required. The native runtime upgrades with the agent.
+
+Health checks and recovery commands are optional. By default, an uncertain execution pauses for
+an operator; `--replay safe` explicitly permits repetition. Without a health check, success means
+successful command completion. Application compatibility and external effect safety remain with
+the code author. See [running a package entrypoint](docs/command-adapter.md), or validate locally
+with `updatectl check ./package --entrypoint install.sh`.
 
 The system is split into deliberately narrow components:
 
 - **`updated-agent`** runs on Linux, macOS, and Windows. It authenticates bundles through TUF,
   materializes immutable content-addressed releases, drives the transaction, survives interruption
   at every durable boundary, and reports signed health and output evidence.
-- **`updated-launcher`** supervises only the agent. It readiness-gates agent self-updates and
-  reverts a bad candidate without owning or disturbing the deployed workload.
 - **`updatec`** is the reference Kubernetes control plane and mTLS gateway. It resolves fleet
   policy, signs and publishes per-node assignments, enrolls nodes, brokers bounded object
   capabilities, accepts signed reports, and reconciles rollout state.
@@ -48,69 +51,45 @@ and a node that cannot reach the repository keeps running the last verified bund
 
 ## What a deployment is
 
-A deployment names two immutable, signed, manifested bundles:
+A deployment names one immutable signed package. `updatectl deploy` places the selected entrypoint,
+arguments, timeout, and optional health, inspection, replay, and recovery procedures inside it.
 
-- the **payload** — any directory tree, published as a canonical archive with a strict per-file
-  manifest, plus a declared entrypoint. The publisher also accepts a lone executable and wraps it
-  into that shape.
-- the **node reconciler** — one executable the agent invokes, and the only thing in the system that
-  touches a workload process. Starting, stopping, draining, and restarting whatever the release
-  runs is its domain behavior, typically by driving the operator's own init system.
+The agent owns verification, durable ordering, retries, deadlines, containment, cancellation,
+health gates, rollback journals, and authenticated reports. Your entrypoint owns application state
+and can invoke any language, service manager, database client, or infrastructure tool available on
+the machine. Assigned configuration and secrets are provided as files. An optional native helper
+is automatically available through `UPDATED_RECONCILER_HELPER`; it upgrades with the agent.
 
-The agent supplies delivery, verification of bytes, durable ordering, retries, deadlines,
-containment, cancellation, rollback journaling, scheduling, and telemetry. The reconciler supplies
-every application-specific desired-state decision. The installed system service has machine
-authority so a reconciler can manage users, packages, services, mounts, networking, and boot state;
-signed provider artifacts are the authorization boundary, and a reconciler may drop privileges for
-the workload it starts. Hooks are invoked with argv only — never shell text — under a
-cleared environment, a null stdin, and a contained process tree the agent reaps when the hook
-returns. Assigned configuration, including secrets, reaches hooks only as ordinary files in the
-fresh private `--input-dir`; it never enters argv, the environment, manifests, telemetry, or logs.
+The default replay and recovery policy pauses uncertain work for an operator. Declare safe replay
+only when your operation can tolerate interruption. A configured recovery command must restore the
+previous application, including any data it changed. The platform verifies predecessor health and
+never implicitly reruns its deployment script. Version numbers do not prove compatibility; inspect
+actual machine state in your code before changing it.
 
-`healthcheck` is the one readiness gate. It makes a single observation and exits zero only when the
-observed release is acceptable; the agent retries it to the signed success threshold within the
-signed grace window, and runs it on the signed cadence for steady state. At every release-check
-cycle the agent also re-runs the installed release's idempotent `apply`, even when no new bundle is
-available, then requires the same bounded readiness gate. That platform-owned loop repairs drift;
-the script only has to describe how to converge its domain correctly. `inspect` is the bounded
-steady-state measurement: it runs after each deploy or rollback once the periodic `healthcheck`
-reports healthy, then hourly with stable per-node ±10% jitter — agent policy rather than deployment
-configuration, so expensive collection cannot drift into every health check. On exit zero the agent
-SHA-256 hashes the exact non-empty stdout bytes, without trimming or decoding them, and places that
-digest plus the signed reconciler artifact digest in the node's DSSE report. Stdout is fingerprint
-data; diagnostics belong on stderr. Empty output, non-zero exit, cancellation, exceeding the
-five-minute agent ceiling, or output beyond 64 KiB omits the fingerprint rather than attesting
-incomplete state.
+Install and upgrade procedures may be different scripts selected by your entrypoint. For required
+intermediate upgrades, the native helper can execute an ordered sequence of checked steps. See
+[installation and ordered upgrades](docs/install-and-upgrade.md) for the Kubernetes example and the
+boundary between application compatibility and platform execution guarantees.
 
-Every invocation carries `--attempt-id`: a transaction's own token when it gates that transaction's
-candidate, or one of the reserved `boot`/`converge`/`periodic`/`fingerprint` identities for an operation
-belonging to no transaction. A transaction's compensating direction carries that token with `r`
-appended. Because intent is journaled before every invocation, every operation is invoked *at least
-once* and must tolerate replay.
+With `--healthcheck`, routine convergence checks actual health and can rerun the entrypoint to repair
+drift. Without it, readiness means the entrypoint completed successfully. Optional `--inspect`
+stdout supplies application-specific fingerprint material; generic scripts have no inferred plan
+or resource diff.
 
-Successful `apply` and `rollback` operations publish a small structured result declaring whether
-state changed, whether the same attempt should be retried, and whether the host must reboot. The
-agent validates and durably records that result, owns the retry ceiling and delay, performs reboot
-through a fixed OS command, and includes the latest reconciliation evidence in the node's signed
-report. Health after a requested reboot is judged only after the next boot, with the predecessor
-retained until confirmation.
-
-The argv contract, the output-manifest document, and a copyable Bash template are in the
-[node reconciler protocol](docs/node-reconciler-protocol.md). Before publishing, run the
-conformance harness against the hook:
+Validate locally, without a repository or cluster:
 
 ```sh
-updatectl reconciler-check ./reconciler
+updatectl check ./package --entrypoint install.sh
 ```
 
-It builds a scratch install root, drives the hook through the same argv grammar the agent emits,
-and replays every operation the way crash recovery does — checking structured results, replay
-tolerance, observation purity, fingerprint stability, output-snapshot bounds, and the refusals for an unknown operation
-and an unimplemented protocol. It needs no repository, keys, or Kubernetes access.
+The checker uses the same runtime and helper as a node. It exercises repetition, observation purity,
+results, and output bounds. Add integration assertions for clean install, same-version convergence,
+drift repair, supported and refused transitions, interruptions, and explicit recovery. The
+[internal reconciler protocol](docs/node-reconciler-protocol.md) is implemented by the platform.
 
 ## Architecture
 
-Every node runs two small processes; workloads belong to the releases themselves, and the control
+Every node runs one agent under the platform's service manager; workloads belong to reconcilers, and the control
 plane lives outside the node entirely.
 
 ```text
@@ -120,31 +99,35 @@ plane lives outside the node entirely.
         ┌─────────────┴───────── signed TUF metadata + bundles ──────────────┐
         ▼  (object storage / CDN)                                            ▲
   per node:                                                       signed health reports
-    outer lifecycle owner (systemd, launchd, Windows SCM)
-      └── updated-launcher (which agent binary runs; readiness-gated pointer flips)
-            └── updated-agent (TUF, selection, transactions, health, rollback)
-                  └── invokes the release's own reconciler hooks
-                        └── workload processes (owned by the hooks, never the agent)
+    lifecycle owner (systemd, launchd, Windows SCM, Kubernetes)
+      └── updated-agent (TUF, selection, transactions, health, rollback)
+            └── native runtime invokes the package entrypoint
+                  └── workload processes (owned by the hooks, never the agent)
 ```
 
-The agent never launches, holds, or stops a workload process, so an agent restart, crash, or
-self-update cannot disturb one. A workload the reconciler starts must be detached from the
-invocation that started it; it then belongs to the release rather than to the agent attempt. The
-launcher owns only which agent binary runs: a new agent proves readiness before its pointer is
-committed, and a bad one is reverted and rejected by content hash.
+The agent does not supervise workload processes. A persistent workload must be detached from its
+invocation or managed by the machine's service manager. It can survive an agent-only restart;
+restarting its container or machine still requires the entrypoint to restore it under the declared
+replay policy. Agent binary upgrades use the
+platform's normal package, image, or service rollout and its rollback mechanism.
 
 Activation follows one durable path:
 
 ```text
 authenticate the archive through TUF
-  → hand the verified filepath to the provider (the default provider extracts and
-    verifies the manifested bundle into an immutable release)
-  → write the transaction journal
-  → atomically switch active-release
-  → the release's reconciler `apply` brings the candidate into service
-  → honor a requested host reboot, otherwise require health immediately
-  → after reboot, reapply and require health before confirmation
-  → commit, or reactivate the predecessor and reject the candidate
+  → stage the immutable candidate package
+  → journal Prepared
+  → verify candidate bytes and atomically switch active-release
+  → journal Activated
+  → candidate reconciler converge(payload=candidate)
+  → journal Converged
+  → require health immediately and journal Verified
+  → commit with the exact predecessor rollback guard and journal Committed
+  → clear the journal
+
+On failure, recovery journals RollbackPlanned, invokes candidate
+`rollback(payload=failed candidate)`, restores the predecessor pointer, invokes predecessor
+`converge(payload=predecessor)`, health-gates it, commits it, and clears the same journal.
 ```
 
 ## Fleet management with `updatec`
@@ -179,7 +162,7 @@ identity.
 **Throttled rollouts.** An `UpdateGroupSet` never advances more than `maxConcurrent` members at
 once (default `members − 1`), holding the rest until the in-flight ones settle. Settlement is
 proven by the node itself: each agent writes a small signed `NodeReport` to shared storage stating
-the exact assignment it acted on, the application archive and provider set it is *actually*
+the exact assignment it acted on, the package and execution definition it is *actually*
 running, its latest platform-owned reconciliation record, and whether that running release is
 healthy. The control plane reads those back — it never probes the app — and settles a node only
 when all desired identities match and no rejection stands. Health remains independent: a restored
@@ -212,7 +195,7 @@ operator-owned backend workloads install from the single [`updatec` Helm chart](
 - Reconciler-requested retries and host reboots are bounded, journaled, and executed by the agent.
 - Every accepted state-changing reconciliation is durably recorded and signed into node telemetry.
 - A post-commit crash inside the confirmation window also reverts the release.
-- Agent crashes and agent self-update do not disturb the reconciler-owned workload.
+- Agent crashes do not disturb a reconciler-owned workload.
 - An unavailable repository does not prevent a verified installed bundle from starting.
 - A throttled rollout completes only on the nodes' own signed health reports; a forged, missing, or
   stale report fails closed rather than releasing a slot or a load-balancer backend.
@@ -242,7 +225,7 @@ client_key  = "/etc/updated/enrollment/tls.key"
 ```
 
 Enrollment returns the pinned routing root plus the complete TUF-signed runtime and repository
-configuration. An installer places the launcher and the initial agent, provisions permissions, and
+configuration. An installer places the agent, provisions permissions, and
 registers the platform lifecycle owner; otherwise the first agent enrolls and cold-installs online.
 For a network-free first start against a remote gateway, that installer must preplace both
 `enrollment.json` and the already-minted `agent.crt` / `agent.key`, and may preplace a verified
@@ -274,20 +257,15 @@ repository directories, so an operator can repair a deployment fully offline wit
 plaintext network transport. Raw edits inside an immutable installed release remain untrusted and
 are rejected. See [packaging/etc/config.toml](packaging/etc/config.toml).
 
-Run the launcher — not the agent — under the chosen lifecycle owner:
+Run the agent directly under the chosen lifecycle owner:
 
 ```sh
-target/release/updated-launcher \
-  --state-dir /var/lib/example-app/launcher-state \
-  --agent /usr/lib/example-app/updated-agent \
-  --ready-timeout 60 \
-  --confirm-timeout 30 \
-  --stop-grace 10
+UPDATED_STATE_DIR=/var/lib/example-app/state \
+  target/release/updated-agent --config /etc/updated/config.toml
 ```
 
-The launcher manages only which agent binary runs, and touches no workload. The config is not named
-on the command line: it reads the canonical path above. `--config` overrides it for a deployment
-that deliberately keeps the file elsewhere.
+Configure the service manager to restart the agent after any exit. The shipped templates do this;
+the agent deliberately exits when a fresh process is required, such as after certificate renewal.
 
 Platform templates (systemd, launchd, Windows service) live under [deploy/](deploy).
 
@@ -327,9 +305,6 @@ rewriting one of those files changes only its own workspace and never the conten
 workspace is created on resolve and reaped once its release directory has stayed gone across
 collection passes, so it never outlives what it belongs to and scratch survives restarts and
 rollbacks onto a release the node has run before.
-
-The launcher has a separate state root containing `desired-agent`, lifecycle markers, and
-content-addressed agent candidates.
 
 ## Rejected releases
 
@@ -384,9 +359,9 @@ OpenSSL, and GNU `sha256sum`.
 
 The E2E harness creates a real signed repository and disposable node installations under
 `target/e2e-work/`. It covers deploy and rollback, a tampered trust root, offline launch, rejection
-persistence, transaction-boundary crashes, locking, agent restart, agent self-update, assigned
+persistence, transaction-boundary crashes, locking, agent restart, assigned
 secrets, and the reconciler-hook lifecycle — including a Jenkins-shaped enterprise upgrade whose
-`apply` backs up state and migrates it, whose `healthcheck` gates the result, and which rolls back
+`converge` backs up state and migrates it, whose `healthcheck` gates the result, and which rolls back
 on failure. Its signed chaotic-application fixture separately proves fail-closed behavior for a
 workload that exits before it binds, a `healthcheck` that never returns a healthy verdict, a
 `healthcheck` held past its deadline, a verdict that flaps between healthy and unhealthy, and one
@@ -415,7 +390,7 @@ are fetched directly from an HTTPS object origin. Production keeps the same boun
 S3 routing objects, short-lived signed reads, and direct release downloads.
 
 ```sh
-cargo build --release -p server -p launcher -p agent
+cargo build --release -p server -p agent
 
 target/release/server init --repo ./release-repo --keys ./release-keys
 target/release/server init --repo ./routing-repo --keys ./routing-keys
@@ -423,7 +398,6 @@ target/release/server gen-certs --dir ./certs --san 127.0.0.1 --san localhost
 
 target/release/server publish-app --repo ./release-repo --keys ./release-keys \
   --product app --channel stable --version 1.0.0 \
-  --entrypoint bin/app \
   --bundle linux-x86_64=./release-linux-x86_64 \
   --bundle macos-aarch64=./release-macos-aarch64
 
@@ -434,8 +408,7 @@ target/release/server serve-capability --repo ./routing-repo --addr 127.0.0.1:80
   --cert ./certs/server.crt --key ./certs/server.key --ca ./certs/ca.crt
 ```
 
-Publish immutable payload and reconciler artifacts first, then a provider set, and finally the
-desired deployment assignment. Every reference includes its exact TUF target path and SHA-256, so
+Publish an immutable package first, then its desired deployment assignment. Every reference includes its exact TUF target path and SHA-256, so
 CDN lag can delay a deployment but cannot mix generations:
 
 ```sh
@@ -447,8 +420,6 @@ target/release/server publish-assignment --repo ./routing-repo --keys ./routing-
   --targets-url https://cdn.example.com/groups/canary/targets/ \
   --application-path products/app/stable/2.0.0/linux-x86_64/app \
   --application-sha256 '<64 hex characters>' \
-  --provider-set-path provider-sets/web-7.json \
-  --provider-set-sha256 '<64 hex characters>' \
   --runtime ./signed-runtime.json
 ```
 
@@ -457,13 +428,13 @@ development and for control planes built on other orchestrators.
 
 ## Scope and limitations
 
-- The launcher is installer-owned and updated out of band; trust roots arrive inside the signed
-  enrollment artifact.
+- The agent is upgraded through the platform's package, image, or service deployment mechanism;
+  trust roots arrive inside the signed enrollment artifact.
 - Local state is not hardware-backed monotonic storage; a local administrator is inside the host
   trust boundary and can reseed an installation.
 - Node service templates run the agent with machine authority so signed reconcilers can manage the
   whole host. A reconciler should launch an untrusted workload under a separate account or sandbox.
-- Activation requires a cooperative lifecycle the reconciler can drive (a master/worker reload, a
+- Activation requires a cooperative workload lifecycle the reconciler can drive (a master/worker reload, a
   systemd unit, an external launcher). Windows uses stop/activate/start.
 - The included publisher and HTTP server are development components, not production signing or
   distribution infrastructure.
@@ -479,7 +450,7 @@ development and for control planes built on other orchestrators.
 - [Package-runner design](docs/package-runner-design.md) — why the agent owns no workload process
 - [Kubernetes install guide](docs/kubernetes-install.md) — the Helm chart, CRDs, and Secrets
 - [Agent install guide](docs/agent-install.md) — packages, `install.sh`, Ansible, and the
-  bootstrap-then-self-update boundary
+  platform service-manager boundary
 - [Reference node config](packaging/etc/config.toml) — the file the package installs
 - Design notes for the shipped controls: [observability](docs/observability-design.md),
   [regression response](docs/regression-response-design.md),

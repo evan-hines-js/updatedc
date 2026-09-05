@@ -1,4 +1,4 @@
-//! An `UpdateRepository`'s lifecycle: binding storage ownership, holding the finalizer, and
+//! An `UpdateRepository`'s reconciler: binding storage ownership, holding the finalizer, and
 //! draining local, admitted and object state before a deleted repository is allowed to go away.
 
 use super::*;

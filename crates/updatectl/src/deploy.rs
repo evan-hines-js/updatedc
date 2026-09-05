@@ -5,6 +5,8 @@ use crate::*;
 
 pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
     let backend = &args.backend;
+    // Validate and snapshot generated execution metadata before network access or signing.
+    let package = package::prepare(&args.source, &args.procedure)?;
     updated_contracts::identity::parse_release_version(&args.version).ok_or_else(|| {
         format!(
             "--version {:?} is not a bounded semantic version",
@@ -14,7 +16,7 @@ pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
     let platform = args
         .platform
         .clone()
-        .unwrap_or_else(|| format!("linux-{}", std::env::consts::ARCH));
+        .unwrap_or_else(foundation::platform::platform_key);
     let (os, arch) = platform
         .split_once('-')
         .ok_or_else(|| format!("--platform must be <os>-<arch>, got {platform:?}"))?;
@@ -31,28 +33,18 @@ pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
 
     let (destination, store, keys, checkout) = checkout_repository(backend).await?;
 
-    // Resolve the provider set against the metadata in hand, before any bundle is built.
-    let provider_set = resolve_provider_set(
-        &checkout,
-        args.provider_set_path.as_deref(),
-        args.provider_set_sha256.as_deref(),
-    )
-    .await?;
-
     // Build the bundle into a scratch dir, then register it as a signed target.
     let build_dir = tempfile::tempdir()?;
     let archive = build_dir.path().join("bundle.tar.zst");
-    build_bundle(
-        &args.source,
+    build_payload_bundle(
+        &package.source,
         &archive,
-        build_dir.path(),
         &args.product,
         &args.version,
         &platform,
-        &args.entrypoint,
     )?;
 
-    let mut target = PublishTarget::application(
+    let target = PublishTarget::application(
         &args.product,
         &args.channel,
         &args.version,
@@ -61,11 +53,6 @@ pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
         &args.product,
         archive,
     );
-    // Bind the resolved provider set into this app version's signed metadata, so a later
-    // cold-install-fallback descent rolls providers back with it.
-    if let Some((path, sha256)) = &provider_set {
-        target = target.with_provider_set(path, sha256);
-    }
     let target_name = target.name.clone();
     repo::add_release(checkout.path(), &keys, vec![target], args.expiry_days).await?;
     let sha256 = repo::target_sha256(checkout.path(), &target_name).await?;
@@ -76,8 +63,8 @@ pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
     checkout.publish(store.as_ref(), &destination).await?;
     eprintln!("published signed target {target_name} (sha256 {sha256})");
 
-    // Roll the group. A JSON merge patch touches only the application reference, leaving
-    // the rest of the deployment spec intact; the operator republishes assignments.
+    // Roll the application and its selected execution together; the operator republishes
+    // assignments. A prior custom provider must not override this release's native runtime.
     //
     // `emergencyCorrection` is written on EVERY deploy, true or false. A merge patch that omitted
     // it would leave a previous `true` in place, so a one-off emergency would silently keep every
@@ -98,47 +85,6 @@ pub(crate) async fn deploy(args: DeployArgs) -> Result<(), Error> {
     }
 
     report_deploy(&args, &platform, &target_name, &sha256)
-}
-
-/// Resolve `--provider-set-path`/`--provider-set-sha256` against the signed metadata this publish
-/// already holds, returning the normalized reference to sign into the app target.
-///
-/// The reference is signed into the app version's custom metadata and then read exactly once,
-/// much later: when a cold-install-fallback descent picks this version on a node, `stage_providers`
-/// calls `exact_target` on it. A well-formed but unresolvable reference — a stale copy-paste of a
-/// previous set's path against the new set's digest, or a set published under a different prefix —
-/// is accepted by every syntactic check and only fails there, leaving the node unable to complete
-/// the rollback it is in the middle of. The checkout in hand is the same signed targets metadata
-/// the node will verify against, so resolving it here turns that into a publish-time refusal with
-/// nothing signed or uploaded. The shared digest grammar admits only canonical lowercase hex, so
-/// the reference verified here is exactly the spelling later signed and compared by every agent.
-pub(crate) async fn resolve_provider_set(
-    checkout: &Checkout,
-    path: Option<&str>,
-    sha256: Option<&str>,
-) -> Result<Option<(String, String)>, Error> {
-    // clap's `requires` makes the flags all-or-nothing.
-    let (Some(path), Some(sha256)) = (path, sha256) else {
-        return Ok(None);
-    };
-    if !updated_contracts::is_canonical_sha256(sha256) {
-        return Err(format!(
-            "--provider-set-sha256 {sha256:?} is not a canonical lowercase SHA-256"
-        )
-        .into());
-    }
-    repo::verify_target_reference(
-        checkout.path(),
-        path,
-        sha256,
-        "--provider-set-path",
-        "--provider-set-sha256",
-        "provider sets",
-        "Publish the provider set with `publish-provider-set` against this same bucket and \
-         prefix first, and pass the path it prints. Nothing was signed or uploaded.",
-    )
-    .await?;
-    Ok(Some((path.to_string(), sha256.to_string())))
 }
 
 /// The merge patch that rolls an `UpdateGroup` onto a freshly published target.

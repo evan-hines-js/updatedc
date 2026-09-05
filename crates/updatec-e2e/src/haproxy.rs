@@ -145,8 +145,6 @@ pub(crate) fn haproxy_statefulset() -> serde_json::Value {
 /// The signed HAProxy artifacts published into MinIO: the shared `haproxy-lifecycle` provider set
 /// and the two app releases the tier upgrades between.
 pub(crate) struct HaproxyRelease {
-    pub(crate) provider_path: String,
-    pub(crate) provider_sha: String,
     pub(crate) v1_path: String,
     pub(crate) v1_sha: String,
     pub(crate) v2_path: String,
@@ -167,35 +165,6 @@ pub(crate) fn publish_haproxy_bundles(
     seed_deployment: &serde_json::Value,
     platform: &str,
 ) -> Result<HaproxyRelease, Box<dyn std::error::Error>> {
-    // 1. The provider set: the reconciler that owns the HAProxy process on every node.
-    let repository = release_repository_flags();
-    let provider = output(kubectl().args(RELEASE_SERVER_EXEC).args([
-        "--",
-        "sh",
-        "-c",
-        &format!(
-            "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
-             rm -rf /tmp/hap-provider && mkdir -p /tmp/hap-provider/bin; \
-             cp /usr/local/share/haproxy/lifecycle /tmp/hap-provider/bin/lifecycle; \
-             cp /usr/local/share/haproxy/lib.sh /tmp/hap-provider/bin/lib.sh; \
-             chmod 0755 /tmp/hap-provider/bin/lifecycle; \
-             art=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
-               {repository} --product haproxy-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
-               --source /tmp/hap-provider --platform {platform}); \
-             set -- $art; \
-             set_out=$(updatectl publish-provider-set --keys-dir /data/release-keys \
-               {repository} --id haproxy-lifecycle --provider-path \"$1\" --provider-sha256 \"$2\" \
-               --provider-timeout-ms {HAPROXY_PROVIDER_TIMEOUT_MS}); \
-             printf 'set %s\\n' \"$(echo $set_out | awk '{{print $NF}}')\""
-        ),
-    ]))?;
-    let provider_sha = provider
-        .lines()
-        .find_map(|line| line.strip_prefix("set ")?.split_whitespace().next())
-        .ok_or("publish-provider-set printed no haproxy provider set sha")?
-        .to_owned();
-    let provider_path = "provider-sets/haproxy-lifecycle.json".to_owned();
-
     // 2. The two app releases, published to a throwaway seed group (unmatched selector, so no node
     //    adopts it) purely to read back each content-addressed path+sha. `updatectl deploy`
     //    publishes AND patches, so a seed group is how we publish without assigning a live cohort —
@@ -204,8 +173,6 @@ pub(crate) fn publish_haproxy_bundles(
     let (v1_path, v1_sha) = publish_haproxy_app(seed_deployment, platform, HAPROXY_V1, &servers)?;
     let (v2_path, v2_sha) = publish_haproxy_app(seed_deployment, platform, HAPROXY_V2, &servers)?;
     Ok(HaproxyRelease {
-        provider_path,
-        provider_sha,
         v1_path,
         v1_sha,
         v2_path,
@@ -221,6 +188,7 @@ fn publish_haproxy_app(
     servers: &[BackendServer],
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     let repository = release_repository_flags();
+    let timeout = HAPROXY_PROVIDER_TIMEOUT_MS.div_ceil(1000);
     let cfg = haproxy_cfg(version, servers);
     let seed = format!("haproxy-seed-{version}");
     apply_json(&serde_json::json!({
@@ -245,7 +213,7 @@ fn publish_haproxy_app(
            if [ -x \"$c\" ]; then cp \"$c\" /tmp/hap-app/bin/haproxy; break; fi; done; \
          [ -x /tmp/hap-app/bin/haproxy ] || { echo 'haproxy binary not found in release-server image' >&2; exit 1; }; \
          chmod 0755 /tmp/hap-app/bin/haproxy; \
-         cp /usr/local/share/haproxy/launch /tmp/hap-app/bin/launch; chmod 0755 /tmp/hap-app/bin/launch",
+         cp /usr/local/share/haproxy/lifecycle /tmp/hap-app/bin/lifecycle; cp /usr/local/share/haproxy/lib.sh /tmp/hap-app/bin/lib.sh; cp /usr/local/share/haproxy/launch /tmp/hap-app/bin/launch; chmod 0755 /tmp/hap-app/bin/launch",
     ]))?;
     // Pipe the generated config in over stdin — no shell escaping of its quotes/braces/newlines.
     pipe_into_release_server("cat > /tmp/hap-app/config/haproxy.cfg", &cfg)?;
@@ -257,7 +225,7 @@ fn publish_haproxy_app(
             "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
              updatectl deploy --keys-dir /data/release-keys {repository} \
              --namespace {NAMESPACE} --group {seed} --product haproxy --channel stable --version {version} \
-             --entrypoint bin/launch --platform {platform} --source /tmp/hap-app"
+             --platform {platform} --source /tmp/hap-app --entrypoint bin/lifecycle --healthcheck bin/lifecycle --inspect bin/lifecycle --recover bin/lifecycle --replay safe --recovery-replay safe --timeout-seconds {timeout}"
         ),
     ]))?;
     let path = kubectl_value("updategroup", &seed, "{.spec.deployment.application.path}")?;
@@ -319,8 +287,7 @@ fn haproxy_group_deployment(
     deployment["name"] = versioned_deployment_name(HAPROXY_GROUP, HAPROXY_V1).into();
     deployment["application"] =
         serde_json::json!({"path": release.v1_path, "sha256": release.v1_sha});
-    deployment["providerSet"] =
-        serde_json::json!({"path": release.provider_path, "sha256": release.provider_sha});
+
     deployment["releaseRepository"] = minio_release_repository(release_root);
     deployment["coldInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
@@ -334,8 +301,7 @@ fn haproxy_group_deployment(
         "healthSuccesses": 1,
         "healthIntervalSeconds": 1,
         "refreshRetrySeconds": 1,
-        "confirmationWindowSeconds": 3,
-        "agentCheckIntervalSeconds": 3600
+        "confirmationWindowSeconds": 3
     });
     deployment
 }
@@ -343,7 +309,7 @@ fn haproxy_group_deployment(
 /// Bring up the whole HAProxy tier onto an already-provisioned cluster: the StatefulSet, the
 /// published bundles, the `haproxy` UpdateGroup at 1.0.0 (annotated with the pre-published 2.0.0
 /// target the e2e upgrade patches in), the HAProxy-mode healthproxy that programs backend
-/// membership, and the front Service. Idempotent enough to re-run: applies are declarative.
+/// membership, and the front Service. Idempotent enough to re-run: converges are declarative.
 pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("[e2e] deploying the updated-managed HAProxy tier ({HAPROXY_REPLICAS} HAProxies fronting the external slice)");
     // Clone the fully-valid `edge` deployment as the template for every HAProxy deployment spec, so
@@ -738,10 +704,6 @@ mod tests {
                 sha256: "a".repeat(64),
             },
             cold_install_fallback: true,
-            provider_set: updatec::TargetSpec {
-                path: "providers-1.0.0.tar.zst".into(),
-                sha256: "b".repeat(64),
-            },
             runtime: updatec::RuntimeSpec {
                 product: "sampleapp".into(),
                 channel: "stable".into(),
@@ -753,8 +715,6 @@ mod tests {
                 },
                 storage: updated_contracts::assignment::ManagedStorage {
                     inactive_releases: 2,
-                    inactive_providers: 2,
-                    inactive_agents: 2,
                     inactive_bytes: 1 << 30,
                     inactive_repository_caches: 2,
                 },
@@ -765,7 +725,6 @@ mod tests {
                     health_interval_seconds: 1,
                     refresh_retry_seconds: 5,
                     confirmation_window_seconds: 120,
-                    agent_check_interval_seconds: 3600,
                 },
             },
         };
@@ -784,8 +743,6 @@ mod tests {
             &edge_group(),
             "{\"signed\":{}}",
             &HaproxyRelease {
-                provider_path: "haproxy-providers.tar.zst".into(),
-                provider_sha: "c".repeat(64),
                 v1_path: "haproxy-1.0.0.tar.zst".into(),
                 v1_sha: "d".repeat(64),
                 v2_path: "haproxy-2.0.0.tar.zst".into(),

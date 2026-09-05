@@ -3,7 +3,7 @@
 //! Unique, unguessable names for ephemeral artifacts — per-attempt lifecycle IDs and scratch
 //! paths — so two concurrent operations never collide and a stale one can't be mistaken for a
 //! fresh one. They are not a sandbox boundary against code running as the
-//! same OS identity. The deliberately dependency-free launcher has its own freshness nonce.
+//! same OS identity.
 
 use std::io;
 

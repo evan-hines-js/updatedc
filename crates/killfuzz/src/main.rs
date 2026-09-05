@@ -43,7 +43,7 @@
 //!
 //! It lives in its own binary — never inside the e2e concurrent scenario pool — so its aggressive
 //! whole-tree kills can never starve or collide with other scenarios. It reuses the e2e harness
-//! library for the (fragile, single-source-of-truth) TUF + launcher setup and adds only the kill
+//! library for the (fragile, single-source-of-truth) TUF + agent setup and adds only the kill
 //! loop. Run: `cargo run -p killfuzz` (tune with `KILLFUZZ_ROUNDS` / `KILLFUZZ_SEED`).
 
 use e2e::fixture;
@@ -85,7 +85,7 @@ impl Lcg {
 }
 
 /// End the round's straggler workload WITHOUT touching the mock-CDN server. `Service::drop` already
-/// killed the launcher's process group, which takes the agent with it; what remains is the
+/// killed the agent's process group; what remains is the
 /// hook-managed workload, which lives in a session of its own precisely so no agent restart can
 /// disturb it. The reconciler recorded its PID, so it is stopped by identity rather than by
 /// pattern-matching argv — through the same guard every scenario's teardown uses.
@@ -172,8 +172,8 @@ impl FuzzHarness<'_> {
             ));
             }
 
-            // SIGKILL the WHOLE tree, then reap synchronously: `Service::drop` kills the launcher's
-            // process group (taking the agent with it) and joins its monitor; `reap` ends the
+            // SIGKILL the WHOLE tree, then reap synchronously: `Service::drop` kills the agent's
+            // process group and joins its monitor; `reap` ends the
             // hook-managed workload while leaving the mock-CDN server up.
             drop(stack);
             reap(dir);
@@ -223,7 +223,7 @@ fn run() -> R {
     // Silent for a couple of minutes on a cold target — say so, so it doesn't look hung.
     println!("killfuzz: building workspace binaries + sample app (first run is slow)…");
     ctx.build()?;
-    // `ctx.build()` builds the server, agent and launcher binaries; the versioned sample app is a separate
+    // `ctx.build()` builds the server and agent binaries; the versioned sample app is a separate
     // fixture the e2e runner builds explicitly, so build it here too or the publish has no source.
     // One version-agnostic binary serves every release — the version is baked into each signed
     // bundle's config, so the same bytes publish as 1.0.0, 2.0.0, and 3.0.0.
@@ -252,7 +252,7 @@ fn run() -> R {
         // start a new update while one is still unconfirmed in its window. The killfuzz exercises
         // crash-safety of install/rollback/roll-forward/reconcile, not the window's duration.
         .confirmation_window("3s")
-        .launcher()?;
+        .command()?;
 
     // The canonical layout, never a second copy of it: a hand-written state path keeps passing
     // after the real layout moves, because the file it watches is simply never written.
@@ -398,8 +398,8 @@ fn run() -> R {
         let began = wait_until(CONVERGE_TIMEOUT, || {
             stack.log_contains(&format!("-> {broken_v}"))
         });
-        // Tight-poll for the fresh journal (written at Activating, before the entrypoint even
-        // execs) and SIGKILL the instant it lands — before the failed activation can roll up and a
+        // Tight-poll for the fresh journal (written at Prepared, before the reconciler executes the
+        // payload) and SIGKILL the instant it lands — before failed convergence can roll up and a
         // Service restart's recovery can clear it, freezing a genuine in-flight transaction on disk.
         let in_flight = began && {
             let mut seen = false;
@@ -519,7 +519,7 @@ mod tests {
     fn lifecycle_fixture_dispatch_cannot_reenter_the_fuzzer() {
         assert!(fixture::is_invocation([
             "killfuzz",
-            "apply",
+            "converge",
             "--",
             "--lifecycle-fixture",
         ]));

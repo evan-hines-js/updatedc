@@ -6,7 +6,7 @@ pub(crate) enum Outcome {
     },
     /// A candidate failed *after* activation: it is rejected and the durable rollback journal is
     /// left in place, but the actual rollback is performed by the one rollback implementation — the
-    /// boot state machine — after this disposable agent terminates and the launcher relaunches
+    /// boot state machine — after this disposable agent terminates and the platform service restarts
     /// it. There is no in-process rollback path.
     RollbackPending,
 }
@@ -28,7 +28,7 @@ impl Chaos {
     pub(crate) fn from_env() -> Self {
         Chaos {
             point: std::env::var(updated::env::CHAOS_POINT).ok(),
-            sentinel: std::env::var(control::STATE_DIR_ENV)
+            sentinel: std::env::var(updated::env::STATE_DIR)
                 .ok()
                 .map(|d| PathBuf::from(d).join("chaos-fired")),
         }
@@ -59,36 +59,40 @@ impl Chaos {
 }
 
 /// The transaction boundaries chaos can crash at, as named constants. The crossing points
-/// in [`apply_update`] and the `BOUNDARIES` list the e2e enumerates both reference these,
+/// in [`execute_update`] and the `BOUNDARIES` list the e2e enumerates both reference these,
 /// so the two cannot drift — a crossing and its list entry are the *same* string.
 pub(crate) mod boundary {
     use crate::domain::TransactionPhase;
 
     pub const PREPARED: &str = "prepared";
-    pub const ACTIVATING: &str = "activating";
-    pub const CANDIDATE_POINTER_APPLIED: &str = "candidate-pointer-applied";
-    pub const CANDIDATE_LIFECYCLE_APPLIED: &str = "candidate-lifecycle-applied";
-    pub const CANDIDATE_HEALTH_APPLIED: &str = "candidate-health-applied";
-    pub const COMMITTING: &str = "committing";
+    pub const ACTIVATED: &str = "activated";
+    pub const CANDIDATE_POINTER_MOVED: &str = "candidate-pointer-moved";
+    pub const CANDIDATE_CONVERGE_FINISHED: &str = "candidate-converge-finished";
+    pub const CANDIDATE_HEALTH_PASSED: &str = "candidate-health-passed";
+    pub const CONVERGED: &str = "converged";
+    pub const VERIFIED: &str = "verified";
     pub const COMMITTED: &str = "committed";
-    pub const COMMIT_APPLIED: &str = "commit-applied";
-    pub const ROLLBACK_ACTIVATING: &str = "rollback-activating";
-    pub const PREDECESSOR_POINTER_APPLIED: &str = "predecessor-pointer-applied";
-    pub const PREDECESSOR_LIFECYCLE_APPLIED: &str = "predecessor-lifecycle-applied";
-    pub const ROLLBACK_APPLIED: &str = "rollback-applied";
-    pub const PREDECESSOR_HEALTH_APPLIED: &str = "predecessor-health-applied";
+    pub const INSTALLED_STATE_COMMITTED: &str = "installed-state-committed";
+    pub const ROLLBACK_PLANNED: &str = "rollback-planned";
+    pub const CANDIDATE_COMPENSATED: &str = "candidate-compensated";
+    pub const PREDECESSOR_POINTER_MOVED: &str = "predecessor-pointer-moved";
+    pub const PREDECESSOR_CONVERGE_FINISHED: &str = "predecessor-converge-finished";
+    pub const RESTORED: &str = "restored";
+    pub const PREDECESSOR_HEALTH_PASSED: &str = "predecessor-health-passed";
     pub const ROLLBACK_VERIFIED: &str = "rollback-verified";
-    pub const ROLLBACK_ADAPTER_APPLIED: &str = "rollback-lifecycle-applied";
+    pub const CANDIDATE_ROLLBACK_FINISHED: &str = "candidate-rollback-finished";
     pub const ROLLED_BACK: &str = "rolled-back";
 
     pub fn durable_phase(phase: TransactionPhase) -> &'static str {
         match phase {
             TransactionPhase::Prepared => PREPARED,
-            TransactionPhase::Activating => ACTIVATING,
-            TransactionPhase::Committing => COMMITTING,
+            TransactionPhase::Activated => ACTIVATED,
+            TransactionPhase::Converged => CONVERGED,
+            TransactionPhase::Verified => VERIFIED,
             TransactionPhase::Committed => COMMITTED,
-            TransactionPhase::RollbackActivating => ROLLBACK_ACTIVATING,
-            TransactionPhase::RollbackApplied => ROLLBACK_APPLIED,
+            TransactionPhase::RollbackPlanned => ROLLBACK_PLANNED,
+            TransactionPhase::CandidateCompensated => CANDIDATE_COMPENSATED,
+            TransactionPhase::Restored => RESTORED,
             TransactionPhase::RollbackVerified => ROLLBACK_VERIFIED,
             TransactionPhase::RolledBack => ROLLED_BACK,
         }
@@ -101,24 +105,26 @@ pub(crate) mod boundary {
 #[cfg(any(feature = "chaos", test))]
 pub(crate) const BOUNDARIES: &[&str] = &[
     boundary::PREPARED,
-    boundary::ACTIVATING,
-    boundary::CANDIDATE_POINTER_APPLIED,
-    boundary::CANDIDATE_LIFECYCLE_APPLIED,
-    boundary::CANDIDATE_HEALTH_APPLIED,
-    boundary::COMMITTING,
-    boundary::COMMIT_APPLIED,
+    boundary::CANDIDATE_POINTER_MOVED,
+    boundary::ACTIVATED,
+    boundary::CANDIDATE_CONVERGE_FINISHED,
+    boundary::CONVERGED,
+    boundary::CANDIDATE_HEALTH_PASSED,
+    boundary::VERIFIED,
+    boundary::INSTALLED_STATE_COMMITTED,
     boundary::COMMITTED,
 ];
 
 #[cfg(any(feature = "chaos", test))]
 pub(crate) const ROLLBACK_BOUNDARIES: &[&str] = &[
-    boundary::ROLLBACK_ACTIVATING,
-    boundary::PREDECESSOR_POINTER_APPLIED,
-    boundary::PREDECESSOR_LIFECYCLE_APPLIED,
-    boundary::ROLLBACK_APPLIED,
-    boundary::PREDECESSOR_HEALTH_APPLIED,
+    boundary::ROLLBACK_PLANNED,
+    boundary::CANDIDATE_ROLLBACK_FINISHED,
+    boundary::CANDIDATE_COMPENSATED,
+    boundary::PREDECESSOR_POINTER_MOVED,
+    boundary::PREDECESSOR_CONVERGE_FINISHED,
+    boundary::RESTORED,
+    boundary::PREDECESSOR_HEALTH_PASSED,
     boundary::ROLLBACK_VERIFIED,
-    boundary::ROLLBACK_ADAPTER_APPLIED,
     boundary::ROLLED_BACK,
 ];
 
@@ -127,9 +133,9 @@ pub(crate) const ROLLBACK_BOUNDARIES: &[&str] = &[
 // What the transaction drives on the *live* side — the release's own reconciler hooks — behind a
 // port, exactly as [`Store`] ports the durable side. The production [`ReleaseReconciler`] invokes
 // the signed node reconciler that travels with the install; a test fake scripts operation outcomes
-// and health, so every fault path of [`apply_update`] is provable without a subprocess.
+// and health, so every fault path of [`execute_update`] is provable without a subprocess.
 
-/// The only two meanings a lifecycle failure can have.
+/// The only two meanings a reconciler failure can have.
 ///
 /// `ReleaseFault` is evidence about the release: its reconciler returned a non-zero status, wrote
 /// an invalid semantic answer, or ran past its signed timeout. `Inconclusive` means the platform
@@ -221,10 +227,15 @@ fn invalid_reconciliation_context(error: String) -> InvocationFailure {
 /// leaves a durable rollback journal, and the agent terminates so boot recovery performs the one
 /// rollback path.
 pub(crate) trait Reconciler {
+    /// Persist recovery prerequisites before the journal authorizes activation.
+    fn prepare_update(&mut self, _attempt_id: &str) -> io::Result<()> {
+        Ok(())
+    }
+
     fn mutate(
         &mut self,
         operation: MutationOperation,
-        lifecycle_attempt_id: &str,
+        attempt_id: &str,
         candidate: ReleaseTarget<'_>,
         predecessor: ReleaseTarget<'_>,
     ) -> Result<updated_contracts::reconciler::SuccessfulMutation, InvocationFailure>;
@@ -232,7 +243,7 @@ pub(crate) trait Reconciler {
         &mut self,
         operation: ObservationOperation,
         timeout: Duration,
-        lifecycle_attempt_id: &str,
+        attempt_id: &str,
         candidate: ReleaseTarget<'_>,
         predecessor: ReleaseTarget<'_>,
     ) -> Result<(), InvocationFailure>;
@@ -244,7 +255,7 @@ pub(crate) trait Reconciler {
 /// this agent's configured bounds.
 pub(crate) struct ReleaseReconciler<'a> {
     opts: &'a Options,
-    lifecycle: &'a updated::state::ProviderRelease,
+    reconciler: &'a updated::state::ReconcilerRelease,
     /// The `--reason` every probe this port makes carries. It is a property of the boot or the
     /// transaction the port serves, not of an individual probe, so it is fixed at construction:
     /// a boot gate observes the same kind of event the boot converge just performed.
@@ -254,53 +265,68 @@ pub(crate) struct ReleaseReconciler<'a> {
 impl<'a> ReleaseReconciler<'a> {
     pub(crate) fn new(
         opts: &'a Options,
-        lifecycle: &'a updated::state::ProviderRelease,
+        reconciler: &'a updated::state::ReconcilerRelease,
         reason: Reason,
     ) -> ReleaseReconciler<'a> {
         ReleaseReconciler {
             opts,
-            lifecycle,
+            reconciler,
             reason,
         }
     }
 }
 
 impl Reconciler for ReleaseReconciler<'_> {
+    fn prepare_update(&mut self, attempt_id: &str) -> io::Result<()> {
+        if self.opts.runtime_data.selection() != &self.opts.application.input_selection
+            || self.opts.runtime_data.inputs() != &self.opts.inputs
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "update inputs are not authenticated",
+            ));
+        }
+        self.opts
+            .runtime_data
+            .pin(&self.opts.paths.recovery_inputs, attempt_id)
+    }
+
     fn mutate(
         &mut self,
         operation: MutationOperation,
-        lifecycle_attempt_id: &str,
+        attempt_id: &str,
         candidate: ReleaseTarget<'_>,
         predecessor: ReleaseTarget<'_>,
     ) -> Result<updated_contracts::reconciler::SuccessfulMutation, InvocationFailure> {
-        invoke_lifecycle_mutation(
-            self.lifecycle,
+        invoke_reconciler_mutation(
+            self.reconciler,
             self.opts,
             operation,
-            LifecycleInvocation {
+            ReconcilerInvocation {
                 reason: self.reason,
-                id: lifecycle_attempt_id,
+                id: attempt_id,
                 candidate,
                 predecessor,
             },
+            None,
         )
     }
     fn observe(
         &mut self,
         operation: ObservationOperation,
         timeout: Duration,
-        lifecycle_attempt_id: &str,
+        attempt_id: &str,
         candidate: ReleaseTarget<'_>,
         predecessor: ReleaseTarget<'_>,
     ) -> Result<(), InvocationFailure> {
-        invoke_lifecycle_observation(
-            self.lifecycle,
+        invoke_reconciler_observation(
+            self.reconciler,
             self.opts,
             operation,
             timeout,
-            LifecycleInvocation {
+            ReconcilerInvocation {
                 reason: self.reason,
-                id: lifecycle_attempt_id,
+                id: attempt_id,
                 candidate,
                 predecessor,
             },
@@ -316,7 +342,7 @@ impl Reconciler for ReleaseReconciler<'_> {
 }
 
 pub(crate) struct FingerprintJob {
-    command: PreparedLifecycleCommand,
+    command: PreparedReconcilerCommand,
     definition_sha256: String,
 }
 
@@ -325,20 +351,20 @@ impl FingerprintJob {
         self,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> io::Result<updated_contracts::telemetry::Fingerprint> {
-        let output = run_prepared_lifecycle_command(self.command, Some(cancelled))
+        let output = run_prepared_reconciler_command(self.command, Some(cancelled))
             .map_err(InvocationFailure::into_io_error)?;
         fingerprint_from_output(&self.definition_sha256, output)
     }
 }
 
 pub(crate) fn prepare_fingerprint_job(
-    release: &updated::state::ProviderRelease,
+    release: &updated::state::ReconcilerRelease,
     opts: &Options,
-    invocation: LifecycleInvocation<'_>,
+    invocation: ReconcilerInvocation<'_>,
 ) -> io::Result<FingerprintJob> {
     Ok(FingerprintJob {
-        command: prepare_lifecycle_command(release, opts, Operation::Inspect, None, invocation)?,
-        definition_sha256: release.archive_sha256.clone(),
+        command: prepare_reconciler_command(release, opts, Operation::Inspect, None, invocation)?,
+        definition_sha256: release.execution_digest(),
     })
 }
 
@@ -367,7 +393,7 @@ fn fingerprint_from_output(
     .map_err(io::Error::other)
 }
 
-/// THE environment converge: run the committed release's `apply` outside a release transaction,
+/// THE environment converge: run the committed release's `converge` outside a release transaction,
 /// so the reconciler sees the runtime the assignment names *now* — its resolved `inputs` above
 /// all, which reach the reconciler only through `--input-dir`.
 ///
@@ -384,6 +410,7 @@ pub(crate) fn converge_environment(
     store: &Store,
     reason: Reason,
     attempt_id: &str,
+    runtime_ceiling: Option<Duration>,
 ) -> io::Result<updated_contracts::reconciler::SuccessfulMutation> {
     let updated::state::Installed::Present(installed) = store.installed()? else {
         return Err(io::Error::new(
@@ -394,12 +421,12 @@ pub(crate) fn converge_environment(
     let installed = *installed;
     let release = installed.release;
     let archive_sha256 = installed.archive_sha256;
-    let lifecycle = installed.lifecycle;
-    run_lifecycle_mutation(
-        lifecycle.as_ref(),
+    let reconciler = installed.reconciler;
+    run_reconciler_mutation(
+        reconciler.as_ref(),
         opts,
-        MutationOperation::Apply,
-        LifecycleInvocation {
+        MutationOperation::Converge,
+        ReconcilerInvocation {
             reason,
             id: attempt_id,
             candidate: ReleaseTarget {
@@ -411,6 +438,7 @@ pub(crate) fn converge_environment(
                 archive_sha256: &archive_sha256,
             },
         },
+        runtime_ceiling,
     )
 }
 
@@ -451,14 +479,14 @@ impl Readiness {
 /// consecutive-success evidence or the agent-owned deadline expires. The reconciler performs one
 /// application-specific observation; the agent owns cadence, bounds, cancellation, and policy.
 ///
-/// `lifecycle_attempt_id` is the transaction's own token whenever the gate is a step of a
+/// `attempt_id` is the transaction's own token whenever the gate is a step of a
 /// transaction — the forward candidate's gate and a crash-recovered rollback's predecessor gate
 /// alike — so the reconciler may rely on effects written by earlier operations of that exact
 /// attempt. It is [`attempt::BOOT`] only for a gate that belongs to no transaction, which observes
 /// durable steady state and never impersonates an attempt whose effects no longer exist.
 pub(crate) async fn became_healthy<T: Reconciler>(
     reconciler: &mut T,
-    lifecycle_attempt_id: &str,
+    attempt_id: &str,
     candidate: ReleaseTarget<'_>,
     predecessor: ReleaseTarget<'_>,
 ) -> Health {
@@ -467,7 +495,7 @@ pub(crate) async fn became_healthy<T: Reconciler>(
     let mut readiness = Readiness::new(successes);
     let mut next = Instant::now();
     // The verdict is the state of the LAST probe, not a latch over the whole grace. The first probe
-    // after an `apply` normally answers "not ready" while the workload is still starting, so a
+    // after a `converge` normally answers "not ready" while the workload is still starting, so a
     // latch saying "the reconciler answered at least once" would be set within ~100ms of every
     // switch-over and could never be unset — a state volume that fills at t=2s would then still be
     // reported as an unhealthy CANDIDATE and earn that release a permanent rejection. Whether the
@@ -483,7 +511,7 @@ pub(crate) async fn became_healthy<T: Reconciler>(
             let probe = reconciler.observe(
                 ObservationOperation::Healthcheck,
                 remaining,
-                lifecycle_attempt_id,
+                attempt_id,
                 candidate,
                 predecessor,
             );
@@ -543,17 +571,17 @@ pub(crate) enum Health {
 
 /// Drive one application update through the durable transaction, over the [`Store`] and
 /// [`Reconciler`] ports.
-pub(crate) async fn apply_update<T: Reconciler>(
+pub(crate) async fn execute_update<T: Reconciler>(
     reconciler: &mut T,
     store: &mut Store,
     candidate: &updated::bundle::ReleaseId,
     candidate_archive_sha256: &str,
     candidate_repository_lineage: updated::state::RepositoryLineage,
-    lifecycle: updated::state::ProviderRelease,
+    candidate_reconciler: updated::state::ReconcilerRelease,
 ) -> io::Result<Outcome> {
     // Recovery belongs to the boot state machine. A live agent must never mutate recovery
     // evidence or move the active pointer outside a transaction. Any transaction error terminates
-    // this disposable agent; the launcher relaunches it through the one recovery path.
+    // this disposable agent; the platform service restarts it through the one recovery path.
     match store.journal()? {
         None => {}
         // A journal that can no longer drive a rollback is SPENT — its transaction already reached
@@ -582,17 +610,18 @@ pub(crate) async fn apply_update<T: Reconciler>(
         Installed::Present(state) => state,
         _ => return Err(io::Error::other("a verified installed release is required")),
     };
+    for release in [&candidate_reconciler, installed.reconciler.as_ref()] {
+        release.check_supported().map_err(io::Error::other)?;
+    }
     let Some(candidate_rejection_sha256) = updated::state::candidate_rejection_sha256(
         &installed.release,
         &installed.archive_sha256,
-        &installed.lifecycle,
         candidate,
         candidate_archive_sha256,
-        &lifecycle,
     ) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "an update must change the application or lifecycle provider",
+            "an update must change the payload or reconciler",
         ));
     };
     let tx = Transaction {
@@ -612,24 +641,25 @@ pub(crate) async fn apply_update<T: Reconciler>(
         // providers become the new head's at commit below. This keeps the journal-driven recovery
         // (an in-process rollback that crashed) consistent with the pending-driven one, which
         // already carries the predecessor's providers.
-        previous_lifecycle: installed.lifecycle.clone(),
-        candidate_lifecycle: Box::new(lifecycle),
+        previous_reconciler: installed.reconciler.clone(),
+        candidate_reconciler: Box::new(candidate_reconciler),
         rollback_health_failures: 0,
         phase: TransactionPhase::Prepared,
     };
+    reconciler.prepare_update(&tx.id)?;
     persist_transaction(store, &tx)?;
 
     // Everything up to here is side-effect free on the live node: the candidate is staged, nothing
     // is pointed at it, and a failure defers cleanly as `Err`. Past this line the pointer moves and
-    // the release's `apply` runs, so no failure may surface as `Err` — that maps to
+    // the release's `converge` runs, so no failure may surface as `Err` — that maps to
     // `AppOutcome::Fatal`, which abandons the update and ends the process with the node
-    // half-switched until the launcher's backoff relaunches this agent. Recovering in place is
+    // half-switched until the platform service restarts this agent. Recovering in place is
     // strictly better, so `switch_over` returns [`Outcome`] rather than `io::Result<Outcome>` — a
     // type error instead of a rule every future call site has to remember.
     Ok(switch_over(reconciler, store, tx).await)
 }
 
-/// The committing half of an update: the pointer moves and the candidate's `apply` runs, so every
+/// The committing half of an update: the pointer moves and the candidate's `converge` runs, so every
 /// failure from here on is answered by restarting into boot recovery, which resumes from the
 /// journal's last durable phase (always a valid checkpoint). The infallible return type is the
 /// enforcement: there is no way to propagate an error out of the switchover.
@@ -655,10 +685,6 @@ async fn switch_over<T: Reconciler>(
             }
         };
     }
-    recover_on_error!(
-        "recording the activation checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::Activating)
-    );
     // Activation itself owns verify-before-point. Staging already separated reproducible archive
     // faults from local storage faults before publishing the tree, so neither a later integrity
     // failure nor pointer I/O is evidence that may poison the durable rejection set.
@@ -666,13 +692,17 @@ async fn switch_over<T: Reconciler>(
         "verifying and writing the active-release pointer",
         store.activate(&candidate)
     );
-    chaos.crossing(boundary::CANDIDATE_POINTER_APPLIED);
+    chaos.crossing(boundary::CANDIDATE_POINTER_MOVED);
+    recover_on_error!(
+        "recording the completed activation",
+        advance_transaction(store, &mut tx, TransactionPhase::Activated)
+    );
 
-    // The candidate's own `apply`: the release converges the machine onto itself — starting,
+    // The candidate's own `converge`: the release converges the machine onto itself — starting,
     // reloading or restarting whatever it owns. This agent touches no workload process, here or
     // anywhere.
-    let apply_result = match reconciler.mutate(
-        MutationOperation::Apply,
+    let converge_result = match reconciler.mutate(
+        MutationOperation::Converge,
         &tx.id,
         ReleaseTarget {
             release: &candidate,
@@ -696,8 +726,12 @@ async fn switch_over<T: Reconciler>(
             return Outcome::RollbackPending;
         }
     };
-    chaos.crossing(boundary::CANDIDATE_LIFECYCLE_APPLIED);
-    if apply_result.host_action() != updated_contracts::reconciler::HostAction::Reboot {
+    chaos.crossing(boundary::CANDIDATE_CONVERGE_FINISHED);
+    recover_on_error!(
+        "recording the completed candidate convergence",
+        advance_transaction(store, &mut tx, TransactionPhase::Converged)
+    );
+    if converge_result.host_action() != updated_contracts::reconciler::HostAction::Reboot {
         match became_healthy(
             reconciler,
             &tx.id,
@@ -730,7 +764,11 @@ async fn switch_over<T: Reconciler>(
                 return Outcome::RollbackPending;
             }
         }
-        chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
+        chaos.crossing(boundary::CANDIDATE_HEALTH_PASSED);
+        recover_on_error!(
+            "recording the successful candidate health gate",
+            advance_transaction(store, &mut tx, TransactionPhase::Verified)
+        );
     }
 
     // Commit atomically WITH the pending rollback intent: the update is unconfirmed until
@@ -740,24 +778,16 @@ async fn switch_over<T: Reconciler>(
     //
     // The predecessor identity comes from the transaction, the same record boot recovery reads, so
     // the pending-driven rollback and the journal-driven one cannot describe different predecessors.
-    // That includes the providers: the rollback restores the *predecessor*, so it must carry the
-    // *predecessor's own* signed providers (app + providers are one signed unit), not the
-    // candidate's. At the assigned head these are the same set; across a provider-set revision in
-    // this update they differ, and reverting the old release with the new providers would
-    // gate/watch it with the wrong hooks.
-    let pending = Some(Pending {
-        lifecycle_attempt_id: tx.id.clone(),
+    // Recovery retains the predecessor package's own execution definition.
+    let pending = Some(RollbackGuard {
+        attempt_id: tx.id.clone(),
         candidate_rejection_sha256: tx.candidate_rejection_sha256.clone(),
         previous_release: tx.previous_release.clone(),
         previous_archive_sha256: tx.previous_archive_sha256.clone(),
         previous_repository_lineage: tx.previous_repository_lineage.clone(),
         committed_at: now_unix(),
-        lifecycle: tx.previous_lifecycle.clone(),
+        reconciler: tx.previous_reconciler.clone(),
     });
-    recover_on_error!(
-        "recording the commit checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::Committing)
-    );
     recover_on_error!(
         "committing the installed release",
         store.commit_installed(&InstalledState {
@@ -767,14 +797,14 @@ async fn switch_over<T: Reconciler>(
             // The candidate's own providers are part of the durable transaction identity, so the
             // commit gate proves the whole deployed unit rather than trusting an adjacent
             // in-memory argument.
-            lifecycle: tx.candidate_lifecycle.clone(),
-            pending,
+            reconciler: tx.candidate_reconciler.clone(),
+            rollback_guard: pending,
             // An update always has a proven predecessor: its failure recovery is this state machine's
             // rollback, never a cold-install-fallback descent, so the new head commits already confirmed.
-            confirmed: true,
+            maturity: Maturity::Proven,
         })
     );
-    chaos.crossing(boundary::COMMIT_APPLIED);
+    chaos.crossing(boundary::INSTALLED_STATE_COMMITTED);
     recover_on_error!(
         "recording the committed checkpoint",
         advance_transaction(store, &mut tx, TransactionPhase::Committed)
@@ -791,7 +821,7 @@ async fn switch_over<T: Reconciler>(
         ));
     }
     Outcome::Committed {
-        host_action: apply_result.host_action(),
+        host_action: converge_result.host_action(),
     }
 }
 
@@ -806,19 +836,16 @@ fn require_candidate_rejection(store: &mut Store, tx: &mut Transaction) -> io::R
     store.reject_deployment(
         &tx.candidate_repository_lineage,
         &tx.candidate_archive_sha256,
-        &tx.candidate_lifecycle.provider_set_sha256,
     )
 }
 
 /// Reject the failed candidate and hand the rollback to the boot state machine — the single
 /// rollback implementation. Every post-activation failure ends here: the candidate is pointed at
-/// and its `apply` has run, so this records the rejection and leaves the durable journal for boot
+/// and its `converge` has run, so this records the rejection and leaves the durable journal for boot
 /// recovery to complete on the next agent start. An agent restart is cheap — it touches no workload
-/// — and the freshly-booted agent restores the predecessor with the predecessor's *own* providers
-/// (carried in the transaction). Rolling back here in-process would be a second rollback path to
-/// keep in lockstep with boot recovery — and, because a live agent holds the candidate's
-/// reconciler, it would compensate the restored predecessor with the *candidate's* hooks. One path,
-/// one set of providers, no divergence.
+/// — and the freshly booted agent first compensates with the candidate's reconciler, then restores
+/// and converges with the predecessor's reconciler. Rolling back here in-process would be a second
+/// path to keep in lockstep with boot recovery. One path, one explicit reconciler per operation.
 ///
 /// Recording the rejection is itself a durable write and can fail (ENOSPC, a read-only remount).
 /// That failure must not escape: this runs mid-switchover, where an error would hold the process
@@ -855,50 +882,90 @@ pub(crate) fn persist_transaction(store: &mut Store, tx: &Transaction) -> io::Re
 /// PowerShell without a JSON parser or SDK. A bounded wait prevents a wedged enterprise
 /// integration from wedging the updater forever.
 #[derive(Clone, Copy)]
-pub(crate) struct LifecycleInvocation<'a> {
+pub(crate) struct ReconcilerInvocation<'a> {
     pub(crate) reason: Reason,
     pub(crate) id: &'a str,
     pub(crate) candidate: ReleaseTarget<'a>,
     pub(crate) predecessor: ReleaseTarget<'a>,
 }
 
-pub(crate) fn run_lifecycle_mutation(
-    lifecycle: &updated::state::ProviderRelease,
+pub(crate) fn run_reconciler_mutation(
+    reconciler: &updated::state::ReconcilerRelease,
     opts: &Options,
     operation: MutationOperation,
-    invocation: LifecycleInvocation<'_>,
+    invocation: ReconcilerInvocation<'_>,
+    runtime_ceiling: Option<Duration>,
 ) -> io::Result<updated_contracts::reconciler::SuccessfulMutation> {
-    invoke_lifecycle_mutation(lifecycle, opts, operation, invocation)
+    invoke_reconciler_mutation(reconciler, opts, operation, invocation, runtime_ceiling)
         .map_err(InvocationFailure::into_io_error)
 }
 
-pub(crate) fn run_lifecycle_observation(
-    lifecycle: &updated::state::ProviderRelease,
+pub(crate) fn run_reconciler_observation(
+    reconciler: &updated::state::ReconcilerRelease,
     opts: &Options,
     operation: ObservationOperation,
-    invocation: LifecycleInvocation<'_>,
+    invocation: ReconcilerInvocation<'_>,
 ) -> io::Result<()> {
-    invoke_lifecycle_observation(lifecycle, opts, operation, HEALTHCHECK_TIMEOUT, invocation)
+    invoke_reconciler_observation(reconciler, opts, operation, HEALTHCHECK_TIMEOUT, invocation)
         .map_err(InvocationFailure::into_io_error)
 }
 
-fn invoke_lifecycle_mutation(
-    lifecycle: &updated::state::ProviderRelease,
+fn invoke_reconciler_mutation(
+    reconciler: &updated::state::ReconcilerRelease,
     opts: &Options,
     operation: MutationOperation,
-    invocation: LifecycleInvocation<'_>,
+    invocation: ReconcilerInvocation<'_>,
+    runtime_ceiling: Option<Duration>,
 ) -> Result<updated_contracts::reconciler::SuccessfulMutation, InvocationFailure> {
+    if let Some(hold) = updated::command_adapter::read_attention(&opts.paths.install_root)
+        .map_err(InvocationFailure::Inconclusive)?
+    {
+        return Err(InvocationFailure::Inconclusive(io::Error::other(format!(
+            "operator attention required: {}",
+            hold.message
+        ))));
+    }
     let phase = operation.operation();
     let max_attempts = updated_contracts::reconciler::MAX_MUTATION_ATTEMPTS;
+    let deadline = runtime_ceiling
+        .map(|ceiling| {
+            Instant::now().checked_add(ceiling).ok_or_else(|| {
+                InvocationFailure::Inconclusive(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "reconciler runtime ceiling is too large",
+                ))
+            })
+        })
+        .transpose()?;
 
     for attempt in 1..=max_attempts {
-        let prepared = prepare_lifecycle_command(lifecycle, opts, phase, None, invocation)
+        let remaining = mutation_runtime_remaining(deadline, phase)?;
+        let prepared = prepare_reconciler_command(reconciler, opts, phase, remaining, invocation)
             .map_err(InvocationFailure::Inconclusive)?;
-        let output = run_prepared_lifecycle_command(prepared, None)?;
+        let output = run_prepared_reconciler_command(prepared, None)?;
         let updated::reconciler::InvocationResult::Mutation(resolution) = output.result else {
             unreachable!("a mutation invocation is validated before it reaches this boundary")
         };
         match resolution {
+            updated_contracts::reconciler::MutationResolution::NeedsAttention(message) => {
+                let root = updated::bundle_store::BundleStore::for_app(&opts.paths)
+                    .location(invocation.candidate.release);
+                let hold = updated_contracts::attention::Attention {
+                    product: reconciler.product.clone(),
+                    receipt: updated::command_adapter::receipt_id(&root)
+                        .map_err(InvocationFailure::Inconclusive)?,
+                    operation,
+                    attempt: invocation.id.into(),
+                    version: invocation.candidate.release.version.clone(),
+                    message,
+                };
+                updated::command_adapter::write_attention(&opts.paths.install_root, &hold)
+                    .map_err(InvocationFailure::Inconclusive)?;
+                return Err(InvocationFailure::Inconclusive(io::Error::other(format!(
+                    "operator attention required: {}",
+                    hold.message
+                ))));
+            }
             updated_contracts::reconciler::MutationResolution::Succeeded(result) => {
                 let transition = updated_contracts::reconciler::ReconciliationTransition::new(
                     invocation
@@ -910,16 +977,11 @@ fn invoke_lifecycle_mutation(
                         .audit_identity()
                         .map_err(invalid_reconciliation_context)?,
                 );
-                let reconciler_release = updated_contracts::reconciler::ReconciledRelease::new(
-                    lifecycle.release.version.clone(),
-                    lifecycle.release.manifest_sha256.clone(),
-                    lifecycle.archive_sha256.clone(),
-                )
-                .map_err(invalid_reconciliation_context)?;
+
                 let reconciler = updated_contracts::reconciler::ReconcilerIdentity::new(
-                    lifecycle.provider_set_sha256.clone(),
-                    lifecycle.product.clone(),
-                    reconciler_release,
+                    reconciler.definition_sha256.clone(),
+                    reconciler.product.clone(),
+                    reconciler.api,
                 )
                 .map_err(invalid_reconciliation_context)?;
                 let record = updated_contracts::reconciler::LastReconciliation::new(
@@ -965,6 +1027,9 @@ fn invoke_lifecycle_mutation(
                     "reconciler {phase} requested retry {attempt} of {max_attempts} in {}s: {message}",
                     delay.as_secs()
                 ));
+                if mutation_runtime_remaining(deadline, phase)?.is_some_and(|left| delay >= left) {
+                    return Err(mutation_runtime_exhausted(phase));
+                }
                 without_blocking_the_runtime(|| std::thread::sleep(delay));
             }
         }
@@ -972,22 +1037,44 @@ fn invoke_lifecycle_mutation(
     unreachable!("the retry loop always returns on its final attempt")
 }
 
-fn invoke_lifecycle_observation(
-    lifecycle: &updated::state::ProviderRelease,
+fn mutation_runtime_remaining(
+    deadline: Option<Instant>,
+    phase: Operation,
+) -> Result<Option<Duration>, InvocationFailure> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(mutation_runtime_exhausted(phase))
+    } else {
+        Ok(Some(remaining))
+    }
+}
+
+fn mutation_runtime_exhausted(phase: Operation) -> InvocationFailure {
+    InvocationFailure::Inconclusive(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("agent-owned runtime budget for reconciler {phase} was exhausted"),
+    ))
+}
+
+fn invoke_reconciler_observation(
+    reconciler: &updated::state::ReconcilerRelease,
     opts: &Options,
     operation: ObservationOperation,
     runtime_ceiling: Duration,
-    invocation: LifecycleInvocation<'_>,
+    invocation: ReconcilerInvocation<'_>,
 ) -> Result<(), InvocationFailure> {
-    let prepared = prepare_lifecycle_command(
-        lifecycle,
+    let prepared = prepare_reconciler_command(
+        reconciler,
         opts,
         operation.operation(),
         Some(runtime_ceiling),
         invocation,
     )
     .map_err(InvocationFailure::Inconclusive)?;
-    let output = run_prepared_lifecycle_command(prepared, None)?;
+    let output = run_prepared_reconciler_command(prepared, None)?;
     match output.result {
         updated::reconciler::InvocationResult::Observation => Ok(()),
         updated::reconciler::InvocationResult::Mutation(_) => {
@@ -996,11 +1083,12 @@ fn invoke_lifecycle_observation(
     }
 }
 
-struct PreparedLifecycleCommand {
+struct PreparedReconcilerCommand {
     command: Command,
     phase: Operation,
     timeout: Duration,
     invocation_data: InvocationData,
+    pending_reboot: PathBuf,
 }
 
 /// Private, per-invocation file exchange. The reconciler sees ordinary files; JSON/base64 is only
@@ -1085,7 +1173,7 @@ impl Drop for InvocationData {
 /// state itself is durable reconciler-owned data and is deliberately preserved; only the one
 /// agent-owned ephemeral child is removed.
 pub(crate) fn clear_stale_invocation_data(paths: &updated::config::Paths) -> io::Result<()> {
-    let products = match std::fs::read_dir(&paths.provider_state_root) {
+    let products = match std::fs::read_dir(&paths.execution_state_root) {
         Ok(products) => products,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
@@ -1093,7 +1181,7 @@ pub(crate) fn clear_stale_invocation_data(paths: &updated::config::Paths) -> io:
                 error,
                 format!(
                     "reading reconciler state root {}",
-                    paths.provider_state_root.display()
+                    paths.execution_state_root.display()
                 ),
             ));
         }
@@ -1104,7 +1192,7 @@ pub(crate) fn clear_stale_invocation_data(paths: &updated::config::Paths) -> io:
                 error,
                 format!(
                     "enumerating reconciler state root {}",
-                    paths.provider_state_root.display()
+                    paths.execution_state_root.display()
                 ),
             )
         })?;
@@ -1134,47 +1222,32 @@ pub(crate) fn clear_stale_invocation_data(paths: &updated::config::Paths) -> io:
     Ok(())
 }
 
-fn prepare_lifecycle_command(
-    lifecycle: &updated::state::ProviderRelease,
+fn prepare_reconciler_command(
+    reconciler: &updated::state::ReconcilerRelease,
     opts: &Options,
     operation: Operation,
     runtime_ceiling: Option<Duration>,
-    invocation: LifecycleInvocation<'_>,
-) -> io::Result<PreparedLifecycleCommand> {
-    operation
-        .validate_invocation(invocation.reason, invocation.id)
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid reconciler invocation: {error}"),
-            )
-        })?;
-    let LifecycleInvocation {
+    invocation: ReconcilerInvocation<'_>,
+) -> io::Result<PreparedReconcilerCommand> {
+    let ReconcilerInvocation {
         reason,
-        id: lifecycle_attempt_id,
+        id: attempt_id,
         candidate,
-        predecessor,
+        predecessor: _,
     } = invocation;
-    let resolved =
-        updated::provider::BundleStore::for_lifecycle(&opts.paths).resolve(&lifecycle.release)?;
-    if resolved.product != lifecycle.product {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "staged lifecycle manifest has the wrong product",
-        ));
-    }
-    let mut timeout = lifecycle_timeout(operation, Duration::from_millis(lifecycle.timeout_millis));
+    reconciler.check_supported().map_err(io::Error::other)?;
+    let mut timeout =
+        reconciler_timeout(operation, Duration::from_millis(reconciler.timeout_millis));
     if let Some(runtime_ceiling) = runtime_ceiling {
         timeout = timeout.min(runtime_ceiling);
     }
     let phase_name = operation.as_str();
-    let app_provider = updated::provider::BundleStore::for_app(&opts.paths);
+    let app_provider = updated::bundle_store::BundleStore::for_app(&opts.paths);
     let candidate_dir = app_provider.location(candidate.release);
-    let predecessor_dir = app_provider.location(predecessor.release);
     // Both durable hook directories come from the one layout definition (`Paths`), never from a
     // string join here: the conformance harness derives them from the same place, so a hook is
     // never certified against a layout no node uses.
-    let state_dir = opts.paths.reconciler_state_dir(&lifecycle.product);
+    let state_dir = opts.paths.reconciler_state_dir(&reconciler.product);
     std::fs::create_dir_all(&state_dir)?;
     let output_snapshot = opts
         .paths
@@ -1185,44 +1258,44 @@ fn prepare_lifecycle_command(
     // reads, or hand a value to the flag beside it.
     let arguments = updated_contracts::reconciler::Arguments {
         protocol: std::ffi::OsStr::new(updated_contracts::reconciler::PROTOCOL),
-        attempt_id: std::ffi::OsStr::new(lifecycle_attempt_id),
+        attempt_id: std::ffi::OsStr::new(attempt_id),
         reason,
         install_root: opts.paths.install_root.as_os_str(),
         state_dir: state_dir.as_os_str(),
-        candidate: candidate_dir.as_os_str(),
-        candidate_version: std::ffi::OsStr::new(&candidate.release.version),
+        payload_root: candidate_dir.as_os_str(),
+        payload_version: std::ffi::OsStr::new(&candidate.release.version),
         output_dir: invocation_data.output_dir.as_os_str(),
         result_file: invocation_data.result_file.as_os_str(),
         input_dir: invocation_data.input_dir.as_os_str(),
-        predecessor: predecessor_dir.as_os_str(),
-        predecessor_version: std::ffi::OsStr::new(&predecessor.release.version),
     };
-    let mut cmd = reconciler_command(&resolved.program)?;
+    let mut cmd = Command::new(&opts.helper_executable);
     cmd.arg(phase_name);
     for (flag, value) in arguments.argv() {
         cmd.arg(flag).arg(value);
     }
-    if !lifecycle.args.is_empty() {
-        // Publisher-configured arguments are explicitly separated from the stable protocol.
-        cmd.arg("--").args(&lifecycle.args);
-    }
-    cmd.current_dir(&resolved.cwd)
+    cmd.current_dir(&candidate_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    // THE invocation environment, shared with `updatectl reconciler-check` so the harness cannot be
+    // THE invocation environment, shared with `updatectl check` so the harness cannot be
     // stricter or looser than a real node. It clears the environment itself.
-    updated::reconciler::apply_environment(&mut cmd);
+    updated::reconciler::configure_environment(&mut cmd);
+    updated::helper::configure(&mut cmd, &opts.helper_executable, operation, &arguments)?;
+    cmd.env(
+        updated::command_adapter::EXPECTED_DEFINITION_ENV,
+        &reconciler.definition_sha256,
+    );
     // A wrapper commonly waits on vendor CLIs, curl, or mount helpers. Run it as a
     // contained tree (Unix process group / Windows job object) so a timeout takes the
     // whole tree down, not just the shell — leaving the foreground operation orphaned.
     // The platform mechanism and parent-death guarantee are one primitive in
     // `foundation::process`, not call-site configuration.
-    Ok(PreparedLifecycleCommand {
+    Ok(PreparedReconcilerCommand {
         command: cmd,
         phase: operation,
         timeout,
         invocation_data,
+        pending_reboot: opts.paths.pending_reboot.clone(),
     })
 }
 
@@ -1236,23 +1309,29 @@ const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// single probe could otherwise outlast the whole grace.
 pub(crate) const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// A non-transactional `converge` runs inline on the report loop. Boot and update transactions keep
+/// the publisher's full signed timeout; only this recurring steady-state invocation is bounded so
+/// retries or a wedged hook cannot age the last healthy report past the reader freshness window.
+pub(crate) const STEADY_STATE_CONVERGE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The agent's own runtime ceilings over the publisher-configured provider timeout. Exhaustive on
 /// purpose: a new operation must state its bound rather than silently inherit "unbounded".
-fn lifecycle_timeout(phase: Operation, configured: Duration) -> Duration {
+fn reconciler_timeout(phase: Operation, configured: Duration) -> Duration {
     match phase {
         Operation::Inspect => configured.min(FINGERPRINT_TIMEOUT),
         Operation::Healthcheck => configured.min(HEALTHCHECK_TIMEOUT),
-        // Deployment operations run under a transaction, not on the steady-state loop, and are
-        // legitimately as slow as the publisher says they are.
-        Operation::Apply | Operation::Rollback => configured,
+        // The ordinary deployment paths are boot and transactions, where these operations are
+        // legitimately as slow as the publisher says they are. The report loop supplies its
+        // separate runtime ceiling when it invokes a recurring `converge`.
+        Operation::Converge | Operation::Rollback => configured,
     }
 }
 
 /// Run a blocking body without starving the async runtime.
 ///
-/// Operator lifecycle hooks are external programs waited on synchronously, for up to their full
+/// Operator reconciler hooks are external programs waited on synchronously, for up to their full
 /// configured timeout. On a multi-threaded runtime that would otherwise pin a worker thread for the
-/// entire hook — stalling telemetry, health probes, and the launcher channel on the same runtime.
+/// entire hook — stalling telemetry and health probes on the same runtime.
 /// Outside a runtime (the fingerprint observer runs on its own OS thread) the body simply runs.
 fn without_blocking_the_runtime<T>(body: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
@@ -1261,24 +1340,25 @@ fn without_blocking_the_runtime<T>(body: impl FnOnce() -> T) -> T {
     }
 }
 
-fn run_prepared_lifecycle_command(
-    prepared: PreparedLifecycleCommand,
+fn run_prepared_reconciler_command(
+    prepared: PreparedReconcilerCommand,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ReconcilerOutput, InvocationFailure> {
     without_blocking_the_runtime(move || {
-        run_prepared_lifecycle_command_blocking(prepared, cancelled)
+        run_prepared_reconciler_command_blocking(prepared, cancelled)
     })
 }
 
-fn run_prepared_lifecycle_command_blocking(
-    prepared: PreparedLifecycleCommand,
+fn run_prepared_reconciler_command_blocking(
+    prepared: PreparedReconcilerCommand,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ReconcilerOutput, InvocationFailure> {
-    let PreparedLifecycleCommand {
+    let PreparedReconcilerCommand {
         command,
         phase,
         timeout,
         invocation_data,
+        pending_reboot,
     } = prepared;
     let phase_name = phase.as_str();
     let mut child = foundation::process::ContainedChild::spawn(command)
@@ -1300,7 +1380,7 @@ fn run_prepared_lifecycle_command_blocking(
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "lifecycle timeout is too large",
+                "reconciler timeout is too large",
             )
         })
         .map_err(InvocationFailure::Inconclusive)?;
@@ -1323,7 +1403,7 @@ fn run_prepared_lifecycle_command_blocking(
     // sequence (ask, kill, then give the reap `KILL_HEADROOM`); the bound is the point. An
     // unbounded `wait()` here waits on a leader the kill may never have reached — EPERM against a
     // hook that setuid'd away from this unprivileged agent, or one wedged in uninterruptible I/O —
-    // and this is the apply/rollback path, so that wait is the whole deployment loop stopping
+    // and this is the converge/rollback path, so that wait is the whole deployment loop stopping
     // forever rather than failing the operation with a reason.
     let kill_and_reap = |child: &mut foundation::process::ContainedChild| {
         match child.stop(Duration::ZERO) {
@@ -1332,7 +1412,7 @@ fn run_prepared_lifecycle_command_blocking(
             }
             // Reported, not waited on. What follows still joins the capture threads, which the
             // survivor may hold open by keeping the inherited pipes — the hook obligation
-            // `updatectl reconciler-check` exists to catch before a release ships.
+            // `updatectl check` exists to catch before a release ships.
             foundation::process::Stopped::Surviving => Err(io::Error::other(format!(
                 "its leader was still unreaped {:?} after the kill",
                 foundation::process::KILL_HEADROOM
@@ -1372,6 +1452,13 @@ fn run_prepared_lifecycle_command_blocking(
                         InvocationFailure::Inconclusive(error)
                     }
                 })?;
+                if matches!(&result, updated::reconciler::InvocationResult::Mutation(
+                    updated_contracts::reconciler::MutationResolution::Succeeded(result)
+                ) if result.host_action() == HostAction::Reboot)
+                {
+                    host::record_reboot(&pending_reboot)
+                        .map_err(InvocationFailure::Inconclusive)?;
+                }
                 if phase.publishes_outputs()
                     && matches!(
                         &result,
@@ -1427,8 +1514,8 @@ struct CapturedOutput {
 /// In every conforming invocation EOF has already happened and this waits for nothing: the hook and
 /// everything in its tree are gone, so their descriptors are closed. A pipe still open past it means
 /// a descendant escaped the tree entirely — detached with `setsid` while keeping the inherited
-/// stdout/stderr, which `docs/node-reconciler-protocol.md` forbids and `updatectl reconciler-check`
-/// fails a hook for. Reading that pipe is a wait no kill can end, on the apply/rollback path: the
+/// stdout/stderr, which `docs/node-reconciler-protocol.md` forbids and `updatectl check`
+/// fails a hook for. Reading that pipe is a wait no kill can end, on the converge/rollback path: the
 /// node's whole deployment loop stopped forever by one stray descendant. So the read is abandoned
 /// and the operation answered with what arrived, which for an `inspect` means no fingerprint is
 /// published rather than no report at all.
@@ -1476,61 +1563,6 @@ fn report_reconciler_output(
         stdout,
         stdout_truncated,
     })
-}
-
-fn reconciler_command(program: &Path) -> io::Result<Command> {
-    #[cfg(target_os = "macos")]
-    {
-        // macOS has no native parent-death facility. Keep a watchdog in this reconciler's fresh
-        // process group: it exits when the provider exits, but if this disposable agent
-        // disappears first it kills only the transaction helper group. Positional parameters
-        // preserve arbitrary program paths without interpolating them into shell source.
-        const WATCHDOG: &str = r#"
-agent=$1
-shift
-leader=$$
-(
-    while kill -0 "$agent" 2>/dev/null && kill -0 "$leader" 2>/dev/null; do
-        sleep 0.05
-    done
-    if kill -0 "$leader" 2>/dev/null; then
-        kill -KILL "-$leader"
-    fi
-) &
-exec "$@"
-"#;
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", WATCHDOG, "updated-reconciler-watchdog"])
-            .arg(std::process::id().to_string())
-            .arg(program);
-        Ok(command)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        #[cfg(windows)]
-        if program
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
-        {
-            let system_root = std::env::var_os("SystemRoot")
-                .or_else(|| std::env::var_os("WINDIR"))
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "SystemRoot is unavailable for PowerShell reconciler",
-                    )
-                })?;
-            let powershell =
-                PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-            let mut command = Command::new(powershell);
-            command
-                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
-                .arg(program);
-            return Ok(command);
-        }
-        Ok(Command::new(program))
-    }
 }
 
 #[cfg(test)]
@@ -1637,26 +1669,53 @@ mod tests {
     #[test]
     fn steady_state_operations_have_agent_owned_runtime_ceilings() {
         assert_eq!(
-            lifecycle_timeout(Operation::Inspect, Duration::from_secs(86_400)),
+            reconciler_timeout(Operation::Inspect, Duration::from_secs(86_400)),
             FINGERPRINT_TIMEOUT
         );
         assert_eq!(
-            lifecycle_timeout(Operation::Inspect, Duration::from_secs(30)),
+            reconciler_timeout(Operation::Inspect, Duration::from_secs(30)),
             Duration::from_secs(30)
         );
         assert_eq!(
-            lifecycle_timeout(Operation::Healthcheck, Duration::from_secs(86_400)),
+            reconciler_timeout(Operation::Healthcheck, Duration::from_secs(86_400)),
             HEALTHCHECK_TIMEOUT
         );
         assert_eq!(
-            lifecycle_timeout(Operation::Healthcheck, Duration::from_secs(5)),
+            reconciler_timeout(Operation::Healthcheck, Duration::from_secs(5)),
             Duration::from_secs(5)
         );
-        // Deployment operations run under a transaction, never on the report loop, so they keep the
-        // publisher's own bound.
+        // Boot and transactional deployment operations keep the publisher's own bound. The
+        // recurring report-loop converge supplies a separate shrinking budget to command
+        // preparation on every attempt.
         assert_eq!(
-            lifecycle_timeout(Operation::Apply, Duration::from_secs(86_400)),
+            reconciler_timeout(Operation::Converge, Duration::from_secs(86_400)),
             Duration::from_secs(86_400)
+        );
+        let remaining = mutation_runtime_remaining(
+            Some(Instant::now() + STEADY_STATE_CONVERGE_TIMEOUT),
+            Operation::Converge,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(remaining <= STEADY_STATE_CONVERGE_TIMEOUT);
+        assert_eq!(
+            reconciler_timeout(Operation::Converge, Duration::from_secs(86_400)).min(remaining),
+            remaining
+        );
+        assert!(matches!(
+            mutation_runtime_remaining(Some(Instant::now()), Operation::Converge),
+            Err(InvocationFailure::Inconclusive(ref error))
+                if error.kind() == io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn a_steady_state_converge_cannot_stall_the_loop_into_a_health_drain() {
+        // Even the pathological timeout teardown (kill headroom plus two escaped pipe readers)
+        // leaves room to publish the now-unready heartbeat before readers age out the prior one.
+        assert!(
+            STEADY_STATE_CONVERGE_TIMEOUT + foundation::process::KILL_HEADROOM + READER_GRACE * 2
+                < updated_contracts::telemetry::REPORT_FRESHNESS
         );
     }
 
@@ -1682,17 +1741,18 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let prepared = PreparedLifecycleCommand {
+        let prepared = PreparedReconcilerCommand {
             command,
             phase: Operation::Inspect,
             timeout: Duration::from_secs(30),
             invocation_data: test_invocation_data(),
+            pending_reboot: crate::test_support::nonexistent_root().join("pending-reboot"),
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&cancelled);
         let started = Instant::now();
         let handle =
-            std::thread::spawn(move || run_prepared_lifecycle_command(prepared, Some(&signal)));
+            std::thread::spawn(move || run_prepared_reconciler_command(prepared, Some(&signal)));
         std::thread::sleep(Duration::from_millis(100));
         cancelled.store(true, Ordering::Release);
 
@@ -1707,8 +1767,8 @@ mod tests {
     /// Every wait on this path is bounded, because this path is the deployment loop. The tree is
     /// gone by the time the pipes are read, so a pipe that never reaches EOF is a descendant that
     /// escaped the tree still holding the inherited stdout/stderr — detached with `setsid` but
-    /// never redirected, which the protocol forbids and `updatectl reconciler-check` fails a hook
-    /// for. Joining that reader stopped apply, rollback, and every probe on the node forever, for a
+    /// never redirected, which the protocol forbids and `updatectl check` fails a hook
+    /// for. Joining that reader stopped converge, rollback, and every probe on the node forever, for a
     /// hook that had already exited zero. Now the read is abandoned and the operation answers.
     #[test]
     fn a_pipe_that_never_reaches_eof_is_abandoned_instead_of_stalling_the_invocation() {
@@ -1721,7 +1781,7 @@ mod tests {
         }
         let started = Instant::now();
         let output = report_reconciler_output(
-            Operation::Apply,
+            Operation::Converge,
             updated::reconciler::capture_output(NeverEof),
             updated::reconciler::capture_output(std::io::empty()),
         )
@@ -1754,12 +1814,13 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let output = run_prepared_lifecycle_command(
-            PreparedLifecycleCommand {
+        let output = run_prepared_reconciler_command(
+            PreparedReconcilerCommand {
                 command,
-                phase: Operation::Apply,
+                phase: Operation::Converge,
                 timeout: Duration::from_secs(5),
                 invocation_data,
+                pending_reboot: crate::test_support::nonexistent_root().join("pending-reboot"),
             },
             None,
         )
@@ -1782,7 +1843,7 @@ mod tests {
     fn successful_hook_kills_its_undetached_tree_but_not_a_detached_workload() {
         // The published contract, executable: an invocation's tree is torn down when the hook
         // returns — on SUCCESS as much as on timeout — so a workload started inside it is killed by
-        // its own successful `apply`, and a hook that wants the workload to belong to the release
+        // its own successful `converge`, and a hook that wants the workload to belong to the release
         // must move it out of the tree first. Both halves are asserted, because a "fix" that spares
         // the tree on success would let a wrapper's inherited pipes outlive the deadline.
         fn run(script: &str) -> (Result<ReconcilerOutput, InvocationFailure>, PathBuf) {
@@ -1802,12 +1863,13 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            let outcome = run_prepared_lifecycle_command(
-                PreparedLifecycleCommand {
+            let outcome = run_prepared_reconciler_command(
+                PreparedReconcilerCommand {
                     command,
-                    phase: Operation::Apply,
+                    phase: Operation::Converge,
                     timeout: Duration::from_secs(30),
                     invocation_data,
+                    pending_reboot: crate::test_support::nonexistent_root().join("pending-reboot"),
                 },
                 None,
             );
@@ -1872,30 +1934,15 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_reconciler_watchdog_preserves_normal_exit() {
-        let command = reconciler_command(Path::new("/usr/bin/true")).unwrap();
-        let mut child = foundation::process::ContainedChild::spawn(command).unwrap();
-        assert!(child.wait().unwrap().success());
-    }
-
-    fn reconciler_release() -> updated::state::ProviderRelease {
-        updated::state::ProviderRelease {
-            provider_set_sha256: "f".repeat(64),
-            product: "reconciler".into(),
-            release: release("1.0.0", "reconciler-manifest"),
-            archive_sha256: digest("reconciler-archive"),
-            args: Vec::new(),
-            timeout_millis: 1_000,
-        }
+    fn reconciler_release() -> updated::state::ReconcilerRelease {
+        *crate::test_support::provider()
     }
 
     /// A store holding `previous` as the confirmed installed release, which is what every
     /// transaction test starts from.
     fn store_with(previous: updated::bundle::ReleaseId) -> Store {
         Store::memory(MemoryBackend {
-            installed: Some(InstalledState::confirmed(
+            installed: Some(InstalledState::proven(
                 test_lineage(),
                 previous.clone(),
                 digest("previous-archive"),
@@ -1912,7 +1959,7 @@ mod tests {
     }
 
     /// A scripted stand-in for the release's reconciler: it records every invocation and can be
-    /// made to fail any operation, so each fault path of [`apply_update`] is provable without a
+    /// made to fail any operation, so each fault path of [`execute_update`] is provable without a
     /// subprocess.
     #[derive(Clone, Copy)]
     enum FakeFailure {
@@ -1949,10 +1996,11 @@ mod tests {
         healthcheck_timeouts: Vec<Duration>,
         health_successes: u32,
         health_interval: Duration,
-        fail_first_apply: bool,
-        unreach_first_apply: bool,
-        applies: usize,
+        fail_first_converge: bool,
+        unreach_first_converge: bool,
+        converges: usize,
         host_action: updated_contracts::reconciler::HostAction,
+        preparation_fails: bool,
     }
 
     impl FakeReconciler {
@@ -1966,10 +2014,10 @@ mod tests {
         fn invoke_operation(
             &mut self,
             operation: Operation,
-            lifecycle_attempt_id: &str,
+            attempt_id: &str,
         ) -> Result<(), InvocationFailure> {
             self.invocations
-                .push((operation.as_str(), lifecycle_attempt_id.to_string()));
+                .push((operation.as_str(), attempt_id.to_string()));
             match operation {
                 Operation::Healthcheck => {
                     self.healthcheck_calls += 1;
@@ -1982,15 +2030,15 @@ mod tests {
                         return Err(FakeFailure::ReleaseFault.error("healthcheck"));
                     }
                 }
-                Operation::Apply => {
-                    self.applies += 1;
-                    if self.unreach_first_apply && self.applies == 1 {
+                Operation::Converge => {
+                    self.converges += 1;
+                    if self.unreach_first_converge && self.converges == 1 {
                         return Err(
-                            FakeFailure::Inconclusive(io::ErrorKind::StorageFull).error("apply")
+                            FakeFailure::Inconclusive(io::ErrorKind::StorageFull).error("converge")
                         );
                     }
-                    if self.fail_first_apply && self.applies == 1 {
-                        return Err(FakeFailure::ReleaseFault.error("apply"));
+                    if self.fail_first_converge && self.converges == 1 {
+                        return Err(FakeFailure::ReleaseFault.error("converge"));
                     }
                 }
                 Operation::Rollback | Operation::Inspect => {}
@@ -2000,14 +2048,21 @@ mod tests {
     }
 
     impl Reconciler for FakeReconciler {
+        fn prepare_update(&mut self, _: &str) -> io::Result<()> {
+            if self.preparation_fails {
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            } else {
+                Ok(())
+            }
+        }
         fn mutate(
             &mut self,
             operation: MutationOperation,
-            lifecycle_attempt_id: &str,
+            attempt_id: &str,
             _: ReleaseTarget<'_>,
             _: ReleaseTarget<'_>,
         ) -> Result<updated_contracts::reconciler::SuccessfulMutation, InvocationFailure> {
-            self.invoke_operation(operation.operation(), lifecycle_attempt_id)?;
+            self.invoke_operation(operation.operation(), attempt_id)?;
             let result = successful_no_change_result();
             Ok(updated_contracts::reconciler::SuccessfulMutation::new(
                 result.changed(),
@@ -2020,14 +2075,14 @@ mod tests {
             &mut self,
             operation: ObservationOperation,
             timeout: Duration,
-            lifecycle_attempt_id: &str,
+            attempt_id: &str,
             _: ReleaseTarget<'_>,
             _: ReleaseTarget<'_>,
         ) -> Result<(), InvocationFailure> {
             if operation == ObservationOperation::Healthcheck {
                 self.healthcheck_timeouts.push(timeout);
             }
-            self.invoke_operation(operation.operation(), lifecycle_attempt_id)
+            self.invoke_operation(operation.operation(), attempt_id)
         }
         fn verification_policy(&self) -> (Duration, u32, Duration) {
             (
@@ -2100,7 +2155,7 @@ mod tests {
         let mut store = store_with(previous.clone());
         let mut reconciler = FakeReconciler::default();
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2127,18 +2182,18 @@ mod tests {
         );
     }
 
-    /// The whole forward transaction, as the release sees it: exactly one `apply` (the switchover)
+    /// The whole forward transaction, as the release sees it: exactly one `converge` (the switchover)
     /// and then the healthcheck gate, in that order, under one attempt identity. The agent starts
-    /// and stops nothing itself, so an `apply` that is missing, doubled, or ordered after the gate
+    /// and stops nothing itself, so a `converge` that is missing, doubled, or ordered after the gate
     /// is a node that never converged onto the candidate it just committed.
     #[tokio::test]
-    async fn a_committed_update_is_one_apply_then_the_health_gate() {
+    async fn a_committed_update_is_one_converge_then_the_health_gate() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = store_with(previous);
         let mut reconciler = FakeReconciler::default();
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2150,7 +2205,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, Outcome::Committed { .. }));
-        assert_eq!(reconciler.operations(), ["apply", "healthcheck"]);
+        assert_eq!(reconciler.operations(), ["converge", "healthcheck"]);
         assert_eq!(store.memory_backend().active.as_ref(), Some(&candidate));
         let attempts: std::collections::HashSet<&str> = reconciler
             .invocations
@@ -2158,6 +2213,83 @@ mod tests {
             .map(|(_, id)| id.as_str())
             .collect();
         assert_eq!(attempts.len(), 1, "one transaction, one attempt identity");
+    }
+
+    #[tokio::test]
+    async fn an_unpersistable_input_pin_prevents_activation_and_hooks() {
+        let previous = release("1.0.0", "one");
+        let mut store = store_with(previous.clone());
+        let mut reconciler = FakeReconciler {
+            preparation_fails: true,
+            ..Default::default()
+        };
+        let error = execute_update(
+            &mut reconciler,
+            &mut store,
+            &release("2.0.0", "two"),
+            &digest("archive-two"),
+            test_lineage(),
+            reconciler_release(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(store.memory_backend().active.as_ref(), Some(&previous));
+        assert!(store.journal().unwrap().is_none());
+        assert!(reconciler.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_execution_api_prevents_activation_without_rejecting_bytes() {
+        let previous = release("1.0.0", "one");
+        let mut store = store_with(previous.clone());
+        let mut reconciler = FakeReconciler::default();
+        let mut candidate = reconciler_release();
+        candidate.api = 99;
+        let result = execute_update(
+            &mut reconciler,
+            &mut store,
+            &release("2.0.0", "two"),
+            &digest("archive-two"),
+            test_lineage(),
+            candidate,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(store.memory_backend().active.as_ref(), Some(&previous));
+        assert!(store.journal().unwrap().is_none());
+        assert!(reconciler.operations().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reboot_result_is_durable_even_if_publishing_outputs_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let pending = directory.path().join("pending-reboot");
+        let mut data = test_invocation_data();
+        // Force a post-result publication failure without touching the reboot record's directory.
+        let blocker = directory.path().join("not-a-directory");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        data.output_snapshot = blocker.join("outputs");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", r#"printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"reboot","message":null}' >"$RESULT_FILE""#])
+            .env("RESULT_FILE", &data.result_file)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let outcome = run_prepared_reconciler_command(
+            PreparedReconcilerCommand {
+                command,
+                phase: Operation::Rollback,
+                timeout: Duration::from_secs(5),
+                invocation_data: data,
+                pending_reboot: pending.clone(),
+            },
+            None,
+        );
+        assert!(matches!(outcome, Err(InvocationFailure::Inconclusive(_))));
+        assert!(host::reboot_pending(&pending).unwrap());
+        // Repeated process restarts have no authority to turn this into a completed reboot.
+        assert!(host::reboot_pending(&pending).unwrap());
     }
 
     #[tokio::test]
@@ -2170,7 +2302,7 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2189,7 +2321,7 @@ mod tests {
         ));
         assert_eq!(
             reconciler.operations(),
-            ["apply"],
+            ["converge"],
             "health is judged only after the host has crossed the requested reboot boundary"
         );
         assert_eq!(store.memory_backend().active.as_ref(), Some(&candidate));
@@ -2198,9 +2330,37 @@ mod tests {
                 .memory_backend()
                 .installed
                 .as_ref()
-                .and_then(|installed| installed.pending.as_ref())
+                .and_then(|installed| installed.rollback_guard.as_ref())
                 .is_some(),
             "the predecessor remains available until post-reboot confirmation"
+        );
+        store
+            .memory_backend_mut()
+            .installed
+            .as_mut()
+            .unwrap()
+            .rollback_guard
+            .as_mut()
+            .unwrap()
+            .committed_at = 1;
+        let situation = gather_situation(&store).unwrap();
+        let plan = plan_boot(&situation);
+        let Installed::Present(installed) = &situation.installed else {
+            panic!("installed candidate")
+        };
+        assert!(window_passed(
+            installed.rollback_guard.as_ref().unwrap(),
+            Duration::from_secs(120),
+            now_unix()
+        ));
+        execute_boot_plan(&plan, &mut store, false, None).unwrap();
+        let Installed::Present(installed) = store.installed().unwrap() else {
+            panic!("installed candidate")
+        };
+        assert_eq!(boot::plan_gate_failure(&installed), GateFailure::Revert);
+        assert!(
+            plan.commit.is_none(),
+            "elapsed downtime cannot confirm an unverified reboot"
         );
     }
 
@@ -2214,7 +2374,7 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2352,7 +2512,7 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2375,16 +2535,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_candidate_apply_failure_records_the_rejection_before_deferring_to_recovery() {
+    async fn a_candidate_converge_failure_records_the_rejection_before_deferring_to_recovery() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = store_with(previous);
         let mut reconciler = FakeReconciler {
-            fail_first_apply: true,
+            fail_first_converge: true,
             ..Default::default()
         };
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2398,10 +2558,7 @@ mod tests {
         // The candidate activated then failed: it is rejected and the rollback journal is durable
         // before we hand off to boot recovery. There is no in-process rollback to fail.
         assert!(matches!(outcome, Outcome::RollbackPending));
-        let rejection = deployment_rejection(
-            &digest("archive-two"),
-            &reconciler_release().provider_set_sha256,
-        );
+        let rejection = deployment_rejection(&digest("archive-two"));
         assert_eq!(
             store.memory_backend().rejected,
             std::collections::HashSet::from([test_lineage().rejection_key(&rejection)])
@@ -2409,8 +2566,8 @@ mod tests {
         assert!(!store.is_rejected(&test_lineage(), &digest("archive-two")));
         assert_eq!(
             reconciler.operations(),
-            ["apply"],
-            "a failed apply is never followed by a health gate on the candidate"
+            ["converge"],
+            "a failed converge is never followed by a health gate on the candidate"
         );
         assert!(
             store
@@ -2433,7 +2590,7 @@ mod tests {
         store.memory_backend_mut().fail_verify_release = true;
         let mut reconciler = FakeReconciler::default();
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2478,7 +2635,7 @@ mod tests {
         store.memory_backend_mut().fail_point_active = true;
         let mut reconciler = FakeReconciler::default();
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2514,16 +2671,16 @@ mod tests {
     /// pointer moved, recovery must restore the predecessor, but the candidate's authenticated
     /// bytes remain eligible: the release never got a chance to answer.
     #[tokio::test]
-    async fn an_apply_that_never_reaches_the_reconciler_rolls_back_without_rejecting() {
+    async fn a_converge_that_never_reaches_the_reconciler_rolls_back_without_rejecting() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = store_with(previous);
         let mut reconciler = FakeReconciler {
-            unreach_first_apply: true,
+            unreach_first_converge: true,
             ..Default::default()
         };
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2560,11 +2717,11 @@ mod tests {
         let mut store = store_with(previous.clone());
         store.memory_backend_mut().fail_reject = true;
         let mut reconciler = FakeReconciler {
-            fail_first_apply: true,
+            fail_first_converge: true,
             ..Default::default()
         };
 
-        let outcome = apply_update(
+        let outcome = execute_update(
             &mut reconciler,
             &mut store,
             &candidate,
@@ -2588,79 +2745,6 @@ mod tests {
                 .as_ref()
                 .is_some_and(|tx| tx.candidate_rejection_required),
             "the journal still carries the rollback and the rejection to replay"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciler_only_revision_uses_the_normal_transaction() {
-        let application_release = release("1.0.0", "one");
-        let mut store = store_with(application_release.clone());
-        let mut reconciler = FakeReconciler::default();
-        let mut revised = reconciler_release();
-        revised.release = release("2.0.0", "reconciler-two");
-        revised.archive_sha256 = digest("reconciler-archive-two");
-        revised.provider_set_sha256 = "e".repeat(64);
-
-        let outcome = apply_update(
-            &mut reconciler,
-            &mut store,
-            &application_release,
-            &digest("previous-archive"),
-            test_lineage(),
-            revised.clone(),
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(outcome, Outcome::Committed { .. }));
-        let Some(installed) = store.memory_backend().installed.clone() else {
-            panic!("the reconciler revision must commit installed state");
-        };
-        assert_eq!(installed.release, application_release);
-        assert_eq!(installed.lifecycle.as_ref(), &revised);
-        let pending = installed
-            .pending
-            .expect("the reconciler revision must retain rollback intent");
-        assert_ne!(pending.lifecycle.as_ref(), &revised);
-        assert_eq!(
-            pending.candidate_rejection_sha256,
-            deployment_rejection(&digest("previous-archive"), &"e".repeat(64))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_bad_provider_only_revision_rejects_only_the_exact_deployment() {
-        let application_release = release("1.0.0", "one");
-        let mut store = store_with(application_release.clone());
-        let mut reconciler = FakeReconciler {
-            fail_first_apply: true,
-            ..Default::default()
-        };
-        let mut revised = reconciler_release();
-        revised.provider_set_sha256 = "e".repeat(64);
-        let provider_set_sha256 = revised.provider_set_sha256.clone();
-
-        let outcome = apply_update(
-            &mut reconciler,
-            &mut store,
-            &application_release,
-            &digest("previous-archive"),
-            test_lineage(),
-            revised,
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(outcome, Outcome::RollbackPending));
-        let rejection = deployment_rejection(&digest("previous-archive"), &provider_set_sha256);
-        assert!(store.is_rejected(&test_lineage(), &rejection));
-        assert!(
-            !store.is_rejected(&test_lineage(), &provider_set_sha256),
-            "runtime evidence must not poison a provider artifact that another app can reuse"
-        );
-        assert!(
-            !store.is_rejected(&test_lineage(), &digest("previous-archive")),
-            "runtime evidence must not blacklist application bytes already proven healthy"
         );
     }
 

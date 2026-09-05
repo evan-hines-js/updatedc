@@ -11,7 +11,7 @@ JAVA="$DATA/jre/bin/java"
 WAR="$DATA/jenkins.war"
 
 if [ ! -x "$JAVA" ] || [ ! -f "$WAR" ]; then
-  echo "jenkins-app: Jenkins is not installed under $DATA (the reconciler's apply must run first)" >&2
+  echo "jenkins-app: Jenkins is not installed under $DATA (the reconciler's converge must run first)" >&2
   exit 1
 fi
 

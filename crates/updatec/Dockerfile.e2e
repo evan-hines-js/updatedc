@@ -19,8 +19,7 @@ COPY .cargo ./.cargo
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p launcher -p agent -p server -p sampleapp -p updatec-e2e -p demo-lifecycle -p updated-healthproxy -p updatectl && \
-    cp /src/target/release/updated-launcher /out-launcher && \
+    cargo build --release -p agent -p server -p sampleapp -p updatec-e2e -p demo-lifecycle -p updated-healthproxy -p updatectl && \
     cp /src/target/release/updated-agent /out-agent && \
     cp /src/target/release/server /out-server && \
     cp /src/target/release/sampleapp /out-sampleapp && \
@@ -39,9 +38,9 @@ FROM ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522
 # signed bundle and every agent (same base image, so the shared libs are present) can run it after
 # `updated` installs it — the load balancer is managed exactly like any other release, not baked
 # into a bespoke image. curl/unzip are the same generic runtime-installer tooling.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip haproxy && \
+# Jenkins uses Java's font manager even in headless mode; a bare Ubuntu image has no fonts.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip haproxy fontconfig fonts-dejavu-core tini && \
     rm -rf /var/lib/apt/lists/* && useradd --uid 65532 --create-home updated
-COPY --from=build /out-launcher /usr/local/bin/updated-launcher
 COPY --from=build /out-agent /usr/local/bin/updated-agent
 COPY --from=build /out-server /usr/local/bin/server
 COPY --from=build /out-sampleapp /usr/local/bin/sampleapp

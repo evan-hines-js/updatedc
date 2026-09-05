@@ -170,7 +170,7 @@ pub(crate) fn condition(
 ///
 /// The loop recomputes every status once per second for every resource, so an unconditional patch is
 /// an apiserver round trip per resource per second on a fleet where nothing is happening — the same
-/// discipline `record_reconcile_failing` applies to its own condition, and the reason every writer's
+/// discipline `record_reconcile_failing` converges to its own condition, and the reason every writer's
 /// conditions array is stabilized by [`crate::alerts::merge_conditions`] first. Compared as the JSON
 /// merge EFFECT, not as whole serialized structs: omitted fields survive a merge patch, so a partial
 /// failure status can be a no-op even though it deliberately does not repeat the last successful
@@ -935,7 +935,7 @@ pub async fn record_reconcile_failing(
         // A merge patch replaces the conditions array wholesale, so every condition this writer
         // does not speak for is carried forward untouched — assembled where every other status
         // writer assembles it, so this path (the one that runs when the loop is broken) cannot
-        // drift from the rule. Passing `published` back through the merge re-applies
+        // drift from the rule. Passing `published` back through the merge re-converges
         // `carry_transition` against the same `observed`, which is a no-op on it.
         let conditions = crate::alerts::merge_conditions(observed, vec![published]);
         sets.patch_status(
@@ -964,7 +964,7 @@ pub async fn record_reconcile_failing(
 /// which silently uncapped enrollment for as long as the failure lasted.
 ///
 /// `observed` is the conditions array the repository currently carries. A merge patch REPLACES an
-/// array wholesale, so the same omission rule applies to the entries of this one: a failure speaks
+/// array wholesale, so the same omission rule converges to the entries of this one: a failure speaks
 /// only for [`crate::status_contract::READY_CONDITION`] and carries every other condition forward
 /// untouched, which is what [`crate::alerts::merge_conditions`] does for every writer. Rewriting
 /// the array with just its own

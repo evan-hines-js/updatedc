@@ -41,90 +41,53 @@ impl RepositoryLineage {
     }
 }
 
-/// Exact independently signed lifecycle provider pinned to a release.
-/// The agent stages it content-addressed on disk and invokes its manifest entrypoint
-/// as an external CLI; this record holds only the signed reference plus its invocation args.
+/// Execution derived from a verified package, persisted with its transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderRelease {
-    /// SHA-256 of the signed provider-set document this reconciler was resolved from. This is the
-    /// provider half of the deployed release identity: telemetry and the update loop compare it
-    /// with the live assignment so a provider-only revision cannot be mistaken for convergence.
-    pub provider_set_sha256: String,
+pub struct ReconcilerRelease {
+    pub definition_sha256: String,
     pub product: String,
-    pub release: ReleaseId,
-    pub archive_sha256: String,
-    pub args: Vec<String>,
+    pub api: u32,
     pub timeout_millis: u64,
 }
-
-impl ProviderRelease {
-    /// Upper bound for the serialized provider identity carried inside durable state. The
-    /// provider-set contract already accounts for the worst-case JSON expansion of its bounded
-    /// arguments; this shape adds only fixed-width digests and a bounded release identity.
-    pub(crate) const MAX_SERIALIZED_BYTES: usize =
-        updated_contracts::artifact::ProviderSet::MAX_DOCUMENT_BYTES;
-
-    /// Re-check on the way in everything the signed provider contract enforced on the way out.
-    ///
-    /// The installed record is plain JSON with no integrity check, so a value that reached disk
-    /// some other way must not become the reconciler identity this node invokes on every boot,
-    /// probe and fingerprint. A zero timeout is the sharp case: every hook would be past its
-    /// deadline before its first poll and be killed as "exceeded its 0s timeout", so the node
-    /// crash-loops blaming the operator's hook instead of failing closed on a corrupt record.
-    ///
-    /// The one home for that rule: the installed record, the update transaction and the install
-    /// transaction all persist the same identity and all re-check it here.
+impl ReconcilerRelease {
+    pub(crate) const MAX_SERIALIZED_BYTES: usize = 1024;
+    pub fn check_supported(&self) -> Result<(), String> {
+        crate::command_adapter::check_api(self.api)
+    }
+    pub fn execution_digest(&self) -> String {
+        self.definition_sha256.clone()
+    }
     pub(crate) fn is_valid(&self) -> bool {
-        use updated_contracts::artifact::ProviderSet;
-        updated_contracts::is_canonical_sha256(&self.provider_set_sha256)
+        updated_contracts::is_canonical_sha256(&self.definition_sha256)
             && updated_contracts::identity::is_segment(&self.product)
-            && self.release.validate().is_ok()
-            && updated_contracts::is_canonical_sha256(&self.archive_sha256)
-            && self.args.len() <= ProviderSet::MAX_ARGS
-            && self
-                .args
-                .iter()
-                .all(|arg| arg.len() <= ProviderSet::MAX_ARG_BYTES)
-            && (ProviderSet::MIN_TIMEOUT_MILLIS..=ProviderSet::MAX_TIMEOUT_MILLIS)
-                .contains(&self.timeout_millis)
+            && self.api > 0
+            && (1..=crate::command_adapter::MAX_INVOCATION_MILLIS).contains(&self.timeout_millis)
     }
 }
 
 /// Derive the only runtime rejection identity an executable replacement may carry.
 ///
-/// A health or lifecycle failure proves that the exact application/provider deployment failed; it
-/// does not prove either independently reusable artifact malformed. The identity is therefore the
-/// same domain-separated pair whether one artifact changed or both did. Structurally invalid
-/// content is rejected directly at its verification boundary instead. A metadata-only lineage
-/// rebind returns `None`: it is not an executable replacement and must use
-/// [`InstalledState::rebind_if_same_artifact`] instead of manufacturing an update transaction.
-/// Durable records and the agent's transaction constructor all call this function, so cold install,
-/// update, rollback, and validation cannot drift into different runtime verdicts.
+/// Runtime failure rejects this exact package within its repository lineage. Invalid archive
+/// bytes are rejected separately at verification. A lineage rebind of identical bytes has no
+/// runtime rejection identity and must not manufacture an update transaction.
 pub fn candidate_rejection_sha256(
     previous_release: &ReleaseId,
     previous_archive_sha256: &str,
-    previous_lifecycle: &ProviderRelease,
     candidate_release: &ReleaseId,
     candidate_archive_sha256: &str,
-    candidate_lifecycle: &ProviderRelease,
 ) -> Option<String> {
-    if previous_release == candidate_release
-        && previous_archive_sha256 == candidate_archive_sha256
-        && previous_lifecycle == candidate_lifecycle
+    if previous_release == candidate_release && previous_archive_sha256 == candidate_archive_sha256
     {
         return None;
     }
-    updated_contracts::digest::deployment_rejection_sha256(
-        candidate_archive_sha256,
-        &candidate_lifecycle.provider_set_sha256,
-    )
+    updated_contracts::digest::deployment_rejection_sha256(candidate_archive_sha256)
 }
 
-const INSTALLED_RECORD_MAX_BYTES: usize = 2 * ProviderRelease::MAX_SERIALIZED_BYTES + 8 * 1024;
+const INSTALLED_RECORD_MAX_BYTES: usize = 2 * ReconcilerRelease::MAX_SERIALIZED_BYTES + 8 * 1024;
 
 /// Version + the sha256 (hex) of the bytes that version was installed from, plus an
-/// optional [`Pending`] record while a just-committed update is still proving itself.
+/// optional [`RollbackGuard`] while a just-committed update is still proving itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledState {
@@ -136,15 +99,13 @@ pub struct InstalledState {
     /// restart, and update — without first re-resolving the assignment over the network. The
     /// provider bytes are already content-addressed on disk from when the release was staged;
     /// this holds only the signed reference.
-    pub lifecycle: Box<ProviderRelease>,
-    /// Set at the instant an update commits and cleared once it is confirmed. While it is
-    /// set, the update is unconfirmed: a crash reactivates `previous_release`, and
-    /// surviving the window confirms it. Absent for a
-    /// steady-state install and a first install (nothing to revert to). Folded into this
-    /// atomic record so the commit and its rollback intent land together — there is no
-    /// separate "arm" step to be interrupted.
+    pub reconciler: Box<ReconcilerRelease>,
+    /// Set atomically when an update commits and cleared after its confirmation window. While it
+    /// is set, a failed boot health gate reactivates `previous_release`. Absent for a steady-state
+    /// install and a first install (nothing to revert to). Folding this guard into the installed
+    /// record means commit and rollback authority land together; there is no separate arm step.
     #[serde(deserialize_with = "updated_contracts::required_option")]
-    pub pending: Option<Pending>,
+    pub rollback_guard: Option<RollbackGuard>,
     /// Whether this head has proven itself healthy at least once. `false` marks a *provisional*
     /// cold install: a head placed from the first trusted assignment that has never passed a
     /// health gate and has no predecessor to revert to. If a provisional head fails — crashes or
@@ -154,27 +115,38 @@ pub struct InstalledState {
     /// `true`: their failure recovery is the update state machine's rollback to a proven
     /// predecessor, not a cold-install-fallback descent. This is the whole "first boot / clean
     /// environment" signal, kept atomic with the install record rather than in a side file.
-    pub confirmed: bool,
+    pub maturity: Maturity,
 }
 
-/// The rollback intent of an unconfirmed update: the version to revert to and when the
-/// update committed (for the confirmation window).
+/// Whether this payload has passed an authoritative health gate on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Maturity {
+    Provisional,
+    Proven,
+}
+
+/// The rollback authority retained during an update's confirmation window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Pending {
-    pub lifecycle_attempt_id: String,
-    /// Candidate identity to reject if this confirmation window later fails.
+pub struct RollbackGuard {
+    pub attempt_id: String,
+    /// Candidate identity to reject if a boot health gate fails while this guard is armed.
     pub candidate_rejection_sha256: String,
     pub previous_release: ReleaseId,
     pub previous_archive_sha256: String,
     pub previous_repository_lineage: RepositoryLineage,
-    /// A crash rollback requires the operator lifecycle provider.
-    pub lifecycle: Box<ProviderRelease>,
+    /// A crash rollback requires the predecessor's exact reconciler.
+    pub reconciler: Box<ReconcilerRelease>,
     /// Unix seconds when the update committed.
     pub committed_at: u64,
 }
 
 impl InstalledState {
+    pub const fn is_proven(&self) -> bool {
+        matches!(self.maturity, Maturity::Proven)
+    }
+
     /// Validate the complete durable installed-state invariant.
     ///
     /// Persistence facades with non-file backends call this same rule before committing, while
@@ -188,12 +160,12 @@ impl InstalledState {
                 "invalid repository lineage",
             ));
         }
-        if !self.lifecycle.is_valid() {
-            // The head reconciler is the one actually invoked, so it gets the check the pending
-            // predecessor already got. See [`ProviderRelease::is_valid`].
+        if !self.reconciler.is_valid() {
+            // The head reconciler is the one actually invoked, so it gets the same validation as
+            // the predecessor reconciler retained by the rollback guard.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "installed provider identity is invalid",
+                "installed reconciler identity is invalid",
             ));
         }
         self.release.validate()?;
@@ -203,116 +175,111 @@ impl InstalledState {
                 "installed archive identity is invalid",
             ));
         }
-        if !self.confirmed && self.pending.is_some() {
-            // A provisional cold install has no proven predecessor to revert to; a rollback intent
-            // on an unconfirmed head is a contradiction. Every confirmed-write path clears or sets
-            // pending deliberately, so this can only appear in a corrupt/hand-edited record.
+        if self.maturity == Maturity::Provisional && self.rollback_guard.is_some() {
+            // A provisional cold install has no proven predecessor to revert to; a rollback guard
+            // on it is a contradiction and can only appear in a corrupt or hand-edited record.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "a provisional (unconfirmed) install must not carry a pending rollback",
+                "a provisional install must not carry a rollback guard",
             ));
         }
-        if let Some(pending) = &self.pending {
-            if pending.committed_at == 0 {
+        if let Some(guard) = &self.rollback_guard {
+            if guard.committed_at == 0 {
                 // Zero is not a timestamp the update path can produce. Treating it as one would
                 // make `window_passed` immediately settle the update on the next boot, erasing its
                 // rollback intent before the candidate passed a health gate.
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending confirmation timestamp is invalid",
+                    "rollback guard timestamp is invalid",
                 ));
             }
-            if !pending.previous_repository_lineage.validate() {
+            if !guard.previous_repository_lineage.validate() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "invalid pending predecessor repository lineage",
+                    "rollback guard predecessor repository lineage is invalid",
                 ));
             }
-            if !crate::rand::is_token(&pending.lifecycle_attempt_id) {
+            if !crate::rand::is_token(&guard.attempt_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending lifecycle id is invalid",
+                    "rollback guard attempt id is invalid",
                 ));
             }
             let expected_rejection = candidate_rejection_sha256(
-                &pending.previous_release,
-                &pending.previous_archive_sha256,
-                &pending.lifecycle,
+                &guard.previous_release,
+                &guard.previous_archive_sha256,
                 &self.release,
                 &self.archive_sha256,
-                &self.lifecycle,
             );
-            if !updated_contracts::is_canonical_sha256(&pending.candidate_rejection_sha256)
-                || expected_rejection.as_deref()
-                    != Some(pending.candidate_rejection_sha256.as_str())
+            if !updated_contracts::is_canonical_sha256(&guard.candidate_rejection_sha256)
+                || expected_rejection.as_deref() != Some(guard.candidate_rejection_sha256.as_str())
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending rejection identity does not match the executable replacement",
+                    "rollback guard rejection identity does not match the executable replacement",
                 ));
             }
-            if !pending.lifecycle.is_valid() {
+            if !guard.reconciler.is_valid() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending provider identity is invalid",
+                    "rollback guard reconciler identity is invalid",
                 ));
             }
-            pending.previous_release.validate()?;
-            if !updated_contracts::is_canonical_sha256(&pending.previous_archive_sha256) {
+            guard.previous_release.validate()?;
+            if !updated_contracts::is_canonical_sha256(&guard.previous_archive_sha256) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending predecessor archive identity is invalid",
+                    "rollback guard predecessor archive identity is invalid",
                 ));
             }
         }
         Ok(())
     }
 
-    /// A confirmed install (no pending rollback): a head with a proven predecessor or one that
-    /// has already passed a health gate. Its recovery on failure is the update state machine.
-    pub fn confirmed(
+    /// A health-proven install with no rollback guard.
+    pub fn proven(
         repository_lineage: RepositoryLineage,
         release: ReleaseId,
         archive_sha256: String,
-        lifecycle: Box<ProviderRelease>,
+        reconciler: Box<ReconcilerRelease>,
     ) -> Self {
         InstalledState {
             repository_lineage,
             release,
             archive_sha256,
-            lifecycle,
-            pending: None,
-            confirmed: true,
+            reconciler,
+            rollback_guard: None,
+            maturity: Maturity::Proven,
         }
     }
 
     /// A *provisional* cold install: the head placed from the first trusted assignment, not yet
-    /// health-proven and with no predecessor. See the [`confirmed`](Self::confirmed) field — if it
-    /// fails its first health gate the boot rejects it and the next cold install descends past it.
+    /// health-proven and with no predecessor. If it fails its first health gate, boot rejects it
+    /// and the next cold install descends past it.
     pub fn provisional(
         repository_lineage: RepositoryLineage,
         release: ReleaseId,
         archive_sha256: String,
-        lifecycle: Box<ProviderRelease>,
+        reconciler: Box<ReconcilerRelease>,
     ) -> Self {
         Self {
-            confirmed: false,
-            ..Self::confirmed(repository_lineage, release, archive_sha256, lifecycle)
+            maturity: Maturity::Provisional,
+            ..Self::proven(repository_lineage, release, archive_sha256, reconciler)
         }
     }
 
-    /// Promote a provisional cold install to confirmed after it passes its first health gate.
+    /// Promote a provisional cold install to proven after it passes its first health gate.
     /// Idempotent; returns whether the flag changed, so the caller only rewrites on transition.
-    /// This deliberately does not settle an update's [`Pending`] rollback intent — that is the
-    /// distinct [`InstalledState::settle_update`] transition.
-    pub fn confirm_provisional(&mut self) -> bool {
-        !std::mem::replace(&mut self.confirmed, true)
+    /// This deliberately does not disarm an update's [`RollbackGuard`] — that is the distinct
+    /// [`InstalledState::disarm_rollback`] transition.
+    pub fn prove_provisional(&mut self) -> bool {
+        std::mem::replace(&mut self.maturity, Maturity::Proven) == Maturity::Provisional
     }
 
-    /// Settle an update after its confirmation window by removing its rollback intent.
+    /// Settle an update after its confirmation window by removing its rollback guard.
     /// Idempotent; returns whether durable state changed.
-    pub fn settle_update(&mut self) -> bool {
-        self.pending.take().is_some()
+    pub fn disarm_rollback(&mut self) -> bool {
+        self.rollback_guard.take().is_some()
     }
 
     /// Version ordering is meaningful only inside one metadata lineage.
@@ -327,12 +294,12 @@ impl InstalledState {
         lineage: RepositoryLineage,
         release: &ReleaseId,
         archive_sha256: &str,
-        reconciler: &ProviderRelease,
+        reconciler: &ReconcilerRelease,
     ) -> Option<Self> {
         (self.repository_lineage != lineage
             && self.release == *release
             && self.archive_sha256 == archive_sha256
-            && self.lifecycle.as_ref() == reconciler)
+            && self.reconciler.as_ref() == reconciler)
             .then(|| Self {
                 repository_lineage: lineage,
                 ..self.clone()
@@ -349,29 +316,32 @@ pub enum Installed {
     Invalid,
 }
 
-/// The only content an enrollment record ever holds. Reading anything else back is corruption,
-/// and [`read_enrollment`] reports it as [`EnrollmentState::Invalid`] so the node fails closed
-/// instead of mistaking a damaged record for a node that was never enrolled.
-const ENROLLMENT_MARKER: &[u8] = b"enrolled\n";
+/// The only content an installation-history marker holds. Reading anything else back is corruption,
+/// and [`read_install_history`] reports it as [`InstallHistory::Invalid`] so the node fails closed
+/// instead of mistaking a damaged record for a node that was never installed.
+const INSTALL_HISTORY_MARKER: &[u8] = b"installed\n";
 
-pub enum EnrollmentState {
+pub enum InstallHistory {
     Present,
     Missing,
     Invalid,
 }
 
-pub fn enrollment_path(installed_path: &Path) -> PathBuf {
-    installed_path.with_file_name("enrollment.json")
+pub fn install_history_path(installed_path: &Path) -> PathBuf {
+    installed_path.with_file_name("install-history")
 }
 
 /// Permanently consume bootstrap eligibility before the first installed-state commit.
 /// A crash after this write can require operator recovery, but can never re-enter bootstrap.
-pub fn enroll(installed_path: &Path) -> io::Result<()> {
-    let path = enrollment_path(installed_path);
+pub fn record_first_install(installed_path: &Path) -> io::Result<()> {
+    let path = install_history_path(installed_path);
     // Once-only: this record is what makes bootstrap eligibility unrepeatable, so an existing one
     // is never overwritten. The single install lock makes this check sufficient — it is the same
     // owner that would have written it.
-    if !matches!(read_enrollment(installed_path), EnrollmentState::Missing) {
+    if !matches!(
+        read_install_history(installed_path),
+        InstallHistory::Missing
+    ) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "this installation has already consumed its bootstrap enrollment",
@@ -381,19 +351,19 @@ pub fn enroll(installed_path: &Path) -> io::Result<()> {
     // the process died mid-write — and a record that is present but unparseable is worse than
     // either state it sits between: the node is refused a cold install (bootstrap is spent) and
     // refused a normal boot (the record is invalid), with nothing on disk able to resolve it.
-    foundation::durable::atomic_write_managed(&path, ".enrollment-", ENROLLMENT_MARKER)
+    foundation::durable::atomic_write_managed(&path, ".enrollment-", INSTALL_HISTORY_MARKER)
 }
 
-pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
+pub fn read_install_history(installed_path: &Path) -> InstallHistory {
     match foundation::file::read_bounded_regular(
-        &enrollment_path(installed_path),
-        ENROLLMENT_MARKER.len(),
+        &install_history_path(installed_path),
+        INSTALL_HISTORY_MARKER.len(),
         foundation::file::FinalSymlink::Refuse,
     ) {
-        Ok(raw) if raw == ENROLLMENT_MARKER => EnrollmentState::Present,
-        Ok(_) => EnrollmentState::Invalid,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => EnrollmentState::Missing,
-        Err(_) => EnrollmentState::Invalid,
+        Ok(raw) if raw == INSTALL_HISTORY_MARKER => InstallHistory::Present,
+        Ok(_) => InstallHistory::Invalid,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => InstallHistory::Missing,
+        Err(_) => InstallHistory::Invalid,
     }
 }
 
@@ -472,25 +442,22 @@ mod tests {
                     manifest_sha256: digest('a'),
                 },
                 archive_sha256: digest('b'),
-                lifecycle: provider(),
-                pending: Some(Pending {
-                    lifecycle_attempt_id: digest('c'),
+                reconciler: provider(),
+                rollback_guard: Some(RollbackGuard {
+                    attempt_id: digest('c'),
                     candidate_rejection_sha256:
-                        updated_contracts::digest::deployment_rejection_sha256(
-                            &digest('b'),
-                            &provider().provider_set_sha256,
-                        )
-                        .unwrap(),
+                        updated_contracts::digest::deployment_rejection_sha256(&digest('b'))
+                            .unwrap(),
                     previous_release: ReleaseId {
                         version: "2.3.3".into(),
                         manifest_sha256: digest('d'),
                     },
                     previous_archive_sha256: digest('e'),
                     previous_repository_lineage: lineage("https://old/metadata/"),
-                    lifecycle: provider(),
+                    reconciler: provider(),
                     committed_at: 1_700_000_000,
                 }),
-                confirmed: true,
+                maturity: Maturity::Proven,
             },
         )
         .unwrap();
@@ -498,7 +465,7 @@ mod tests {
             Installed::Present(s) => {
                 assert_eq!(s.release.version, "2.3.4");
                 assert_eq!(s.archive_sha256, digest('b'));
-                assert_eq!(s.pending.unwrap().previous_release.version, "2.3.3");
+                assert_eq!(s.rollback_guard.unwrap().previous_release.version, "2.3.3");
             }
             _ => panic!("expected Present"),
         }
@@ -523,94 +490,31 @@ mod tests {
     }
 
     #[test]
-    fn a_head_reconciler_identity_the_contract_would_refuse_is_a_corrupt_record() {
-        // The head reconciler is the one this node invokes on every boot, probe and fingerprint,
-        // so it gets the check the pending predecessor already gets. A zero timeout is the sharp
-        // case: `lifecycle_timeout` would hand every hook a deadline already in the past and kill
-        // it as "exceeded its 0s timeout", crash-looping the node with a message blaming the
-        // operator's hook — where refusing the record fails closed on the real cause.
-        let head = |mutate: fn(&mut ProviderRelease)| {
-            let mut lifecycle = provider();
-            mutate(&mut lifecycle);
-            InstalledState::confirmed(
-                lineage("https://repo/metadata/"),
-                ReleaseId {
-                    version: "2.3.4".into(),
-                    manifest_sha256: digest('a'),
-                },
-                digest('b'),
-                lifecycle,
-            )
+    fn native_execution_survives_durable_state_without_a_fictitious_artifact() {
+        let (root, path) = tmp("native-execution");
+        let mut reconciler = provider();
+        reconciler.api = 1;
+        let state = InstalledState::proven(
+            lineage("https://repo/metadata/"),
+            ReleaseId {
+                version: "4.0.0".into(),
+                manifest_sha256: digest('a'),
+            },
+            digest('b'),
+            reconciler,
+        );
+        write_installed(&path, &state).unwrap();
+        let Installed::Present(restored) = read_installed(&path) else {
+            panic!("valid native state was lost")
         };
-        for (name, state) in [
-            ("zero-timeout", head(|p| p.timeout_millis = 0)),
-            (
-                "over-timeout",
-                head(|p| {
-                    p.timeout_millis =
-                        updated_contracts::artifact::ProviderSet::MAX_TIMEOUT_MILLIS + 1
-                }),
-            ),
-            // `product` becomes a directory name under the install root; staging refuses anything
-            // that could escape it, and so must the record that outlives staging.
-            (
-                "traversal-product",
-                head(|p| p.product = "../escape".into()),
-            ),
-            ("empty-product", head(|p| p.product = String::new())),
-            (
-                "leading-dash-product",
-                head(|p| p.product = "-unsafe".into()),
-            ),
-            (
-                "overlong-product",
-                head(|p| {
-                    p.product = "a".repeat(updated_contracts::identity::MAX_SEGMENT_BYTES + 1)
-                }),
-            ),
-            (
-                "bad-provider-archive",
-                head(|p| p.archive_sha256 = "bad".into()),
-            ),
-            (
-                "bad-provider-release",
-                head(|p| p.release.manifest_sha256 = "bad".into()),
-            ),
-            (
-                "too-many-provider-args",
-                head(|p| {
-                    p.args =
-                        vec![String::new(); updated_contracts::artifact::ProviderSet::MAX_ARGS + 1]
-                }),
-            ),
-            (
-                "overlong-provider-arg",
-                head(|p| {
-                    p.args = vec![
-                        "x".repeat(updated_contracts::artifact::ProviderSet::MAX_ARG_BYTES + 1)
-                    ]
-                }),
-            ),
-        ] {
-            let (_dir, path) = tmp(name);
-            assert_eq!(
-                write_installed(&path, &state).unwrap_err().kind(),
-                io::ErrorKind::InvalidData,
-                "{name} must never be written"
-            );
-            // Present on disk some other way (a hand-edited or truncated-then-rewritten record):
-            // it must read as corrupt, not as a usable head.
-            std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
-            assert!(
-                matches!(read_installed(&path), Installed::Invalid),
-                "{name} must read as corrupt"
-            );
-        }
+        assert_eq!(*restored, state);
+        assert_eq!(restored.reconciler.api, 1);
+        drop(root);
     }
 
     #[test]
     fn the_installed_artifact_identity_is_revalidated_as_one_unit() {
-        let valid = InstalledState::confirmed(
+        let valid = InstalledState::proven(
             lineage("https://repo/metadata/"),
             ReleaseId {
                 version: "2.3.4".into(),
@@ -642,17 +546,17 @@ mod tests {
             repository_lineage: tx.candidate_repository_lineage,
             release: tx.candidate_release,
             archive_sha256: tx.candidate_archive_sha256,
-            lifecycle: provider(),
-            pending: Some(Pending {
-                lifecycle_attempt_id: tx.id,
+            reconciler: provider(),
+            rollback_guard: Some(RollbackGuard {
+                attempt_id: tx.id,
                 candidate_rejection_sha256: tx.candidate_rejection_sha256,
                 previous_release: tx.previous_release,
                 previous_archive_sha256: tx.previous_archive_sha256,
                 previous_repository_lineage: tx.previous_repository_lineage,
-                lifecycle: tx.previous_lifecycle,
+                reconciler: tx.previous_reconciler,
                 committed_at: 0,
             }),
-            confirmed: true,
+            maturity: Maturity::Proven,
         };
         assert_eq!(
             state.validate().unwrap_err().kind(),
@@ -673,58 +577,74 @@ mod tests {
             repository_lineage: tx.candidate_repository_lineage,
             release: tx.candidate_release,
             archive_sha256: tx.candidate_archive_sha256,
-            lifecycle: tx.candidate_lifecycle,
-            pending: Some(Pending {
-                lifecycle_attempt_id: tx.id,
+            reconciler: tx.candidate_reconciler,
+            rollback_guard: Some(RollbackGuard {
+                attempt_id: tx.id,
                 candidate_rejection_sha256: digest('0'),
                 previous_release: tx.previous_release,
                 previous_archive_sha256: tx.previous_archive_sha256,
                 previous_repository_lineage: tx.previous_repository_lineage,
-                lifecycle: tx.previous_lifecycle,
+                reconciler: tx.previous_reconciler,
                 committed_at: 1,
             }),
-            confirmed: true,
+            maturity: Maturity::Proven,
         };
         assert_eq!(
             state.validate().unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
-        let deployment_rejection = updated_contracts::digest::deployment_rejection_sha256(
-            &state.archive_sha256,
-            &state.lifecycle.provider_set_sha256,
-        )
-        .unwrap();
-        state.pending.as_mut().unwrap().candidate_rejection_sha256 = deployment_rejection.clone();
+        let deployment_rejection =
+            updated_contracts::digest::deployment_rejection_sha256(&state.archive_sha256).unwrap();
+        state
+            .rollback_guard
+            .as_mut()
+            .unwrap()
+            .candidate_rejection_sha256 = deployment_rejection.clone();
         state.validate().unwrap();
 
-        state.pending.as_mut().unwrap().candidate_rejection_sha256 = state.archive_sha256.clone();
+        state
+            .rollback_guard
+            .as_mut()
+            .unwrap()
+            .candidate_rejection_sha256 = state.archive_sha256.clone();
         assert_eq!(
             state.validate().unwrap_err().kind(),
             io::ErrorKind::InvalidData,
             "runtime evidence cannot poison reusable application bytes"
         );
-        state.pending.as_mut().unwrap().candidate_rejection_sha256 =
-            state.lifecycle.provider_set_sha256.clone();
+        state
+            .rollback_guard
+            .as_mut()
+            .unwrap()
+            .candidate_rejection_sha256 = state.reconciler.definition_sha256.clone();
         assert_eq!(
             state.validate().unwrap_err().kind(),
             io::ErrorKind::InvalidData,
             "runtime evidence cannot poison a reusable provider set"
         );
 
-        // Reaching the same candidate through a provider-only transition yields the same identity.
-        let pending = state.pending.as_mut().unwrap();
+        // Identical package bytes cannot manufacture a second execution-only transition.
+        let pending = state.rollback_guard.as_mut().unwrap();
         pending.previous_release = state.release.clone();
         pending.previous_archive_sha256 = state.archive_sha256.clone();
-        pending.lifecycle.provider_set_sha256 = digest('e');
-        state.pending.as_mut().unwrap().candidate_rejection_sha256 = deployment_rejection.clone();
-        state.validate().unwrap();
+        pending.reconciler.definition_sha256 = digest('e');
+        state
+            .rollback_guard
+            .as_mut()
+            .unwrap()
+            .candidate_rejection_sha256 = deployment_rejection.clone();
+        assert!(state.validate().is_err());
 
         // Reaching it with both artifacts changed still yields that one candidate identity.
-        let pending = state.pending.as_mut().unwrap();
+        let pending = state.rollback_guard.as_mut().unwrap();
         pending.previous_release.version = "0.9.0".into();
         pending.previous_archive_sha256 = digest('b');
-        state.pending.as_mut().unwrap().candidate_rejection_sha256 = deployment_rejection;
+        state
+            .rollback_guard
+            .as_mut()
+            .unwrap()
+            .candidate_rejection_sha256 = deployment_rejection;
         state.validate().unwrap();
     }
 
@@ -784,18 +704,13 @@ mod tests {
             version: "8.0.0".into(),
             manifest_sha256: digest('a'),
         };
-        let reconciler = ProviderRelease {
-            provider_set_sha256: "f".repeat(64),
+        let reconciler = ReconcilerRelease {
+            definition_sha256: "f".repeat(64),
             product: "reconciler".into(),
-            release: ReleaseId {
-                version: "1.0.0".into(),
-                manifest_sha256: digest('b'),
-            },
-            archive_sha256: digest('c'),
-            args: Vec::new(),
+            api: 1,
             timeout_millis: 1_000,
         };
-        let installed = InstalledState::confirmed(
+        let installed = InstalledState::proven(
             old.clone(),
             release.clone(),
             digest('d'),
@@ -816,31 +731,29 @@ mod tests {
     }
 
     #[test]
-    fn rebind_changes_only_lineage_and_cannot_settle_lifecycle_state() {
+    fn rebind_changes_only_lineage_and_cannot_settle_reconciler_state() {
         let old = lineage("https://old/metadata/");
         let new = lineage("https://new/metadata/");
         let release = ReleaseId {
             version: "8.0.0".into(),
             manifest_sha256: digest('a'),
         };
-        let lifecycle = Box::new(ProviderRelease {
-            provider_set_sha256: digest('b'),
+        let reconciler = Box::new(ReconcilerRelease {
+            definition_sha256: digest('b'),
             product: "reconciler".into(),
-            release: ReleaseId {
-                version: "1.0.0".into(),
-                manifest_sha256: digest('c'),
-            },
-            archive_sha256: digest('d'),
-            args: Vec::new(),
+            api: 1,
             timeout_millis: 1_000,
         });
-        let mut installed =
-            InstalledState::confirmed(old.clone(), release.clone(), digest('e'), lifecycle.clone());
-        installed.pending = Some(Pending {
-            lifecycle_attempt_id: digest('f'),
+        let mut installed = InstalledState::proven(
+            old.clone(),
+            release.clone(),
+            digest('e'),
+            reconciler.clone(),
+        );
+        installed.rollback_guard = Some(RollbackGuard {
+            attempt_id: digest('f'),
             candidate_rejection_sha256: updated_contracts::digest::deployment_rejection_sha256(
                 &digest('e'),
-                &installed.lifecycle.provider_set_sha256,
             )
             .unwrap(),
             previous_release: ReleaseId {
@@ -849,44 +762,64 @@ mod tests {
             },
             previous_archive_sha256: digest('3'),
             previous_repository_lineage: old,
-            lifecycle,
+            reconciler,
             committed_at: 42,
         });
 
         let rebound = installed
-            .rebind_if_same_artifact(new.clone(), &release, &digest('e'), &installed.lifecycle)
+            .rebind_if_same_artifact(new.clone(), &release, &digest('e'), &installed.reconciler)
             .unwrap();
         assert_eq!(rebound.repository_lineage, new);
-        assert_eq!(rebound.pending, installed.pending);
-        assert_eq!(rebound.confirmed, installed.confirmed);
+        assert_eq!(rebound.rollback_guard, installed.rollback_guard);
+        assert_eq!(rebound.is_proven(), installed.is_proven());
 
         let mut provisional = installed;
-        provisional.pending = None;
-        provisional.confirmed = false;
+        provisional.rollback_guard = None;
+        provisional.maturity = Maturity::Provisional;
         let rebound = provisional
             .rebind_if_same_artifact(
                 lineage("https://third/metadata/"),
                 &release,
                 &digest('e'),
-                &provisional.lifecycle,
+                &provisional.reconciler,
             )
             .unwrap();
-        assert!(!rebound.confirmed);
+        assert!(!rebound.is_proven());
     }
 
     #[test]
-    fn enrollment_is_one_way_and_survives_missing_installed_state() {
+    fn install_history_is_one_way_and_independent_of_enrollment() {
         let (_dir, path) = tmp("enrollment");
-        enroll(&path).unwrap();
-        assert!(matches!(read_enrollment(&path), EnrollmentState::Present));
+        let enrollment = path.with_file_name("enrollment.json");
+        std::fs::create_dir_all(enrollment.parent().unwrap()).unwrap();
+        std::fs::write(&enrollment, b"signed enrollment artifact").unwrap();
+        assert!(matches!(
+            read_install_history(&path),
+            InstallHistory::Missing
+        ));
+        record_first_install(&path).unwrap();
         assert_eq!(
-            enroll(&path).unwrap_err().kind(),
+            std::fs::read(&enrollment).unwrap(),
+            b"signed enrollment artifact"
+        );
+        assert!(matches!(
+            read_install_history(&path),
+            InstallHistory::Present
+        ));
+        assert_eq!(
+            record_first_install(&path).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert!(matches!(read_installed(&path), Installed::Missing));
-        assert!(matches!(read_enrollment(&path), EnrollmentState::Present));
-        // A damaged record fails closed: it is neither a usable enrollment nor a fresh start.
-        std::fs::write(enrollment_path(&path), b"tampered").unwrap();
-        assert!(matches!(read_enrollment(&path), EnrollmentState::Invalid));
+        assert!(matches!(
+            read_install_history(&path),
+            InstallHistory::Present
+        ));
+        // A damaged record fails closed: it is neither a usable installation history nor a fresh start.
+        std::fs::write(install_history_path(&path), b"tampered").unwrap();
+        assert!(matches!(
+            read_install_history(&path),
+            InstallHistory::Invalid
+        ));
     }
 }

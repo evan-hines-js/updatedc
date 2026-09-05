@@ -2,13 +2,8 @@
 # describe the node differently. Build with packaging/build.sh, which compiles the binaries and
 # then runs `nfpm package -p deb` and `-p rpm` over this file.
 #
-# What this package is FOR: bootstrapping a node once. It places the launcher, the first agent,
-# the unit, and the config skeleton — and then gets out of the way. Every later agent version
-# arrives through the fleet's own signed TUF channel, verified against the pinned root, exactly
-# like every workload does. Do NOT wire this package into an unattended-upgrades or `yum update`
-# path expecting it to be the upgrade mechanism: two updaters racing for the same binary is the
-# one failure mode the whole design exists to avoid. Upgrade the package only to move the
-# LAUNCHER, which is installer-owned by design and deliberately never self-updates.
+# The package owns the agent binary and its systemd unit. Agent upgrades are intentionally handled
+# by the host package/configuration manager; the agent's signed channel manages applications only.
 
 name: updated-agent
 arch: ${PKG_ARCH}
@@ -18,21 +13,14 @@ section: admin
 priority: optional
 maintainer: updatedc <https://github.com/evan-hines-js/updatedc>
 description: |
-  Self-updating release agent (launcher + agent).
-  Bootstraps a node onto an `updated` fleet: the installer-owned launcher supervises a
-  content-addressed agent, and every later agent version and workload arrives through the
-  fleet's signed TUF channel rather than through this package.
+  Externally supervised release agent.
+  Bootstraps a node onto an `updated` fleet; systemd supervises the package-owned agent directly,
+  while workloads arrive through the fleet's signed TUF channel.
 vendor: updatedc
 homepage: https://github.com/evan-hines-js/updatedc
 license: AGPL-3.0-only
 
 contents:
-  # The two installer-owned binaries. They live outside the writable state directory precisely
-  # because they are the anchors the self-update machinery is measured against.
-  - src: ${PKG_BINDIR}/updated-launcher
-    dst: /usr/lib/updated/updated-launcher
-    expand: true
-    file_info: {mode: 0755}
   - src: ${PKG_BINDIR}/updated-agent
     dst: /usr/lib/updated/updated-agent
     expand: true

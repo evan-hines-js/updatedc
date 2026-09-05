@@ -1,12 +1,10 @@
 ---
 # Bootstrap a fleet of hosts onto an `updated` control plane. The VM-fleet counterpart to the
-# Helm chart: the *same* launcher and agent the published release ships, placed by Ansible instead
+# Helm chart: the same agent the published release ships, placed by Ansible instead
 # of by a pod spec, enrolling with the same control plane.
 #
-# This play performs the FIRST install only. After it, every agent version and every workload
-# arrives through the fleet's own signed TUF channel — re-running this play does not upgrade an
-# agent, and the package is deliberately not the upgrade mechanism. The one reason to run it again
-# is to move the launcher, which is installer-owned by design and never updates itself.
+# This play owns agent installation and upgrades through the host's package/configuration manager.
+# The fleet's signed TUF channel manages workload releases and desired configuration.
 #
 # Required vars (see roles/updated_agent/defaults/main.yml):
 #   updated_enrollment_url  the control plane's gateway URL (https, mutual TLS)

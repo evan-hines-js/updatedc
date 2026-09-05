@@ -123,8 +123,8 @@ pub struct RunningState<'a> {
     pub version: &'a str,
     /// The SHA-256 of the archive that version was installed from, empty alongside `version`.
     pub archive_sha256: &'a str,
-    /// The signed provider-set document whose reconciler is actually installed.
-    pub provider_set_sha256: &'a str,
+    /// The signed package execution definition whose reconciler is actually installed.
+    pub definition_sha256: &'a str,
     /// Settled: acted on the assignment and healthy. Never true mid-rollout.
     pub healthy: bool,
     /// An update transaction is in flight: this node committed an update whose confirmation window
@@ -133,7 +133,7 @@ pub struct RunningState<'a> {
     /// writer can tell them apart, so it is reported rather than guessed at by a reader.
     pub updating: bool,
     /// This node has DURABLY REJECTED the release its assignment names: either its application
-    /// archive or provider-set document is in the node's content-addressed rejection record. Only
+    /// archive or package execution definition is in the node's content-addressed rejection record. Only
     /// this node knows it — the record covers a candidate that failed its ACTIVATION as well as one
     /// that failed its confirmation window, and the first runs no completed update transaction, so
     /// no observer of the report stream can infer it.
@@ -198,8 +198,8 @@ pub fn load_outputs(paths: &updated::config::Paths, manifest_sha256: &str) -> Op
 /// Transient control-plane failures return 5xx; a `403` is reserved for a missing, revoked, or
 /// malformed live identity and will keep failing until that identity changes.
 ///
-/// So a refusal drops reporting to the slowest cadence the agent already has, the agent-check
-/// interval, and warns once. Nothing is given up: a report that would be refused carries no
+/// So a refusal drops reporting to the signed refresh-retry cadence and warns once. Nothing is
+/// given up: a report that would be refused carries no
 /// information to any reader, and a node whose identity is later completed recovers on its own at
 /// that cadence without a restart.
 #[derive(Default)]
@@ -306,6 +306,85 @@ impl Refusal {
     }
 }
 
+/// Captures report routing before the run takes ownership of mutable options. Reporting a hold
+/// happens only on exit and has a fixed deadline, outside the update and health paths.
+pub struct AttentionReporter {
+    routing: Routing,
+    paths: updated::config::Paths,
+    deployment: String,
+    assignment: String,
+}
+impl AttentionReporter {
+    pub fn new(opts: &crate::Options) -> Self {
+        Self {
+            routing: opts.routing.clone(),
+            paths: opts.paths.clone(),
+            deployment: opts.deployment.clone(),
+            assignment: opts.assignment_sha256.clone(),
+        }
+    }
+    pub async fn report(&self) {
+        let result = tokio::time::timeout(Duration::from_secs(12), self.publish()).await;
+        match result {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => crate::warn(&format!("reporting operator hold failed ({error})")),
+            Err(_) => crate::warn("reporting operator hold exceeded its deadline"),
+        }
+    }
+    async fn publish(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if updated::command_adapter::read_attention(&self.paths.install_root)?.is_none()
+            || self.routing.is_local()?
+        {
+            return Ok(());
+        }
+        let control = self.routing.mtls.reqwest_control_client()?;
+        let object = self.routing.mtls.reqwest_capability_client()?;
+        let node = node_identity(&self.routing);
+        let key = crate::load_report_signing_key(Some(&self.routing.mtls.client_key))?;
+        let (version, archive, provider, manifest) =
+            match updated::state::try_read_installed(&self.paths.installed)? {
+                updated::state::Installed::Present(state) => (
+                    state.release.version,
+                    state.archive_sha256,
+                    state.reconciler.definition_sha256,
+                    state.release.manifest_sha256,
+                ),
+                updated::state::Installed::Missing => Default::default(),
+                updated::state::Installed::Invalid => {
+                    return Err("invalid installed state while reporting hold".into())
+                }
+            };
+        let state = RunningState {
+            deployment: &self.deployment,
+            assignment_sha256: &self.assignment,
+            version: &version,
+            archive_sha256: &archive,
+            definition_sha256: &provider,
+            healthy: false,
+            updating: false,
+            rejected: false,
+            fingerprint: None,
+            paths: &self.paths,
+            manifest_sha256: &manifest,
+        };
+        report_running_state(
+            &ReportChannel {
+                control_client: &control,
+                object_client: &object,
+                control_base: Some(&self.routing.base_url),
+                node: node.as_deref(),
+                signing_key: key.as_deref(),
+                refusal_backoff: Duration::from_secs(60),
+            },
+            &state,
+            &mut Refusal::default(),
+            &mut OutputPublisher::default(),
+        )
+        .await;
+        Ok(())
+    }
+}
+
 /// Write the node's running state through its routing gateway. Strictly best-effort: any
 /// error (local routing, no derivable identity, network failure, non-success status)
 /// is logged and swallowed so reporting can never disrupt the update loop.
@@ -343,22 +422,33 @@ pub async fn report_running_state(
         crate::warn("no telemetry signing key available; skipping the rollout heartbeat");
         return;
     };
-    let reconciliation = match updated::reconciler::read_last_reconciliation(
-        &state.paths.last_reconciliation,
-    ) {
-        Ok(Some(record)) => Some(record),
-        Ok(None) if state.version.is_empty() => None,
-        Ok(None) => {
-            crate::warn(
-                "the installed release has no reconciliation evidence; skipping rollout telemetry",
-            );
-            return;
-        }
+    let attention = match updated::command_adapter::read_attention(&state.paths.install_root) {
+        Ok(record) => record,
         Err(error) => {
             crate::warn(&format!(
-                "reading the last reconciliation record failed ({error}); skipping rollout telemetry"
+                "cannot read operator hold ({error}); skipping rollout telemetry"
             ));
             return;
+        }
+    };
+    let reconciliation = if attention.is_some() {
+        None
+    } else {
+        match updated::reconciler::read_last_reconciliation(&state.paths.last_reconciliation) {
+            Ok(Some(record)) => Some(record),
+            Ok(None) if state.version.is_empty() => None,
+            Ok(None) => {
+                crate::warn(
+                "the installed release has no reconciliation evidence; skipping rollout telemetry",
+            );
+                return;
+            }
+            Err(error) => {
+                crate::warn(&format!(
+                "reading the last reconciliation record failed ({error}); skipping rollout telemetry"
+            ));
+                return;
+            }
         }
     };
     let Ok(mut report) = NodeReport::new(
@@ -367,15 +457,17 @@ pub async fn report_running_state(
         state.assignment_sha256,
         state.version,
         state.archive_sha256,
-        state.provider_set_sha256,
-        state.healthy,
+        state.definition_sha256,
+        state.healthy && attention.is_none(),
     ) else {
         crate::warn("invalid node identity; skipping rollout telemetry");
         return;
     };
     report.updating = state.updating;
+    report.helper = Some(updated_contracts::helper::Support::current());
     report.rejected = state.rejected;
-    report.fingerprint = if state.healthy {
+    report.attention = attention;
+    report.fingerprint = if report.healthy {
         state.fingerprint.cloned()
     } else {
         None
@@ -384,15 +476,19 @@ pub async fn report_running_state(
     // Store the private object first, then bind its exact bytes into the signed report. A failed
     // output write cannot make an old object look current, and storage cannot substitute new bytes
     // under the same node key.
-    report.output_sha256 = outputs
-        .publish(
-            channel.control_client,
-            channel.object_client,
-            control_base,
-            node,
-            state,
-        )
-        .await;
+    report.output_sha256 = if report.attention.is_some() {
+        None
+    } else {
+        outputs
+            .publish(
+                channel.control_client,
+                channel.object_client,
+                control_base,
+                node,
+                state,
+            )
+            .await
+    };
     // Signed with the node's per-node key so the throttle and the health proxy can verify authenticity
     // end-to-end, rather than trusting the write hop.
     // Encoded under the ceiling every reader decodes with, so an over-large report fails here,
@@ -688,7 +784,7 @@ mod tests {
                 assignment_sha256: &digest,
                 version: "1.0.0",
                 archive_sha256: &digest,
-                provider_set_sha256: &digest,
+                definition_sha256: &digest,
                 healthy: false,
                 updating: false,
                 rejected: false,
@@ -706,7 +802,7 @@ mod tests {
         paths: &updated::config::Paths,
         version: &str,
         archive_sha256: &str,
-        provider_set_sha256: &str,
+        definition_sha256: &str,
         manifest_sha256: &str,
     ) {
         use updated_contracts::reconciler::{
@@ -720,20 +816,12 @@ mod tests {
         )
         .unwrap();
         let transition = ReconciliationTransition::new(release.clone(), release);
-        let reconciler_release =
-            ReconciledRelease::new("1.0.0".into(), archive_sha256.into(), archive_sha256.into())
-                .unwrap();
         let record = LastReconciliation::new(
-            MutationOperation::Apply,
+            MutationOperation::Converge,
             Reason::Restart,
             updated_contracts::reconciler::attempt::CONVERGE.into(),
             transition,
-            ReconcilerIdentity::new(
-                provider_set_sha256.into(),
-                "system".into(),
-                reconciler_release,
-            )
-            .unwrap(),
+            ReconcilerIdentity::new(definition_sha256.into(), "system".into(), 1).unwrap(),
             SuccessfulMutation::new(false, HostAction::None, None).unwrap(),
             1,
         )
@@ -746,6 +834,56 @@ mod tests {
     /// A 403 is a standing verdict on this node's identity: the writer must stop hammering it every
     /// cycle. This protects a deleted, revoked, or malformed identity from producing one futile
     /// request and warning per second forever on a demo cadence.
+    #[tokio::test]
+    async fn held_installation_can_report_before_its_first_reconciliation() {
+        let (base, object, requests, writes) = accepting_report_endpoints().await;
+        let root = tempfile::tempdir().unwrap();
+        let paths = updated::config::Paths::resolve(root.path(), root.path());
+        let digest = "a".repeat(64);
+        updated::command_adapter::write_attention(
+            root.path(),
+            &updated_contracts::attention::Attention {
+                product: "app".into(),
+                receipt: digest.clone(),
+                operation: updated_contracts::reconciler::MutationOperation::Converge,
+                attempt: digest.clone(),
+                version: "1.0.0".into(),
+                message: "inspect partial deployment".into(),
+            },
+        )
+        .unwrap();
+        let key =
+            updated::csr::key_pem_to_pkcs8_der(&updated::csr::generate_key().unwrap()).unwrap();
+        report_running_state(
+            &ReportChannel {
+                control_client: &reqwest::Client::new(),
+                object_client: &object,
+                control_base: Some(&base),
+                node: Some("node-1"),
+                signing_key: Some(&key),
+                refusal_backoff: Duration::from_secs(60),
+            },
+            &RunningState {
+                deployment: "deployment",
+                assignment_sha256: &digest,
+                version: "1.0.0",
+                archive_sha256: &digest,
+                definition_sha256: &digest,
+                healthy: true,
+                updating: false,
+                rejected: false,
+                fingerprint: None,
+                paths: &paths,
+                manifest_sha256: &digest,
+            },
+            &mut Refusal::default(),
+            &mut OutputPublisher::default(),
+        )
+        .await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn a_refused_report_backs_off_instead_of_reporting_every_cycle() {
         let (base, requests) = report_endpoint("403 Forbidden");
@@ -829,7 +967,7 @@ mod tests {
             assignment_sha256: &assignment_sha256,
             version: "1.0.0",
             archive_sha256: &archive_sha256,
-            provider_set_sha256: &archive_sha256,
+            definition_sha256: &archive_sha256,
             healthy: true,
             updating: false,
             rejected: false,

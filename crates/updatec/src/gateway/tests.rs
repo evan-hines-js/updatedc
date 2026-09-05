@@ -346,6 +346,32 @@ fn renewal_requires_a_provisioned_agent_repository_and_pinned_key() {
 }
 
 #[test]
+fn a_deleting_agent_cannot_authorize_a_key_even_while_finalizers_keep_it_readable() {
+    for kind in [
+        crate::AgentIdentityKind::Manual,
+        crate::AgentIdentityKind::Enrolled,
+    ] {
+        let mut agent = renewal_agent(kind, "repo", Some(TEST_LEAF_KEY));
+        agent.metadata.finalizers = Some(vec!["updated.dev/cleanup".into()]);
+        assert!(agent_authorizes_key(
+            &agent,
+            "repo",
+            "node-a",
+            TEST_LEAF_KEY
+        ));
+        agent.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
+        );
+        assert!(!agent_authorizes_key(
+            &agent,
+            "repo",
+            "node-a",
+            TEST_LEAF_KEY
+        ));
+    }
+}
+
+#[test]
 fn identity_lookup_distinguishes_revocation_from_control_plane_failure() {
     let api_error = |code| {
         kube::Error::Api(kube::core::ErrorResponse {
@@ -539,6 +565,14 @@ fn only_an_explicitly_reserved_name_may_be_completed_by_enrollment() {
     let mut established = deferred(crate::AgentIdentityKind::Reserved);
     established.spec.identity.registration_sha256 = Some("registration".into());
     assert!(!adopts_preapproval(&established, &desired));
+    let mut deleting = deferred(crate::AgentIdentityKind::Reserved);
+    deleting.metadata.deletion_timestamp = Some(
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
+    );
+    assert!(!adopts_preapproval(&deleting, &desired));
+    let mut other_name = deferred(crate::AgentIdentityKind::Reserved);
+    other_name.metadata.name = Some("other-node".into());
+    assert!(!adopts_preapproval(&other_name, &desired));
 }
 
 #[tokio::test]
@@ -621,6 +655,15 @@ async fn reserved_only_rejects_an_absent_name_before_inventory_creation() {
 
 #[tokio::test]
 async fn enrollment_refuses_a_same_name_replacement_before_issuing_its_capability() {
+    assert_enrollment_refuses_changed_identity(false).await;
+}
+
+#[tokio::test]
+async fn enrollment_refuses_deletion_after_admission_before_issuing_its_capability() {
+    assert_enrollment_refuses_changed_identity(true).await;
+}
+
+async fn assert_enrollment_refuses_changed_identity(deleting: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let name = "node-a";
@@ -641,6 +684,12 @@ async fn enrollment_refuses_a_same_name_replacement_before_issuing_its_capabilit
         Some(TEST_OTHER_LEAF_KEY),
     );
     replacement.spec.identity.registration_sha256 = Some(registration.clone());
+    if deleting {
+        replacement.spec.identity = accepted.spec.identity.clone();
+        replacement.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
+        );
+    }
     replacement.status = Some(crate::UpdateAgentStatus {
         enrollment_object_key: Some(format!(
             "enrollments/{}/{}/{}.json",

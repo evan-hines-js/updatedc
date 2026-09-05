@@ -1,17 +1,17 @@
-//! `updatectl reconciler-check` — the conformance harness a reconciler author runs before
+//! `updatectl check` — the conformance harness a reconciler author runs before
 //! publishing.
 //!
 //! The agent can enforce ordering, bounds, identity, and result handling, but it cannot prove that
 //! a reconciler is idempotent, read-only where it must be, or stable across replays
 //! (`docs/node-reconciler-protocol.md`). Those are exactly the properties whose violation shows up
-//! as a rare, crash-timing-dependent production failure — a replayed `apply` that fails the second
+//! as a rare, crash-timing-dependent production failure — a replayed `converge` that fails the second
 //! time, an `inspect` that mutates the state directory, a fingerprint that changes on every probe
 //! and re-arms the fleet's drift detection forever.
 //!
 //! So this exercises them directly: it builds a scratch install root and state directory — from
 //! [`Paths`](updated::config::Paths), the agent's own layout — invokes the hook through the *same*
 //! argv builder ([`Arguments`](updated_contracts::reconciler::Arguments)) and the *same* invocation
-//! environment ([`apply_environment`](updated::reconciler::apply_environment)) the agent invokes
+//! environment ([`configure_environment`](updated::reconciler::configure_environment)) the agent invokes
 //! through, with a null stdin, and replays every operation the way crash recovery does, under the
 //! same attempt id.
 //!
@@ -19,7 +19,7 @@
 //! argv: a contained process tree with parent-death containment, torn down on every exit path,
 //! under a deadline. That is not fidelity for its own sake. Detaching the workload is a hook
 //! obligation the protocol states and nothing else can check — a harness with no tree to tear down
-//! passes a hook that forgot, which then loses its workload to its own first successful `apply`
+//! passes a hook that forgot, which then loses its workload to its own first successful `converge`
 //! (see [`Harness::invoke`]).
 //!
 //! It is deliberately not a test framework: one linear run, one human-readable line per check, and
@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use clap::Args;
 use updated_contracts::dataflow::FileSnapshot;
 #[cfg(all(test, unix))]
 use updated_contracts::reconciler::FLAGS;
@@ -45,16 +44,13 @@ use crate::Error;
 const TRANSACTION_ATTEMPT: &str =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// The versions the scratch releases carry. Two different ones, so a hook that reads
-/// `--candidate-version` and `--predecessor-version` cannot pass by accident.
+/// The scratch releases use different versions so candidate compensation and predecessor
+/// convergence cannot accidentally act on the same payload.
 const CANDIDATE_VERSION: &str = "2.0.0";
 const PREDECESSOR_VERSION: &str = "1.0.0";
 
-/// How long one invocation may run before its tree is killed and the check fails. A conformance run
-/// has no deployment to read `lifecycle.timeout_millis` from, so this stands in for the agent's
-/// `agent::update::lifecycle_timeout`: generous for a real `apply`, and finite, which is the whole
-/// point — a hook that never exits must fail the author's run rather than wedge their terminal.
-const INVOCATION_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the wait loop looks for the hook's exit — the agent's own polling cadence.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -66,10 +62,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// hook while holding the inherited stdout/stderr — the process left inside the tree that
 /// [`Invocation::left_tree`] reports, and the thing a plain `Command::output()` would have waited
 /// on forever.
-const TREE_GRACE: Duration = Duration::from_millis(500);
+const TREE_GRACE: Duration = Duration::from_secs(2);
 
-#[derive(Args, Debug)]
-pub(crate) struct ReconcilerCheckArgs {
+#[derive(Debug)]
+struct CheckSetup {
     /// The reconciler executable to check — the release's own entrypoint, exactly as the signed
     /// bundle carries it.
     hook: PathBuf,
@@ -77,12 +73,14 @@ pub(crate) struct ReconcilerCheckArgs {
     /// Build the scratch install root here instead of in a temporary directory, and leave it in
     /// place afterwards. Without it a run that fails keeps its scratch tree and prints the path,
     /// and a run that passes cleans up.
-    #[arg(long)]
     scratch: Option<PathBuf>,
 
-    /// Publisher arguments, passed after `--` exactly as a deployment's configured `args` are.
-    #[arg(last = true)]
-    publisher_args: Vec<String>,
+    /// Copy these payload files into the candidate fixture before invoking the reconciler.
+    candidate_payload: Option<PathBuf>,
+
+    /// Copy these payload files into the predecessor fixture. Commands execute on this host;
+    /// point procedures at isolated test infrastructure.
+    predecessor_payload: Option<PathBuf>,
 }
 
 /// Where the scratch machine is built: an operator-named directory that outlives the run, or a
@@ -114,6 +112,7 @@ impl Scratch {
 struct Release {
     dir: PathBuf,
     version: &'static str,
+    timeout: Duration,
 }
 
 /// The scratch machine one conformance run is performed against.
@@ -123,18 +122,19 @@ struct Release {
 /// passes exists before the first invocation. Input and output directories are private and fresh
 /// for every invocation, exactly as they are on the agent.
 struct Harness {
+    helper_executable: PathBuf,
     hook: PathBuf,
     cwd: PathBuf,
     install_root: PathBuf,
     state_dir: PathBuf,
     candidate: Release,
     predecessor: Release,
-    publisher_args: Vec<String>,
 }
 
 /// What one invocation did: enough to name it in a failure and to compare it against its replay.
 struct Invocation {
     argv: String,
+    timeout: Duration,
     /// The exit status as the agent reads it — `Some(code)`, `None` for death by signal, and
     /// `None` with [`timed_out`](Self::timed_out) for a hook the deadline killed.
     code: Option<i32>,
@@ -178,13 +178,24 @@ impl Invocation {
         )
     }
 
+    fn reports_replay_noop(&self, first: &Self) -> bool {
+        self.reports_changed(false)
+            && matches!(
+                (&self.result, &first.result),
+                (Ok(Some(updated_contracts::reconciler::MutationResolution::Succeeded(result))),
+                 Ok(Some(updated_contracts::reconciler::MutationResolution::Succeeded(original))))
+                    if result.host_action() == updated_contracts::reconciler::HostAction::None
+                        || result.host_action() == original.host_action()
+            )
+    }
+
     /// How the invocation ended, for the report line.
     fn status(&self) -> String {
         match self.code {
             Some(code) => format!("exit {code}"),
             None if self.timed_out => format!(
                 "no exit within the {}s conformance deadline; the tree was killed",
-                INVOCATION_TIMEOUT.as_secs()
+                self.timeout.as_secs()
             ),
             None => "killed by a signal".to_string(),
         }
@@ -192,6 +203,9 @@ impl Invocation {
 
     fn result_diagnostic(&self) -> String {
         match &self.result {
+            Ok(Some(updated_contracts::reconciler::MutationResolution::NeedsAttention(
+                message,
+            ))) => format!("; operator attention required: {message}"),
             Ok(Some(updated_contracts::reconciler::MutationResolution::Succeeded(result))) => {
                 format!(
                     "; result status=succeeded, changed={}, hostAction={:?}",
@@ -219,7 +233,7 @@ impl Invocation {
 }
 
 impl Harness {
-    fn new(root: &Path, hook: PathBuf, publisher_args: Vec<String>) -> io::Result<Self> {
+    fn new(root: &Path, hook: PathBuf, budgets: [Duration; 2]) -> io::Result<Self> {
         let install_root = root.join("install-root");
         // The agent's own layout, from the one definition of it rather than from paths respelled
         // here: a harness that certified hooks against directories no node uses is exactly the
@@ -236,7 +250,10 @@ impl Harness {
         for directory in [&state_dir, &candidate, &predecessor] {
             std::fs::create_dir_all(directory)?;
         }
+        let helper_executable =
+            updated::helper::pin(&std::env::current_exe()?, &root.join("helper-runtime"))?;
         Ok(Harness {
+            helper_executable,
             cwd: hook
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -248,22 +265,23 @@ impl Harness {
             candidate: Release {
                 dir: candidate,
                 version: CANDIDATE_VERSION,
+                timeout: budgets[0],
             },
             predecessor: Release {
                 dir: predecessor,
                 version: PREDECESSOR_VERSION,
+                timeout: budgets[1],
             },
-            publisher_args,
         })
     }
 
     /// Invoke the hook the way the agent's own invoker does: the argv from
-    /// `agent::update::prepare_lifecycle_command`, run as
+    /// `agent::update::prepare_reconciler_command`, run as
     /// `agent::update::run_prepared_lifecycle_command_blocking` runs it — a contained tree with
     /// parent-death containment, torn down with `kill_tree` on EVERY exit path, under a deadline.
     ///
-    /// `converge_onto` is always `--candidate` — in both directions, per the protocol: a rollback
-    /// passes the release being restored as the candidate and the failed one as the predecessor.
+    /// `payload` is always the sole operation subject: the failed candidate for `rollback`, and the
+    /// desired release for `converge`.
     /// The argv comes from the published grammar's own builder, the one the agent invokes through,
     /// so this harness cannot check a hook against a flag the agent does not send or against a
     /// value the agent would put behind a different flag.
@@ -272,9 +290,9 @@ impl Harness {
     /// that otherwise appear for the first time on a real node.
     ///
     /// 1. `docs/node-reconciler-protocol.md` makes detaching a hook obligation — "a workload
-    ///    started inside the tree is killed by its own successful `apply`". A harness that never
+    ///    started inside the tree is killed by its own successful `converge`". A harness that never
     ///    tears the tree down passes a hook that forgot to `setsid`, which then loses its workload
-    ///    to the first real `apply`. Here the tree is torn down, and a descendant still holding the
+    ///    to the first real `converge`. Here the tree is torn down, and a descendant still holding the
     ///    captured pipes a moment after the hook returned is reported as
     ///    [`left_tree`](Invocation::left_tree).
     /// 2. Reading the pipes to EOF with no deadline is the hazard the agent comments on directly:
@@ -287,20 +305,12 @@ impl Harness {
         protocol: &str,
         attempt_id: &str,
         reason: Reason,
-        converge_onto: &Release,
-        undoing: &Release,
+        payload: &Release,
     ) -> io::Result<Invocation> {
         operation
             .validate_invocation(reason, attempt_id)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        self.invoke_raw(
-            operation.as_str(),
-            protocol,
-            attempt_id,
-            reason,
-            converge_onto,
-            undoing,
-        )
+        self.invoke_raw(operation.as_str(), protocol, attempt_id, reason, payload)
     }
 
     /// Bypass the typed operation gate only for conformance checks that intentionally send an
@@ -312,8 +322,7 @@ impl Harness {
         protocol: &str,
         attempt_id: &str,
         reason: Reason,
-        converge_onto: &Release,
-        undoing: &Release,
+        payload: &Release,
     ) -> io::Result<Invocation> {
         let exchange = tempfile::Builder::new()
             .prefix("reconciler-invocation-")
@@ -331,13 +340,11 @@ impl Harness {
             reason,
             install_root: self.install_root.as_os_str(),
             state_dir: self.state_dir.as_os_str(),
-            candidate: converge_onto.dir.as_os_str(),
-            candidate_version: OsStr::new(converge_onto.version),
+            payload_root: payload.dir.as_os_str(),
+            payload_version: OsStr::new(payload.version),
             output_dir: output_dir.as_os_str(),
             result_file: result_file.as_os_str(),
             input_dir: input_dir.as_os_str(),
-            predecessor: undoing.dir.as_os_str(),
-            predecessor_version: OsStr::new(undoing.version),
         };
         let mut command = Command::new(&self.hook);
         command.arg(operation);
@@ -346,11 +353,6 @@ impl Harness {
             command.arg(flag).arg(value);
             argv.push(flag.to_string());
             argv.push(value.to_string_lossy().into_owned());
-        }
-        if !self.publisher_args.is_empty() {
-            command.arg("--").args(&self.publisher_args);
-            argv.push("--".to_string());
-            argv.extend(self.publisher_args.iter().cloned());
         }
         command
             .current_dir(&self.cwd)
@@ -364,7 +366,15 @@ impl Harness {
         // conformance and passed in production) and no `SystemRoot` on Windows, where nothing that
         // needs PowerShell or cmd can start at all. Application data is available only through the
         // input directory, which is empty here because a conformance run has no control plane.
-        updated::reconciler::apply_environment(&mut command);
+        updated::reconciler::configure_environment(&mut command);
+        if let Ok(operation) = operation.parse::<Operation>() {
+            updated::helper::configure(
+                &mut command,
+                &self.helper_executable,
+                operation,
+                &arguments,
+            )?;
+        }
         let mut child = foundation::process::ContainedChild::spawn(command)?;
         let stdout = updated::reconciler::capture_output(
             child
@@ -376,7 +386,7 @@ impl Harness {
                 .take_stderr()
                 .ok_or_else(|| io::Error::other("the hook's stderr was not captured"))?,
         );
-        let deadline = Instant::now() + INVOCATION_TIMEOUT;
+        let deadline = Instant::now() + payload.timeout;
         let root_exited = loop {
             if child.root_has_exited()? {
                 break true;
@@ -438,6 +448,7 @@ impl Harness {
             updated::reconciler::snapshot_directory(&output_dir).map_err(|error| error.to_string());
         Ok(Invocation {
             argv: argv.join(" "),
+            timeout: payload.timeout,
             code: exited.and_then(|status| status.code()),
             timed_out: exited.is_none(),
             left_tree,
@@ -532,7 +543,76 @@ impl Report {
     }
 }
 
-pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
+/// Test fixtures are explicit local inputs. Preserve executable permissions; refuse links and
+/// special files so a scratch copy cannot follow references outside the selected fixture.
+pub(crate) fn copy_fixture(source: &Path, destination: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        match std::fs::symlink_metadata(&target) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "payload fixture destination must be empty",
+                ))
+            }
+        }
+        if kind.is_dir() {
+            std::fs::create_dir(&target)?;
+            copy_fixture(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            let mut source = foundation::file::open_regular(
+                &entry.path(),
+                foundation::file::FinalSymlink::Refuse,
+            )?;
+            let mut destination = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            io::copy(&mut source, &mut destination)?;
+            destination.set_permissions(source.metadata()?.permissions())?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload fixtures must contain only regular files and directories",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_package(
+    candidate: &Path,
+    predecessor: &Path,
+    manual_recovery: bool,
+) -> Result<(), Error> {
+    run_check(
+        CheckSetup {
+            hook: std::env::current_exe()?,
+            scratch: None,
+            candidate_payload: Some(candidate.into()),
+            predecessor_payload: Some(predecessor.into()),
+        },
+        manual_recovery,
+        [
+            Duration::from_millis(
+                updated::command_adapter::inspect_package(candidate)?.timeout_millis,
+            ),
+            Duration::from_millis(
+                updated::command_adapter::inspect_package(predecessor)?.timeout_millis,
+            ),
+        ],
+    )
+}
+#[cfg(test)]
+fn reconciler_check(args: CheckSetup) -> Result<(), Error> {
+    run_check(args, false, [FIXTURE_TIMEOUT; 2])
+}
+
+fn run_check(args: CheckSetup, manual_recovery: bool, budgets: [Duration; 2]) -> Result<(), Error> {
     let hook = std::fs::canonicalize(&args.hook)
         .map_err(|error| format!("{}: {error}", args.hook.display()))?;
     let scratch = match args.scratch {
@@ -542,7 +622,20 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
         }
         None => Scratch::Temporary(tempfile::tempdir()?),
     };
-    let harness = Harness::new(scratch.path(), hook, args.publisher_args)?;
+    let harness = Harness::new(scratch.path(), hook, budgets)?;
+    for (source, destination) in [
+        (&args.candidate_payload, &harness.candidate.dir),
+        (&args.predecessor_payload, &harness.predecessor.dir),
+    ] {
+        if let Some(source) = source {
+            let source = std::fs::canonicalize(source)?;
+            let destination = std::fs::canonicalize(destination)?;
+            if destination.starts_with(&source) || source.starts_with(&destination) {
+                return Err("payload fixtures and scratch paths must not overlap".into());
+            }
+            copy_fixture(&source, &destination)?;
+        }
+    }
     println!(
         "checking {} against node reconciler protocol {}\n  install root: {}\n  state dir:    {}\n",
         harness.hook.display(),
@@ -559,15 +652,14 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
     // whether an invocation half-ran and its only correct recovery is to invoke again — with the
     // same attempt id and the same arguments.
     let first = harness.invoke(
-        Operation::Apply,
+        Operation::Converge,
         updated_contracts::reconciler::PROTOCOL,
         TRANSACTION_ATTEMPT,
         Reason::Update,
         &harness.candidate,
-        &harness.predecessor,
     )?;
     report.check(
-        "apply/update succeeds",
+        "converge/update succeeds",
         first.mutation_succeeded(),
         format!(
             "{}{}\n        {}",
@@ -577,37 +669,36 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
         ),
     );
     // The obligation `docs/node-reconciler-protocol.md` puts on the hook and nothing else could
-    // check: the agent kills the invocation's process tree on EVERY apply, success included, so a
-    // workload started inside it is killed by its own successful apply. A hook that forgot to
+    // check: the agent kills the invocation's process tree on EVERY converge, success included, so
+    // a workload started inside it is killed by its own successful converge. A hook that forgot to
     // detach shows up here — and only here — instead of on the first real node.
     report.check(
-        "apply leaves nothing inside the invocation's process tree",
+        "converge leaves nothing inside the invocation's process tree",
         !first.left_tree,
         if first.left_tree {
             format!(
-                "something apply started was still holding the invocation's stdout/stderr {}ms \
-                 after it exited, so it is still inside the tree the agent kills on every apply — \
+                "something converge started was still holding the invocation's stdout/stderr {}ms \
+                 after it exited, so it is still inside the tree the agent kills on every converge — \
                  the workload would not survive its own deployment. Detach it (`setsid`, or \
                  `CREATE_BREAKAWAY_FROM_JOB`) AND redirect its stdio off the inherited pipes; \
                  detaching alone still holds them.",
                 TREE_GRACE.as_millis()
             )
         } else {
-            "both captured pipes reached EOF as soon as apply returned".to_string()
+            "both captured pipes reached EOF as soon as converge returned".to_string()
         },
     );
     let first_outputs = first.outputs.clone();
     let replay = harness.invoke(
-        Operation::Apply,
+        Operation::Converge,
         updated_contracts::reconciler::PROTOCOL,
         TRANSACTION_ATTEMPT,
         Reason::Update,
         &harness.candidate,
-        &harness.predecessor,
     )?;
     report.check(
-        "apply is replay-tolerant (same attempt id, run twice)",
-        replay.mutation_succeeded() && replay.reports_changed(false),
+        "converge is replay-tolerant (same attempt id, run twice)",
+        replay.mutation_succeeded() && replay.reports_replay_noop(&first),
         format!(
             "first {}, replay {}{}{}",
             first.status(),
@@ -657,7 +748,6 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
                 updated_contracts::reconciler::attempt::PERIODIC,
                 Reason::Restart,
                 &harness.candidate,
-                &harness.candidate,
             )
         })
         .collect::<io::Result<_>>()?;
@@ -679,7 +769,6 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
                 updated_contracts::reconciler::PROTOCOL,
                 updated_contracts::reconciler::attempt::FINGERPRINT,
                 Reason::Restart,
-                &harness.candidate,
                 &harness.candidate,
             )
         })
@@ -736,8 +825,8 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
         },
     );
 
-    // Compensation. The rollback direction carries its own token — the forward one with `r`
-    // appended — and converges ONTO the release being restored, so candidate and predecessor swap.
+    // Compensation is bound to the failed candidate's own payload. Selecting or starting the
+    // predecessor is a distinct converge invocation below.
     let rollback_attempt = format!("{TRANSACTION_ATTEMPT}r");
     let rollback: Vec<Invocation> = (0..2)
         .map(|_| {
@@ -746,72 +835,109 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
                 updated_contracts::reconciler::PROTOCOL,
                 &rollback_attempt,
                 Reason::Update,
-                &harness.predecessor,
                 &harness.candidate,
             )
         })
         .collect::<io::Result<_>>()?;
-    report.check(
-        "rollback is replay-tolerant (compensating attempt id, run twice)",
-        rollback.iter().all(Invocation::mutation_succeeded) && rollback[1].reports_changed(false),
-        format!(
-            "--attempt-id {rollback_attempt}, --candidate {} (restored), --predecessor {} \
-             (failed): {} then {}{}{}",
-            harness.predecessor.version,
+    if manual_recovery {
+        report.check(
+            "manual recovery stops for attention on both invocations",
+            rollback.iter().all(|invocation| {
+                invocation.succeeded()
+                    && matches!(
+                        invocation.result,
+                        Ok(Some(
+                            updated_contracts::reconciler::MutationResolution::NeedsAttention(_)
+                        ))
+                    )
+            }),
+            "no automatic recovery was authorized".into(),
+        );
+    } else {
+        report.check(
+            "rollback is replay-tolerant (compensating attempt id, run twice)",
+            rollback.iter().all(Invocation::mutation_succeeded)
+                && rollback[1].reports_replay_noop(&rollback[0]),
+            format!(
+            "--attempt-id {rollback_attempt}, --payload-root {} (failed candidate): {} then {}{}{}",
             harness.candidate.version,
             rollback[0].status(),
             rollback[1].status(),
             rollback[1].diagnostic(),
             rollback[1].result_diagnostic()
         ),
-    );
-    report.check(
-        "rollback outputs are valid and identical across a fresh-directory replay",
-        matches!(
-            (&rollback[0].outputs, &rollback[1].outputs),
-            (Ok(before), Ok(after)) if before == after
-        ),
-        match (&rollback[0].outputs, &rollback[1].outputs) {
-            (Ok(before), Ok(after)) if before == after => {
-                format!("{} files, unchanged", before.files.len())
-            }
-            (Ok(before), Ok(after)) => format!(
-                "first invocation produced {:?}, replay produced {:?}",
-                before.files.keys().collect::<Vec<_>>(),
-                after.files.keys().collect::<Vec<_>>()
+        );
+        report.check(
+            "rollback outputs are valid and identical across a fresh-directory replay",
+            matches!(
+                (&rollback[0].outputs, &rollback[1].outputs),
+                (Ok(before), Ok(after)) if before == after
             ),
-            (Err(error), _) => format!("first invocation rejected: {error}"),
-            (_, Err(error)) => format!("replay rejected: {error}"),
-        },
-    );
+            match (&rollback[0].outputs, &rollback[1].outputs) {
+                (Ok(before), Ok(after)) if before == after => {
+                    format!("{} files, unchanged", before.files.len())
+                }
+                (Ok(before), Ok(after)) => format!(
+                    "first invocation produced {:?}, replay produced {:?}",
+                    before.files.keys().collect::<Vec<_>>(),
+                    after.files.keys().collect::<Vec<_>>()
+                ),
+                (Err(error), _) => format!("first invocation rejected: {error}"),
+                (_, Err(error)) => format!("replay rejected: {error}"),
+            },
+        );
+
+        let restored: Vec<Invocation> = (0..2)
+            .map(|_| {
+                harness.invoke(
+                    Operation::Converge,
+                    updated_contracts::reconciler::PROTOCOL,
+                    &rollback_attempt,
+                    Reason::Update,
+                    &harness.predecessor,
+                )
+            })
+            .collect::<io::Result<_>>()?;
+        report.check(
+            "predecessor convergence is separate and replay-tolerant",
+            restored.iter().all(Invocation::mutation_succeeded)
+                && restored[1].reports_replay_noop(&restored[0]),
+            format!(
+                "--payload-root {} (predecessor): {} then {}{}{}",
+                harness.predecessor.version,
+                restored[0].status(),
+                restored[1].status(),
+                restored[1].diagnostic(),
+                restored[1].result_diagnostic()
+            ),
+        );
+    }
 
     // The two refusals. A hook that runs whatever it is handed is a hook that will one day converge
     // a machine on a protocol it does not implement.
     let unknown = harness.invoke_raw(
-        "converge",
+        "unknown",
         updated_contracts::reconciler::PROTOCOL,
         TRANSACTION_ATTEMPT,
         Reason::Update,
         &harness.candidate,
-        &harness.predecessor,
     )?;
     report.check(
         "an unknown operation is refused",
         !unknown.succeeded(),
-        format!("`converge` ended with {}", unknown.status()),
+        format!("`unknown` ended with {}", unknown.status()),
     );
     let wrong_protocol = harness.invoke(
-        Operation::Apply,
-        "2",
+        Operation::Converge,
+        "999",
         TRANSACTION_ATTEMPT,
         Reason::Update,
         &harness.candidate,
-        &harness.predecessor,
     )?;
     report.check(
         "a protocol version this hook does not implement is refused",
         !wrong_protocol.succeeded(),
-        format!("`--protocol 2` ended with {}", wrong_protocol.status()),
+        format!("`--protocol 999` ended with {}", wrong_protocol.status()),
     );
 
     println!("\n{} checks, {} failed", report.checks, report.failures);
@@ -848,15 +974,15 @@ while [ $# -gt 0 ]; do
     --state-dir) state_dir=$2; shift 2 ;;
     --output-dir) output_dir=$2; shift 2 ;;
     --result-file) result_file=$2; shift 2 ;;
-    --install-root|--candidate|--candidate-version|--input-dir|--predecessor|--predecessor-version)
+    --install-root|--payload-root|--payload-version|--input-dir)
       shift 2 ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ "$protocol" = 1 ] || exit 2
+[ "$protocol" = 2 ] || exit 2
 case "$operation" in
-  apply|rollback)
+  converge|rollback)
     # Keyed to the attempt, never to invocation count: the replay finds its marker and stops.
     marker="$state_dir/$operation.$attempt.done"
     changed=false
@@ -875,7 +1001,7 @@ case "$operation" in
 esac
 "#;
 
-    /// The same reconciler with one defect: `apply` refuses to run twice, which is precisely what
+    /// The same reconciler with one defect: `converge` refuses to run twice, which is precisely what
     /// crash recovery does to it.
     const BREAKS_IDEMPOTENCE: &str = r#"#!/bin/sh
 set -eu
@@ -886,15 +1012,15 @@ while [ $# -gt 0 ]; do
     --protocol) protocol=$2; shift 2 ;;
     --state-dir) state_dir=$2; shift 2 ;;
     --result-file) result_file=$2; shift 2 ;;
-    --attempt-id|--reason|--install-root|--candidate|--candidate-version|--output-dir|--input-dir|--predecessor|--predecessor-version)
+    --attempt-id|--reason|--install-root|--payload-root|--payload-version|--output-dir|--input-dir)
       shift 2 ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ "$protocol" = 1 ] || exit 2
+[ "$protocol" = 2 ] || exit 2
 case "$operation" in
-  apply|rollback)
+  converge|rollback)
     if [ -f "$state_dir/$operation.installed" ]; then
       echo "$operation has already run" >&2
       exit 1
@@ -915,9 +1041,9 @@ case "$operation" in
 esac
 "#;
 
-    /// Conformant in every respect except the one only containment can observe: `apply` starts its
+    /// Conformant in every respect except the one only containment can observe: `converge` starts its
     /// workload INSIDE the invocation's process tree and lets it keep the inherited stdout/stderr.
-    /// On a real node the agent's `kill_tree` after a successful `apply` kills it, so this hook
+    /// On a real node the agent's `kill_tree` after a successful `converge` kills it, so this hook
     /// deploys once and loses its workload immediately.
     const LEAKS_WORKLOAD: &str = r#"#!/bin/sh
 set -eu
@@ -929,15 +1055,15 @@ while [ $# -gt 0 ]; do
     --attempt-id) attempt=$2; shift 2 ;;
     --state-dir) state_dir=$2; shift 2 ;;
     --result-file) result_file=$2; shift 2 ;;
-    --reason|--install-root|--candidate|--candidate-version|--output-dir|--input-dir|--predecessor|--predecessor-version)
+    --reason|--install-root|--payload-root|--payload-version|--output-dir|--input-dir)
       shift 2 ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[ "$protocol" = 1 ] || exit 2
+[ "$protocol" = 2 ] || exit 2
 case "$operation" in
-  apply|rollback)
+  converge|rollback)
     marker="$state_dir/$operation.$attempt.done"
     if [ -f "$marker" ]; then
       printf '%s' '{"schema":1,"status":"succeeded","changed":false,"hostAction":"none","message":null}' >"$result_file"
@@ -964,10 +1090,11 @@ esac
     /// Every run is scoped to the test's own directory, so a failing check keeps its evidence
     /// there and nothing outlives the test.
     fn check(scratch: &Path, hook: PathBuf) -> Result<(), Error> {
-        reconciler_check(ReconcilerCheckArgs {
+        reconciler_check(CheckSetup {
             hook,
+            candidate_payload: None,
+            predecessor_payload: None,
             scratch: Some(scratch.join("scratch")),
-            publisher_args: vec!["--publisher-flag".into()],
         })
     }
 
@@ -978,7 +1105,15 @@ esac
         check(scratch.path(), hook).expect("a conformant reconciler passes");
     }
 
-    /// The defects this harness exists to catch: a replayed `apply` that fails, a `rollback` that
+    #[test]
+    fn an_outstanding_reboot_request_can_repeat_until_the_host_reboots() {
+        let scratch = tempfile::tempdir().unwrap();
+        let body = CONFORMANT.replace("\"hostAction\":\"none\"", "\"hostAction\":\"reboot\"");
+        let hook = fixture(scratch.path(), "needs-reboot.sh", &body);
+        check(scratch.path(), hook).expect("replaying a request does not repeat the mutation");
+    }
+
+    /// The defects this harness exists to catch: a replayed `converge` that fails, a `rollback` that
     /// fails its own replay, an `inspect` that writes to the state directory, and a fingerprint
     /// that changes while nothing has.
     #[test]
@@ -986,11 +1121,11 @@ esac
         let scratch = tempfile::tempdir().unwrap();
         let hook = fixture(scratch.path(), "broken.sh", BREAKS_IDEMPOTENCE);
         let error = check(scratch.path(), hook).expect_err("a non-idempotent reconciler fails");
-        assert_eq!(error.to_string(), "4 of 13 conformance checks failed");
+        assert_eq!(error.to_string(), "5 of 14 conformance checks failed");
     }
 
     /// The obligation no amount of argv checking can reach: `docs/node-reconciler-protocol.md`
-    /// requires a hook to detach anything meant to outlive `apply`, because the agent tears the
+    /// requires a hook to detach anything meant to outlive `converge`, because the agent tears the
     /// invocation's process tree down on EVERY exit path, success included. Invoking through a bare
     /// `Command::output()` gave the harness no tree to tear down, so this hook passed conformance
     /// and then lost its workload to its own first real deployment — and it hung that harness on
@@ -1002,7 +1137,7 @@ esac
         let scratch = tempfile::tempdir().unwrap();
         let hook = fixture(scratch.path(), "leaks.sh", LEAKS_WORKLOAD);
         let error = check(scratch.path(), hook).expect_err("a hook that leaks its workload fails");
-        assert_eq!(error.to_string(), "1 of 13 conformance checks failed");
+        assert_eq!(error.to_string(), "1 of 14 conformance checks failed");
     }
 
     /// The harness must hand the hook exactly the published grammar — a hook that rejects an
@@ -1011,15 +1146,14 @@ esac
     fn the_harness_sends_only_the_published_flags() {
         let scratch = tempfile::tempdir().unwrap();
         let hook = fixture(scratch.path(), "conformant.sh", CONFORMANT);
-        let harness = Harness::new(scratch.path(), hook, Vec::new()).unwrap();
+        let harness = Harness::new(scratch.path(), hook, [FIXTURE_TIMEOUT; 2]).unwrap();
         let invocation = harness
             .invoke(
                 Operation::Inspect,
-                "1",
+                updated_contracts::reconciler::PROTOCOL,
                 updated_contracts::reconciler::attempt::FINGERPRINT,
                 Reason::Restart,
                 &harness.candidate,
-                &harness.predecessor,
             )
             .unwrap();
         assert!(invocation.succeeded(), "{}", invocation.stderr);
@@ -1041,7 +1175,7 @@ state_dir=
 while [ $# -gt 0 ]; do
   case "$1" in
     --state-dir) state_dir=$2; shift 2 ;;
-    --protocol|--attempt-id|--reason|--install-root|--candidate|--candidate-version|--output-dir|--result-file|--input-dir|--predecessor|--predecessor-version)
+    --protocol|--attempt-id|--reason|--install-root|--payload-root|--payload-version|--output-dir|--result-file|--input-dir)
       shift 2 ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -1060,21 +1194,20 @@ printf 'state=ready\n'
     fn the_harness_invokes_with_the_agents_own_invocation_environment() {
         let scratch = tempfile::tempdir().unwrap();
         let hook = fixture(scratch.path(), "reports-env.sh", REPORTS_ENVIRONMENT);
-        let harness = Harness::new(scratch.path(), hook, Vec::new()).unwrap();
+        let harness = Harness::new(scratch.path(), hook, [FIXTURE_TIMEOUT; 2]).unwrap();
         let invocation = harness
             .invoke(
                 Operation::Inspect,
-                "1",
+                updated_contracts::reconciler::PROTOCOL,
                 updated_contracts::reconciler::attempt::FINGERPRINT,
                 Reason::Restart,
                 &harness.candidate,
-                &harness.predecessor,
             )
             .unwrap();
         assert!(invocation.succeeded(), "{}", invocation.stderr);
 
         let mut expected = Command::new("hook");
-        updated::reconciler::apply_environment(&mut expected);
+        updated::reconciler::configure_environment(&mut expected);
         let baseline = expected
             .get_envs()
             .find(|(name, _)| *name == OsStr::new("PATH"))

@@ -5,9 +5,7 @@
 # digest agreement. Network installs cannot disable provenance verification or select a mutable
 # release; an air-gapped operator establishes that trust before staging local artifacts.
 #
-# This role's whole job is the FIRST install — after it, every agent version and every workload
-# arrives through the fleet's own signed TUF channel. Re-running this role does not upgrade an
-# agent, and it is not meant to.
+# This role owns agent installation and upgrades. The signed TUF channel manages workloads.
 
 - name: Validate the enrollment identity was supplied
   # Fail on the play, not on a half-configured node: without these three the service starts,
@@ -229,9 +227,9 @@
       ansible.builtin.assert:
         that:
           - updated_archive_members.stdout_lines ==
-            ['updated-launcher', 'updated-agent', 'updated-agent.service']
+            ['updated-agent', 'updated-agent.service']
         fail_msg: >-
-          {{ updated_artifact }} must contain exactly updated-launcher, updated-agent, and
+          {{ updated_artifact }} must contain exactly updated-agent and
           updated-agent.service in that order. Refusing to extract unexpected paths as root.
 
     - name: Inspect the release archive member types
@@ -265,7 +263,6 @@
         path: "/var/cache/updated-install/archive/{{ item }}"
         follow: false
       loop:
-        - updated-launcher
         - updated-agent
         - updated-agent.service
       register: updated_archive_files
@@ -291,7 +288,6 @@
         group: root
         mode: "0755"
       loop:
-        - updated-launcher
         - updated-agent
 
     - name: Install the verified agent service
@@ -332,7 +328,7 @@
   no_log: true
   notify: Restart the updated agent
 
-- name: Write the launcher enrollment config
+- name: Write the agent enrollment config
   ansible.builtin.template:
     src: config.toml.j2
     dest: /etc/updated/config.toml

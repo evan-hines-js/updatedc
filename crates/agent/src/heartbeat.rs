@@ -27,7 +27,7 @@ pub(crate) struct Heartbeat {
     pub(crate) signing_key: Option<Vec<u8>>,
     /// Whether the report endpoint is currently refusing this node, and when to try again. A
     /// refusal is a standing verdict about identity (see [`telemetry::Refusal`]), so it paces the
-    /// writer down to the agent-check cadence instead of spending a request and a warning per cycle
+    /// writer down to a bounded retry cadence instead of spending a request and a warning per cycle
     /// on a report no reader could ever accept.
     pub(crate) refusal: telemetry::Refusal,
     pub(crate) outputs: telemetry::OutputPublisher,
@@ -61,7 +61,7 @@ pub(crate) struct Settlement {
 struct InstalledReleaseIdentity {
     version: String,
     archive_sha256: String,
-    provider_set_sha256: String,
+    definition_sha256: String,
     manifest_sha256: String,
 }
 
@@ -70,7 +70,7 @@ fn installed_release_identity(store: &Store) -> io::Result<InstalledReleaseIdent
         updated::state::Installed::Present(state) => InstalledReleaseIdentity {
             version: state.release.version,
             archive_sha256: state.archive_sha256,
-            provider_set_sha256: state.lifecycle.provider_set_sha256.clone(),
+            definition_sha256: state.reconciler.definition_sha256.clone(),
             manifest_sha256: state.release.manifest_sha256,
         },
         updated::state::Installed::Missing | updated::state::Installed::Invalid => {
@@ -89,11 +89,7 @@ pub(super) fn rejects_release(
     lineage: &updated::state::RepositoryLineage,
     assignment: &updated_contracts::assignment::RepositoryAssignment,
 ) -> bool {
-    store.rejects_deployment(
-        lineage,
-        &assignment.application.sha256,
-        &assignment.provider_set.sha256,
-    )
+    store.rejects_deployment(lineage, &assignment.application.sha256)
 }
 
 pub(crate) fn rejects_assigned_release(
@@ -154,16 +150,15 @@ impl Heartbeat {
                 control_base: self.control_base.as_deref(),
                 node: self.node.as_deref(),
                 signing_key: self.signing_key.as_deref(),
-                // The slowest cadence the agent already has, read fresh each cycle so an
-                // assignment that changes it moves the backoff with it.
-                refusal_backoff: opts.timeouts.agent_check_interval,
+                // A refused identity is retried on the signed refresh-retry cadence.
+                refusal_backoff: opts.timeouts.refresh_retry,
             },
             &telemetry::RunningState {
                 deployment: &document.deployment,
                 assignment_sha256: assignment.sha256(),
                 version: &installed.version,
                 archive_sha256: &installed.archive_sha256,
-                provider_set_sha256: &installed.provider_set_sha256,
+                definition_sha256: &installed.definition_sha256,
                 healthy,
                 updating: state.updating,
                 rejected,

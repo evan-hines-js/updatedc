@@ -5,8 +5,7 @@
 use crate::*;
 
 /// Reject the exact deployed unit of a *provisional* (never-health-proven) cold-installed head so
-/// the next boot's cold install descends via cold-install fallback past it. The application and provider
-/// remain independently reusable because a runtime health failure proves only their combination.
+/// the next boot's cold install descends via cold-install fallback past that exact signed package.
 ///
 /// Called only for a head [`boot::plan_gate_failure`] has already classified provisional: a head
 /// with a predecessor to revert to takes the revert path instead, and a confirmed head is never
@@ -15,11 +14,7 @@ pub(crate) fn reject_provisional_head(
     store: &mut Store,
     state: &updated::state::InstalledState,
 ) -> std::io::Result<()> {
-    store.reject_deployment(
-        &state.repository_lineage,
-        &state.archive_sha256,
-        &state.lifecycle.provider_set_sha256,
-    )?;
+    store.reject_deployment(&state.repository_lineage, &state.archive_sha256)?;
     warn(&format!(
         "provisional head {} never passed a health gate; rejected its exact deployment so the \
          next cold install descends via cold-install fallback",
@@ -31,7 +26,7 @@ pub(crate) fn reject_provisional_head(
 /// How many consecutive boots may fail to health-gate a crash-recovered rollback's predecessor
 /// before the agent settles on that exact predecessor and reports it unhealthy. More than one so a
 /// merely slow-to-start predecessor is not abandoned on its first miss; small so a genuinely broken
-/// predecessor cannot keep the node in a launcher restart loop.
+/// predecessor cannot keep the node in a service restart loop.
 pub(crate) const MAX_ROLLBACK_HEALTH_ATTEMPTS: u32 = 3;
 
 /// What a boot does after a crash-recovered rollback's predecessor fails its health gate.
@@ -48,47 +43,21 @@ pub(crate) enum RollbackHealthOutcome {
 
 /// Bound rollback-target health failures so a predecessor deployment that can no longer pass the gate
 /// cannot crash-loop the node forever. The failure count rides the journal (the very thing that
-/// re-derives the rollback on each boot, so it survives the launcher relaunch). Once it reaches
-/// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], this compensates the failed candidate through the release's
-/// own `rollback` — the agent promises reconciler authors that every `apply` it drives is
-/// compensated — and marks the rollback terminal. The caller then uses the same commit-and-clear
-/// path as every successful rollback. The exact previously confirmed predecessor remains selected;
-/// its current health is reported as unhealthy. Recovery never turns a failed direct update into an
-/// inferred walk through repository history.
+/// re-derives the rollback on each boot, so it survives the service restart). Once it reaches
+/// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], it marks the rollback terminal. Candidate compensation is an
+/// earlier durable barrier and is never coupled to predecessor health. The exact previously
+/// confirmed predecessor remains selected; its current health is reported as unhealthy. Recovery
+/// never turns a failed direct update into an inferred walk through repository history.
 ///
-/// The compensation is journaled before it is attempted, and the failure tally is the durable
-/// marker that makes it one shot rather than a relaunch loop: the boot that reaches the bound
-/// persists the count at exactly [`MAX_ROLLBACK_HEALTH_ATTEMPTS`] before invoking the hook, so a
-/// boot that finds the count already past the bound knows the previous attempt did not complete and
-/// settles without invoking it again instead of relaunching into it forever. Worst case, two boots.
-///
-/// Settlement advances only across the ordinary `RollbackApplied -> RolledBack` edge. It does not
+/// Settlement advances only across the ordinary `Restored -> RolledBack` edge. It does not
 /// manufacture a success verdict; the caller carries the failed health gate into telemetry.
 pub(crate) fn bound_unhealthy_rollback(
     store: &mut Store,
     tx: &mut Transaction,
-    compensate: &mut dyn FnMut(&Transaction) -> io::Result<()>,
 ) -> io::Result<RollbackHealthOutcome> {
     let failures = tx.record_rollback_health_failure()?;
     if failures >= MAX_ROLLBACK_HEALTH_ATTEMPTS {
-        if failures == MAX_ROLLBACK_HEALTH_ATTEMPTS {
-            // Journal the intent first, so a compensation that dies mid-flight is not re-attempted
-            // forever by the boots that follow.
-            persist_transaction(store, tx)?;
-            compensate(tx)?;
-            Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
-        } else {
-            warn(
-                "the failed candidate's rollback compensation was already attempted and did not \
-                 complete; settling on the exact predecessor without repeating it forever",
-            );
-            // Record the observation as its own state transition before moving the phase. Keeping
-            // one durable mutation per write lets the storage boundary reject skipped history
-            // without needing a special compound-transition escape hatch.
-            persist_transaction(store, tx)?;
-        }
-        // Conclude the rollback only after the compensation completed or its one durable attempt
-        // was consumed. There is no metadata-only finalize phase.
+        persist_transaction(store, tx)?;
         if tx.recovery_pending(TransactionPhase::RolledBack) {
             update::advance_transaction(store, tx, TransactionPhase::RolledBack)?;
         }
@@ -123,7 +92,7 @@ pub(crate) fn recovery_transaction(situation: &Situation) -> Option<Transaction>
             updated::transaction::Recovery::Committed => confirmation_window_rollback(situation),
             // Nothing was ever displaced (a pre-activation crash), or the rollback already ran to
             // completion. `reconcile_transaction` clears the journal and, for a finished rollback,
-            // commits the predecessor with zero lifecycle calls; synthesizing anything here would
+            // commits the predecessor with zero reconciler calls; synthesizing anything here would
             // re-run an already-completed rollback machine and double-invoke every hook.
             updated::transaction::Recovery::NeverSwapped => None,
         };
@@ -137,40 +106,40 @@ pub(crate) fn recovery_transaction(situation: &Situation) -> Option<Transaction>
 /// the operator's `rollback` for the candidate's machine-state changes.
 ///
 /// The rejection is NOT re-derived here: the boot that judged the candidate recorded it durably
-/// (see [`revert_unconfirmed_head`]) before the pointer ever moved.
+/// (see [`revert_guarded_head`]) before the pointer ever moved.
 pub(crate) fn confirmation_window_rollback(situation: &Situation) -> Option<Transaction> {
+    if !situation.predecessor_is_active() {
+        return None;
+    }
     let Installed::Present(installed) = &situation.installed else {
         return None;
     };
-    let pending = installed.pending.as_ref()?;
-    if situation.active.as_ref() != Some(&pending.previous_release) {
-        return None;
-    }
-    Some(rollback_of_unconfirmed(installed, pending, false))
+    let pending = installed.rollback_guard.as_ref()?;
+    Some(rollback_of_guarded(installed, pending, false))
 }
 
 /// The rollback transaction that reverts `installed` to the predecessor its `pending` names — the
 /// one shape both the boot gate's revert and the resumption of an interrupted one produce, so a
 /// revert that is decided in one boot and driven by the next cannot describe two different things.
-pub(crate) fn rollback_of_unconfirmed(
+pub(crate) fn rollback_of_guarded(
     installed: &updated::state::InstalledState,
-    pending: &Pending,
+    rollback_guard: &RollbackGuard,
     reject_candidate: bool,
 ) -> Transaction {
     Transaction {
-        id: pending.lifecycle_attempt_id.clone(),
-        previous_release: pending.previous_release.clone(),
-        previous_archive_sha256: pending.previous_archive_sha256.clone(),
-        previous_repository_lineage: pending.previous_repository_lineage.clone(),
+        id: rollback_guard.attempt_id.clone(),
+        previous_release: rollback_guard.previous_release.clone(),
+        previous_archive_sha256: rollback_guard.previous_archive_sha256.clone(),
+        previous_repository_lineage: rollback_guard.previous_repository_lineage.clone(),
         candidate_release: installed.release.clone(),
         candidate_archive_sha256: installed.archive_sha256.clone(),
-        candidate_rejection_sha256: pending.candidate_rejection_sha256.clone(),
+        candidate_rejection_sha256: rollback_guard.candidate_rejection_sha256.clone(),
         candidate_repository_lineage: installed.repository_lineage.clone(),
         candidate_rejection_required: reject_candidate,
-        previous_lifecycle: pending.lifecycle.clone(),
-        candidate_lifecycle: installed.lifecycle.clone(),
+        previous_reconciler: rollback_guard.reconciler.clone(),
+        candidate_reconciler: installed.reconciler.clone(),
         rollback_health_failures: 0,
-        phase: TransactionPhase::RollbackActivating,
+        phase: TransactionPhase::RollbackPlanned,
     }
 }
 
@@ -178,24 +147,33 @@ pub(crate) fn rollback_of_unconfirmed(
 /// rollback journal, and the candidate's rejection.
 ///
 /// Only the intent is written here — the rollback itself is boot recovery's, the single
-/// implementation — so this agent exits and the next boot restores the predecessor's pointer, runs
-/// its `apply`, gates it, and replays the compensating `rollback` from exactly this journal.
+/// implementation — so this agent exits and the next boot compensates the failed candidate, then
+/// restores, converges, and health-gates the predecessor from exactly this journal.
 ///
 /// `bytes_repaired` is the one thing that withholds the rejection. It is permanent and keyed by
 /// archive hash, so it may never be charged to bytes this same boot re-downloaded and re-verified:
 /// the gate then failed on a tree that no longer exists. The revert is owed either way — it is
 /// reversible — and a release that fails the gate again on the next boot, which finds the tree
 /// intact, is charged for it, so the descent still terminates.
-pub(crate) fn revert_unconfirmed_head(
+pub(crate) fn revert_guarded_head(
     store: &mut Store,
     installed: &updated::state::InstalledState,
     bytes_repaired: bool,
 ) -> io::Result<()> {
     let pending = installed
-        .pending
+        .rollback_guard
         .as_ref()
-        .expect("an unconfirmed head has a pending record");
-    let tx = rollback_of_unconfirmed(installed, pending, !bytes_repaired);
+        .expect("a guarded head has a rollback guard");
+    let tx = rollback_of_guarded(installed, pending, !bytes_repaired);
+    // A completed forward journal may survive cleanup. Retire that spent record before
+    // starting the guard's rollback; its terminal phase cannot be rewritten backwards.
+    if let Some(journal) = store.journal()? {
+        if boot::journal_recovery(&journal, store.active_release()?.as_ref(), Some(installed))
+            == updated::transaction::Recovery::Committed
+        {
+            store.clear_journal()?;
+        }
+    }
     warn(&format!(
         "release {} failed its boot health gate inside its confirmation window; reverting to {}",
         installed.release.version, pending.previous_release.version
@@ -205,24 +183,53 @@ pub(crate) fn revert_unconfirmed_head(
         store.reject_deployment(
             &tx.candidate_repository_lineage,
             &tx.candidate_archive_sha256,
-            &tx.candidate_lifecycle.provider_set_sha256,
         )?;
     }
     Ok(())
 }
 
-/// Converge the machine onto the restored predecessor during a rollback recovery.
+/// Compensate the failed candidate before any predecessor state is restored. The operation is
+/// bound to the candidate's own reconciler and payload; once this barrier is durable, recovery
+/// never invokes it again and can safely move on to predecessor convergence.
+pub(crate) fn complete_candidate_compensation(
+    opts: &Options,
+    store: &mut Store,
+    recovery: Option<&mut Transaction>,
+) -> io::Result<updated_contracts::reconciler::HostAction> {
+    let Some(tx) = recovery else {
+        return Ok(updated_contracts::reconciler::HostAction::None);
+    };
+    if !tx.recovery_pending(TransactionPhase::CandidateCompensated) {
+        return Ok(updated_contracts::reconciler::HostAction::None);
+    }
+    let result = run_reconciler_mutation(
+        tx.candidate_reconciler.as_ref(),
+        opts,
+        MutationOperation::Rollback,
+        ReconcilerInvocation {
+            reason: Reason::Update,
+            id: &tx.rollback_attempt_id(),
+            candidate: ReleaseTarget {
+                release: &tx.candidate_release,
+                archive_sha256: &tx.candidate_archive_sha256,
+            },
+            predecessor: ReleaseTarget {
+                release: &tx.previous_release,
+                archive_sha256: &tx.previous_archive_sha256,
+            },
+        },
+        None,
+    )?;
+    Chaos::from_env().crossing(update::boundary::CANDIDATE_ROLLBACK_FINISHED);
+    advance_transaction(store, tx, TransactionPhase::CandidateCompensated)?;
+    Ok(result.host_action())
+}
+
+/// Verify the restored predecessor and replay its output evidence during rollback recovery.
 ///
-/// The boot converge is the committed release's `apply` and never runs during recovery, so this is
-/// the only thing that starts the predecessor's workload. An incomplete rollback owes a converged
-/// predecessor until it reaches `RolledBack` — not merely one historical `apply` — because a machine
-/// reboot (rather than an agent kill) at any later rollback phase leaves the predecessor's workload
-/// stopped and the boot gate would then fail a perfectly healthy release. The `apply` is idempotent
-/// by the Execution contract, so replaying it on every resume boot is exactly the right semantics.
-///
-/// It runs under the transaction's compensating attempt identity, never the forward one: the
-/// forward switchover already invoked `apply` under `tx.id` with the *candidate* as `--candidate`,
-/// and a reconciler that keys completion on the attempt id would otherwise skip this one.
+/// The compensating attempt tells the native runtime to check actual predecessor health without
+/// rerunning its deployment command. The candidate's explicit recovery procedure owns restoration;
+/// lost health after a machine reboot requires attention rather than an implicit migration replay.
 pub(crate) fn complete_recovery_activation(
     opts: &Options,
     store: &mut Store,
@@ -234,13 +241,12 @@ pub(crate) fn complete_recovery_activation(
     if !tx.recovery_pending(TransactionPhase::RolledBack) {
         return Ok(updated_contracts::reconciler::HostAction::None);
     }
-    // Restore the predecessor's machine state through the same reconciler operation used for the
-    // candidate — the predecessor's own `apply`, which is what re-converges whatever it owns.
-    let result = run_lifecycle_mutation(
-        tx.previous_lifecycle.as_ref(),
+    // The native runtime interprets this compensating converge as predecessor verification.
+    let result = run_reconciler_mutation(
+        tx.previous_reconciler.as_ref(),
         opts,
-        MutationOperation::Apply,
-        LifecycleInvocation {
+        MutationOperation::Converge,
+        ReconcilerInvocation {
             reason: Reason::Update,
             id: &tx.rollback_attempt_id(),
             candidate: ReleaseTarget {
@@ -252,28 +258,19 @@ pub(crate) fn complete_recovery_activation(
                 archive_sha256: &tx.candidate_archive_sha256,
             },
         },
+        None,
     )?;
-    if result.host_action() == updated_contracts::reconciler::HostAction::Reboot {
-        return Ok(result.host_action());
+    Chaos::from_env().crossing(update::boundary::PREDECESSOR_CONVERGE_FINISHED);
+    if tx.recovery_pending(TransactionPhase::Restored) {
+        advance_transaction(store, tx, TransactionPhase::Restored)?;
     }
-    Chaos::from_env().crossing(update::boundary::PREDECESSOR_LIFECYCLE_APPLIED);
-    if tx.recovery_pending(TransactionPhase::RollbackApplied) {
-        advance_transaction(store, tx, TransactionPhase::RollbackApplied)?;
-    }
-    Ok(updated_contracts::reconciler::HostAction::None)
+    Ok(result.host_action())
 }
 
 // ============================== boot: gather + execute ==============================
 
-/// Read the whole world the boot planner needs — durable state via the [`Store`] and the
-/// launcher's rejection marker, already claimed into [`launcher::Evidence`] — into one
-/// [`Situation`]. The shell's single point of input gathering. Reading evidence leaves it on disk;
-/// the boot path clears the claim only once the intent it implies is durable.
-pub(crate) fn gather_situation(
-    opts: &Options,
-    store: &Store,
-    evidence: &launcher::Evidence,
-) -> io::Result<Situation> {
+/// Read the durable state the boot planner needs into one [`Situation`].
+pub(crate) fn gather_situation(store: &Store) -> io::Result<Situation> {
     let active = store.active_release()?;
     let installed = store.installed()?;
     let journal = store.journal()?;
@@ -281,9 +278,6 @@ pub(crate) fn gather_situation(
         installed,
         active,
         journal,
-        bad_agent: evidence.rejected_agent().map(PathBuf::from),
-        confirm_window: opts.timeouts.confirmation_window,
-        now: now_unix(),
     })
 }
 
@@ -292,50 +286,22 @@ pub(crate) fn gather_situation(
 pub(crate) fn execute_boot_plan(
     plan: &Plan,
     store: &mut Store,
-    self_update: &mut SelfUpdateState,
     defer_commit: bool,
     recovery: Option<&mut Transaction>,
-    evidence: &mut launcher::Evidence,
-) -> io::Result<Option<Pending>> {
-    let activate_release = recovery
-        .as_ref()
-        .is_none_or(|tx| tx.recovery_pending(TransactionPhase::RollbackApplied));
-    apply_store_plan(plan, store, defer_commit, activate_release)?;
+) -> io::Result<Option<RollbackGuard>> {
+    let activate_release = recovery.as_ref().is_none_or(|tx| {
+        !tx.recovery_pending(TransactionPhase::CandidateCompensated)
+            && tx.recovery_pending(TransactionPhase::Restored)
+    });
+    execute_store_plan(plan, store, defer_commit, activate_release)?;
     if activate_release && !matches!(plan.release, ReleaseFix::None) {
-        Chaos::from_env().crossing(update::boundary::PREDECESSOR_POINTER_APPLIED);
+        Chaos::from_env().crossing(update::boundary::PREDECESSOR_POINTER_MOVED);
     }
-    if let Some(path) = &plan.reject_agent {
-        // Fallible on purpose, and cleared only here: a rejection that failed to reach disk must
-        // not be mistaken for a durable one. If the write fails this boot fails with the marker
-        // intact, so the next boot rejects the same candidate instead of re-staging it forever.
-        //
-        // With one exception, which is the marker module's own stated invariant: bytes that are not
-        // a content-addressed `agents/<hash>/<binary>` path — a stray write, a truncated or
-        // partially restored file — name no hash to suppress and are not evidence about any
-        // candidate. Failing the boot on them would fail identically on every subsequent boot (the
-        // marker is only ever cleared here), leaving the node permanently unbootable, so they are
-        // discarded with a warning and the marker is cleared.
-        //
-        // The shape is decided HERE, before the write is attempted, and `reject_candidate` takes
-        // the extracted hash rather than re-deriving it: a failing write reports `InvalidInput`
-        // for a bad key too, so classifying the error afterwards would make "malformed marker"
-        // and "the rejection did not reach disk" the same test.
-        if let Some(hash) = rejected_agent_hash(path) {
-            self_update.reject_candidate(hash)?;
-        } else {
-            warn(&format!(
-                "discarding an unusable rejected-agent marker: {} is not a content-addressed \
-                 agents/<hash>/<binary> path and names no candidate to suppress",
-                path.display()
-            ));
-        }
-        evidence.clear_rejected_agent()?;
-    }
-    installed_pending(store)
+    installed_rollback_guard(store)
 }
 
-/// Apply the durable half of a boot [`Plan`] to the [`Store`].
-pub(crate) fn apply_store_plan(
+/// Converge the durable half of a boot [`Plan`] to the [`Store`].
+pub(crate) fn execute_store_plan(
     plan: &Plan,
     store: &mut Store,
     defer_commit: bool,
@@ -363,28 +329,15 @@ pub(crate) fn apply_store_plan(
     Ok(())
 }
 
-/// The candidate hash a rejected-agent marker names, or `None` when the marker's bytes are
-/// not a content-addressed `agents/<hash>/<binary>` path.
-///
-/// The one place that extraction happens; the hash it yields is what `reject_candidate` records.
-/// It applies the very predicate `Rejections::reject` validates with — [`updated::reject::is_rejection_key`],
-/// called rather than restated — so this accepts exactly the markers that path would accept
-/// however that grammar moves. Every marker it turns down would have failed there with no hash
-/// recorded anyway.
-pub(crate) fn rejected_agent_hash(path: &std::path::Path) -> Option<&str> {
-    let hash = path.parent()?.file_name()?.to_str()?;
-    updated::reject::is_rejection_key(hash).then_some(hash)
-}
-
 /// The unconfirmed update recorded in the installed state, if any.
-pub(crate) fn installed_pending(store: &Store) -> io::Result<Option<Pending>> {
+pub(crate) fn installed_rollback_guard(store: &Store) -> io::Result<Option<RollbackGuard>> {
     Ok(match store.installed()? {
-        Installed::Present(s) => s.pending,
+        Installed::Present(s) => s.rollback_guard,
         Installed::Missing | Installed::Invalid => None,
     })
 }
 
-/// Run one steady-state probe against the committed release and the lifecycle provider that must
+/// Run one steady-state probe against the committed release and the reconciler that must
 /// invoke it, read together from the one installed record.
 ///
 /// The record is read here, inside the call, and `probe` only ever *borrows* what it names — so a
@@ -397,13 +350,13 @@ pub(crate) fn installed_pending(store: &Store) -> io::Result<Option<Pending>> {
 /// release was serving perfectly well reported itself unready and was drained out of rotation.
 pub(crate) fn probe_steady_target<T>(
     store: &Store,
-    probe: impl FnOnce(&updated::bundle::ReleaseId, &str, &updated::state::ProviderRelease) -> T,
+    probe: impl FnOnce(&updated::bundle::ReleaseId, &str, &updated::state::ReconcilerRelease) -> T,
 ) -> io::Result<T> {
     match store.installed()? {
         Installed::Present(state) => Ok(probe(
             &state.release,
             &state.archive_sha256,
-            &state.lifecycle,
+            &state.reconciler,
         )),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -415,10 +368,10 @@ pub(crate) fn probe_steady_target<T>(
 /// Confirm the current update by clearing its pending record.
 /// Returns `true` only once the confirmation is durable, so callers must keep their
 /// in-memory pending intent (and continue suppressing updates) after a write failure.
-pub(crate) fn confirm_update(store: &mut Store) -> bool {
+pub(crate) fn disarm_update_rollback(store: &mut Store) -> bool {
     match store.installed() {
         Ok(Installed::Present(mut st)) => {
-            if !st.settle_update() {
+            if !st.disarm_rollback() {
                 return true;
             }
             if let Err(e) = store.commit_installed(&st) {
@@ -457,20 +410,17 @@ mod confirmation_tests {
             repository_lineage: lineage(),
             release: release("2.0.0", "candidate"),
             archive_sha256: digest("candidate-archive"),
-            lifecycle: provider(),
-            pending: Some(updated::state::Pending {
-                lifecycle_attempt_id: digest("attempt"),
-                candidate_rejection_sha256: deployment_rejection(
-                    &digest("candidate-archive"),
-                    &provider().provider_set_sha256,
-                ),
+            reconciler: provider(),
+            rollback_guard: Some(updated::state::RollbackGuard {
+                attempt_id: digest("attempt"),
+                candidate_rejection_sha256: deployment_rejection(&digest("candidate-archive")),
                 previous_release: release("1.0.0", "predecessor"),
                 previous_archive_sha256: digest("predecessor-archive"),
                 previous_repository_lineage: lineage(),
-                lifecycle: provider(),
+                reconciler: provider(),
                 committed_at: 1,
             }),
-            confirmed: true,
+            maturity: Maturity::Proven,
         }
     }
 
@@ -483,18 +433,18 @@ mod confirmation_tests {
             ..Default::default()
         });
 
-        assert!(confirm_update(&mut store));
+        assert!(disarm_update_rollback(&mut store));
         assert!(matches!(
             store.installed().unwrap(),
-            Installed::Present(state) if state.pending.is_none()
+            Installed::Present(state) if state.rollback_guard.is_none()
         ));
 
         store.memory_backend_mut().installed = None;
-        assert!(!confirm_update(&mut store));
+        assert!(!disarm_update_rollback(&mut store));
 
         let mut corrupt = unconfirmed_update();
         corrupt.archive_sha256 = "not-a-digest".into();
         store.memory_backend_mut().installed = Some(corrupt);
-        assert!(!confirm_update(&mut store));
+        assert!(!disarm_update_rollback(&mut store));
     }
 }

@@ -14,20 +14,23 @@
 //! target bytes — lives in [`updated-tuf`](../updated_tuf/index.html) on top of
 //! TUF. This crate is everything that happens *after* verified bytes are staged
 //! on disk, plus the small OS glue the agent needs. Application process
-//! ownership and boot-safe identity now live in the launcher (`launcher`), not here.
+//! ownership lives in release reconciler hooks; persistent node identity lives in agent state.
 
 pub mod bundle;
+pub mod bundle_store;
+pub mod command_adapter;
 pub mod config;
 pub mod csr;
 pub mod enrollment;
 pub mod env;
 pub mod gc;
 pub mod hash;
+pub mod helper;
 pub mod http;
 pub mod install;
 pub mod journal;
 pub mod lock;
-pub mod provider;
+pub mod native_runtime;
 pub mod rand;
 pub mod reconciler;
 pub mod reject;

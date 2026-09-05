@@ -345,9 +345,8 @@ The controller's PVC carries `helm.sh/resource-policy: keep`: it holds TUF versi
 state, and a repository that restarts its version counter is one clients reject.
 
 Note that the in-cluster control plane upgrades by image, through Helm — unlike an agent, which
-updates itself through the fleet's own signed TUF channel. Both are the same mechanism applied to
-different units: a container image here, a signed tarball there. If you run the control plane on a
-host rather than in Kubernetes, publish it into a channel and it self-updates like anything else.
+is upgraded through an ordinary container image rollout. If you run the control plane on a host
+rather than in Kubernetes, upgrade it through that host's package or service deployment mechanism.
 
 ## The load balancer
 

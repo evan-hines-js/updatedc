@@ -9,7 +9,7 @@
 //! [`digests_match`] is the only way to come to a verdict about two.
 //!
 //! The purely lexical half of the rule ("what does a digest look like") lives lower still, in
-//! `foundation`, because the permanent launcher must apply it without linking a crypto library.
+//! `foundation`, so low-level filesystem users can apply it without linking a crypto library.
 //! [`is_canonical_sha256`] is re-exported here so callers have one name for it.
 
 use aws_lc_rs::digest::{digest, Context, SHA256};
@@ -56,26 +56,15 @@ pub fn digests_match(got: &str, expected: &str) -> bool {
     is_canonical_sha256(got) && is_canonical_sha256(expected) && got == expected
 }
 
-/// The rejection identity of one exact application/provider deployment.
+/// The runtime rejection identity of one exact signed package.
 ///
-/// Runtime health and lifecycle failures can be evidence about the interaction between the two
-/// artifacts rather than either artifact in isolation. Hashing the pair under a fixed domain lets
-/// rejection skip that exact deployed unit without poisoning an application that may work with a
-/// different provider, or a provider that may work with a different application. Inputs must
-/// already use the canonical digest grammar; malformed durable identities cannot be normalized
-/// into a new, apparently valid rejection key.
-pub fn deployment_rejection_sha256(
-    application_sha256: &str,
-    provider_set_sha256: &str,
-) -> Option<String> {
-    if !is_canonical_sha256(application_sha256) || !is_canonical_sha256(provider_set_sha256) {
-        return None;
-    }
-    let mut hasher = Sha256Hasher::new();
-    hasher.update(b"updated.dev/deployment-rejection/v1\0");
-    hasher.update(application_sha256.as_bytes());
-    hasher.update(provider_set_sha256.as_bytes());
-    Some(hasher.finish_hex())
+/// Domain separation distinguishes lifecycle/health failures from malformed archive bytes.
+/// The package binds the customer's entrypoint, configuration, and payload together. Inputs must
+/// already use the canonical digest grammar; malformed durable identities cannot become a new,
+/// apparently valid rejection key.
+pub fn deployment_rejection_sha256(application_sha256: &str) -> Option<String> {
+    crate::is_canonical_sha256(application_sha256)
+        .then(|| sha256_bytes(format!("updated-package-rejection:{application_sha256}").as_bytes()))
 }
 
 #[cfg(test)]
@@ -103,22 +92,5 @@ mod tests {
         assert!(!digests_match(&digest, &digest.to_uppercase()));
         assert!(!digests_match(&digest, &"0".repeat(64)));
         assert!(!digests_match("", ""));
-    }
-
-    #[test]
-    fn deployment_rejections_are_domain_separated_ordered_pairs() {
-        let application = sha256_bytes(b"application");
-        let provider = sha256_bytes(b"provider set");
-        let deployment = deployment_rejection_sha256(&application, &provider).unwrap();
-
-        assert!(is_canonical_sha256(&deployment));
-        assert_ne!(deployment, application);
-        assert_ne!(deployment, provider);
-        assert_ne!(
-            deployment,
-            deployment_rejection_sha256(&provider, &application).unwrap()
-        );
-        assert!(deployment_rejection_sha256(&application.to_uppercase(), &provider).is_none());
-        assert!(deployment_rejection_sha256(&application, "not-a-digest").is_none());
     }
 }

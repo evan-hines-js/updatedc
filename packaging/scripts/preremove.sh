@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stop the launcher only on a real removal, never on the remove half of an upgrade — postinstall
+# Stop the agent only on a real removal, never on the remove half of an upgrade — postinstall
 # restarts it there, and stopping it twice needlessly widens the window with no supervisor.
 set -e
 

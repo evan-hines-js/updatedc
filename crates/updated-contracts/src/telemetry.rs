@@ -33,7 +33,7 @@ pub const REPORT_FRESHNESS: Duration = Duration::from_secs(60);
 
 /// How much later than its assigned check interval a node's heartbeat can land: the agent
 /// spreads each next check by this much, so consecutive reports are up to 1.2x the interval apart.
-/// Public because the agent schedules against it — the spread a node actually applies and the
+/// Public because the agent schedules against it — the spread a node actually converges and the
 /// spread [`MAX_CHECK_INTERVAL_SECONDS`] budgets for are then the same number, not two literals
 /// that agree today.
 pub const REPORT_CADENCE_JITTER_PERCENT: u32 = 20;
@@ -276,6 +276,11 @@ impl Fingerprint {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<crate::attention::Attention>,
+    /// Absent means unreported, never inferred from the agent's package version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper: Option<crate::helper::Support>,
     pub schema: u32,
     /// The node identity this report is for (matches the selected `UpdateAgent`).
     pub node: crate::identity::ResourceName,
@@ -312,11 +317,10 @@ pub struct NodeReport {
     /// Empty only before the first install completes, matching [`NodeReport::version`]. Any
     /// other non-`is_canonical_sha256` value is malformed and fails the trust gate closed.
     pub archive_sha256: String,
-    /// SHA-256 of the signed provider-set document whose reconciler is actually installed.
-    /// Application bytes and their lifecycle provider are one deployed unit; reporting both keeps
-    /// a provider-only assignment from looking settled while the node still runs the old hooks.
+    /// SHA-256 of the signed package execution definition whose reconciler is actually installed.
+    /// This binds execution audit and fingerprint evidence to the installed package.
     /// Empty only before the first install, alongside [`NodeReport::archive_sha256`].
-    pub provider_set_sha256: String,
+    pub definition_sha256: String,
     /// Whether the node has *settled* on that deployment: it has finished acting on the
     /// assignment (installed and confirmed it, or attempted and rolled back from it) and
     /// its running app is healthy. A node with an unconfirmed update still in flight reports
@@ -395,17 +399,19 @@ impl NodeReport {
         assignment_sha256: impl Into<String>,
         version: impl Into<String>,
         archive_sha256: impl Into<String>,
-        provider_set_sha256: impl Into<String>,
+        definition_sha256: impl Into<String>,
         healthy: bool,
     ) -> Result<Self, crate::identity::ResourceNameError> {
         Ok(Self {
             schema: Self::SCHEMA,
+            helper: None,
+            attention: None,
             node: crate::identity::ResourceName::new(node)?,
             deployment: deployment.into(),
             assignment_sha256: assignment_sha256.into(),
             version: version.into(),
             archive_sha256: archive_sha256.into(),
-            provider_set_sha256: provider_set_sha256.into(),
+            definition_sha256: definition_sha256.into(),
             healthy,
             updating: false,
             rejected: false,
@@ -442,6 +448,20 @@ impl NodeReport {
     /// structural predicate; the producer uses the reason only to make a fail-closed omission
     /// actionable instead of logging an opaque "malformed" warning.
     fn shape_error(&self) -> Option<&'static str> {
+        if self
+            .attention
+            .as_ref()
+            .is_some_and(|record| self.healthy || record.validate().is_err())
+        {
+            return Some("invalid operator attention report");
+        }
+        if self
+            .helper
+            .as_ref()
+            .is_some_and(|helper| !helper.is_valid())
+        {
+            return Some("invalid helper capability report");
+        }
         if self.schema != Self::SCHEMA {
             return Some("unknown schema");
         }
@@ -457,8 +477,8 @@ impl NodeReport {
         if !self.version.is_empty() && !crate::identity::is_release_version(&self.version) {
             return Some("invalid release version");
         }
-        if self.archive_sha256.is_empty() != self.provider_set_sha256.is_empty() {
-            return Some("archive and provider-set identity are incomplete");
+        if self.archive_sha256.is_empty() != self.definition_sha256.is_empty() {
+            return Some("archive and execution identity are incomplete");
         }
         if self.healthy && self.archive_sha256.is_empty() {
             return Some("healthy report has no installed release");
@@ -469,10 +489,10 @@ impl NodeReport {
         if !self.archive_sha256.is_empty() && !crate::is_canonical_sha256(&self.archive_sha256) {
             return Some("invalid archive digest");
         }
-        if !self.provider_set_sha256.is_empty()
-            && !crate::is_canonical_sha256(&self.provider_set_sha256)
+        if !self.definition_sha256.is_empty()
+            && !crate::is_canonical_sha256(&self.definition_sha256)
         {
-            return Some("invalid provider-set digest");
+            return Some("invalid execution definition digest");
         }
         if !self.assignment_sha256.is_empty()
             && !crate::is_canonical_sha256(&self.assignment_sha256)
@@ -497,7 +517,7 @@ impl NodeReport {
             return Some("unhealthy report carries healthy-only evidence");
         }
         match &self.reconciliation {
-            None if self.version.is_empty() => None,
+            None if self.version.is_empty() || self.attention.is_some() => None,
             None => Some("installed release has no reconciliation evidence"),
             Some(_) if self.version.is_empty() => {
                 Some("reconciliation evidence has no installed release")
@@ -505,7 +525,7 @@ impl NodeReport {
             Some(record)
                 if record.candidate().version() != self.version
                     || record.candidate().archive_sha256() != self.archive_sha256
-                    || record.reconciler().provider_set_sha256() != self.provider_set_sha256 =>
+                    || record.reconciler().definition_sha256() != self.definition_sha256 =>
             {
                 Some("reconciliation evidence names a different release")
             }
@@ -534,18 +554,12 @@ impl NodeReport {
     /// application archive, and its provider set, and excludes a standing rejection of that
     /// assignment. Rollout settlement and dataflow admission share this predicate so neither can
     /// mistake a healthy predecessor for the desired release.
-    pub fn is_converged_to(
-        &self,
-        assignment_sha256: &str,
-        archive_sha256: &str,
-        provider_set_sha256: &str,
-    ) -> bool {
+    pub fn is_converged_to(&self, assignment_sha256: &str, archive_sha256: &str) -> bool {
         self.is_wellformed()
             && self.healthy
             && !self.rejected
             && self.assignment_sha256 == assignment_sha256
             && self.archive_sha256 == archive_sha256
-            && self.provider_set_sha256 == provider_set_sha256
     }
 }
 
@@ -669,7 +683,7 @@ impl ReportStoredAt {
 /// Returns an opaque accepted report only when the body fits [`MAX_REPORT_ENVELOPE_BYTES`], is an envelope
 /// of the report payload type, carries one to [`Envelope::MAX_SIGNATURES`] signatures, and decodes
 /// to a report that is well formed
-/// (which includes the exact current schema — the same fail-closed predicate every reader applies,
+/// (which includes the exact current schema — the same fail-closed predicate every reader converges,
 /// so a record no reader can use is never stored), and names `node` — the node the caller
 /// is filing it under. The signature is deliberately NOT
 /// verified here, and this is the only function that decodes a payload without checking it: a writer
@@ -1252,7 +1266,7 @@ impl FleetShardUpdate {
     }
 }
 
-/// The bounded ingress form of [`FleetReports`]. It applies the same identity hash, exact encoded
+/// The bounded ingress form of [`FleetReports`]. It converges the same identity hash, exact encoded
 /// entry accounting, per-shard byte ceiling, and receiver-acceptance eviction order as persisted
 /// shards. A gateway therefore cannot exceed its configured serialized report budget in the gap
 /// before a flush and cannot disagree with the writer about which entries fit.
@@ -1467,23 +1481,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let reconciler_release = crate::reconciler::ReconciledRelease::new(
-            "3.0.0".into(),
-            DIGEST.into(),
-            OTHER_DIGEST.into(),
-        )
-        .unwrap();
         crate::reconciler::LastReconciliation::new(
-            crate::reconciler::MutationOperation::Apply,
+            crate::reconciler::MutationOperation::Converge,
             crate::reconciler::Reason::Update,
             "a".repeat(64),
             transition,
-            crate::reconciler::ReconcilerIdentity::new(
-                DIGEST.into(),
-                "system".into(),
-                reconciler_release,
-            )
-            .unwrap(),
+            crate::reconciler::ReconcilerIdentity::new(DIGEST.into(), "system".into(), 1).unwrap(),
             crate::reconciler::SuccessfulMutation::new(
                 true,
                 crate::reconciler::HostAction::Reboot,
@@ -1581,24 +1584,23 @@ mod tests {
             .expect("a rollback reports both the restored release health and the rejection");
         assert!(report.healthy);
         assert!(report.rejected);
-        assert!(!report.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
+        assert!(!report.is_converged_to(OTHER_DIGEST, DIGEST));
     }
 
     #[test]
-    fn exact_convergence_has_one_assignment_release_and_provider_predicate() {
+    fn exact_convergence_has_one_assignment_and_package_predicate() {
         let report = report();
-        assert!(report.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
-        assert!(!report.is_converged_to(DIGEST, DIGEST, DIGEST));
-        assert!(!report.is_converged_to(OTHER_DIGEST, OTHER_DIGEST, DIGEST));
-        assert!(!report.is_converged_to(OTHER_DIGEST, DIGEST, OTHER_DIGEST));
+        assert!(report.is_converged_to(OTHER_DIGEST, DIGEST));
+        assert!(!report.is_converged_to(DIGEST, DIGEST));
+        assert!(!report.is_converged_to(OTHER_DIGEST, OTHER_DIGEST));
 
         let mut unhealthy = report.clone();
         unhealthy.healthy = false;
-        assert!(!unhealthy.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
+        assert!(!unhealthy.is_converged_to(OTHER_DIGEST, DIGEST));
 
         let mut rejected = report;
         rejected.rejected = true;
-        assert!(!rejected.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
+        assert!(!rejected.is_converged_to(OTHER_DIGEST, DIGEST));
     }
 
     #[test]
@@ -1624,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn an_installed_report_must_bind_reconciliation_to_its_running_bytes_and_provider_set() {
+    fn an_installed_report_must_bind_reconciliation_to_its_package_and_execution() {
         for mutate in [
             (|report: &mut serde_json::Value| {
                 report["reconciliation"] = serde_json::Value::Null;
@@ -1634,7 +1636,7 @@ mod tests {
                     serde_json::json!(OTHER_DIGEST);
             },
             |report| {
-                report["reconciliation"]["reconciler"]["providerSetSha256"] =
+                report["reconciliation"]["reconciler"]["definitionSha256"] =
                     serde_json::json!(OTHER_DIGEST);
             },
         ] {
@@ -1904,7 +1906,7 @@ mod tests {
                 "a digest a reader cannot join on must fail the gate: {malformed}"
             );
         }
-        let (envelope, point) = signed_unchecked(|r| r.provider_set_sha256 = "not-a-digest".into());
+        let (envelope, point) = signed_unchecked(|r| r.definition_sha256 = "not-a-digest".into());
         assert!(
             fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
             "the provider half of the running identity must fail closed too"
@@ -1953,7 +1955,7 @@ mod tests {
         let (envelope, point) = signed(|r| {
             r.version = String::new();
             r.archive_sha256 = String::new();
-            r.provider_set_sha256 = String::new();
+            r.definition_sha256 = String::new();
             r.reconciliation = None;
             r.healthy = false;
         });
@@ -1961,7 +1963,7 @@ mod tests {
         let report = fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).unwrap();
         assert!(report.version.is_empty());
         assert!(report.archive_sha256.is_empty());
-        assert!(report.provider_set_sha256.is_empty());
+        assert!(report.definition_sha256.is_empty());
     }
 
     #[test]
@@ -2003,6 +2005,30 @@ mod tests {
         bloated.payload = "A".repeat(MAX_REPORT_ENVELOPE_BYTES + 1);
         let error = encode_report_envelope(&bloated).expect_err("over the ceiling");
         assert!(error.contains("node report envelope"), "{error}");
+    }
+
+    #[test]
+    fn attention_is_authenticated_but_cannot_claim_health_or_successful_convergence() {
+        let (pkcs8, public) = keypair();
+        let mut report = report();
+        report.healthy = false;
+        report.reconciliation = None;
+        report.attention = Some(crate::attention::Attention {
+            product: "app".into(),
+            receipt: DIGEST.into(),
+            operation: crate::reconciler::MutationOperation::Converge,
+            attempt: OTHER_DIGEST.into(),
+            version: "3.0.0".into(),
+            message: "verify migration completion".into(),
+        });
+        let envelope = encoded_envelope(&report, &pkcs8);
+        let accepted = fresh_report_fixture(&envelope, "agent-9", &public, now_ms()).unwrap();
+        assert_eq!(accepted.attention, report.attention);
+        report.healthy = true;
+        assert!(encode_signed_report(&report, &pkcs8).is_err());
+        report.healthy = false;
+        report.output_sha256 = Some(DIGEST.into());
+        assert!(encode_signed_report(&report, &pkcs8).is_err());
     }
 
     #[test]

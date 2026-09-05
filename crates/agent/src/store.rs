@@ -128,71 +128,53 @@ impl Store {
         }
     }
 
+    fn rejection_is_durable(&self, lineage: &RepositoryLineage, digest: &str) -> bool {
+        let Ok(key) = Self::rejection_key(lineage, digest) else {
+            return false;
+        };
+        match &self.backend {
+            Backend::File { rejected, .. } => rejected.is_durably_rejected(&key),
+            #[cfg(test)]
+            Backend::Memory(memory) => !memory.rejections_dirty && memory.rejected.contains(&key),
+        }
+    }
+
     /// Whether any durable verdict excludes this exact deployed unit.
     ///
-    /// The application archive and provider-set document keep their own content verdicts because
-    /// a structurally invalid artifact is unusable everywhere. Runtime failures may instead reject
-    /// only the domain-separated pair. Every selector, diagnostic, heartbeat, and fallback gate
-    /// asks this method so those three identities cannot drift into different never-retry rules.
+    /// Malformed archive bytes and runtime failures use distinct rejection domains for the same
+    /// signed package. Every selector, diagnostic, heartbeat, and fallback gate asks this method
+    /// so those identities cannot drift into different never-retry rules.
     pub(crate) fn rejects_deployment(
         &self,
         lineage: &RepositoryLineage,
         application_sha256: &str,
-        provider_set_sha256: &str,
     ) -> bool {
         self.is_rejected(lineage, application_sha256)
-            || self.is_rejected(lineage, provider_set_sha256)
-            || updated_contracts::digest::deployment_rejection_sha256(
-                application_sha256,
-                provider_set_sha256,
-            )
-            .is_none_or(|deployment| self.is_rejected(lineage, &deployment))
+            || updated_contracts::digest::deployment_rejection_sha256(application_sha256)
+                .is_none_or(|digest| self.is_rejected(lineage, &digest))
     }
 
-    /// The selector-facing form of [`Store::rejects_deployment`]. A provider is absent only when
-    /// repairing the already-committed application archive, so that operation asks solely about
-    /// direct application evidence. Every ordinary selection supplies a provider and therefore
-    /// consumes the complete deployed-unit rule.
-    pub(crate) fn rejects_selection(
-        &self,
-        lineage: &RepositoryLineage,
-        application_sha256: &str,
-        provider_set_sha256: Option<&str>,
-    ) -> bool {
-        provider_set_sha256.map_or_else(
-            || self.is_rejected(lineage, application_sha256),
-            |provider_set_sha256| {
-                self.rejects_deployment(lineage, application_sha256, provider_set_sha256)
-            },
-        )
-    }
-
-    /// Persist runtime evidence against the exact application/provider combination that failed.
-    /// Structurally invalid individual artifacts still use [`Store::reject`] directly; a health
-    /// failure cannot prove either reusable artifact bad in isolation.
+    /// Persist runtime evidence against the exact signed package that failed.
+    /// Structurally invalid archives still use [`Store::reject_artifact`] directly.
     pub(crate) fn reject_deployment(
         &mut self,
         lineage: &RepositoryLineage,
         application_sha256: &str,
-        provider_set_sha256: &str,
     ) -> io::Result<()> {
-        let digest = updated_contracts::digest::deployment_rejection_sha256(
-            application_sha256,
-            provider_set_sha256,
-        )
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot reject a deployment with an invalid artifact identity",
-            )
-        })?;
+        let digest = updated_contracts::digest::deployment_rejection_sha256(application_sha256)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot reject a deployment with an invalid artifact identity",
+                )
+            })?;
         self.record_rejection(lineage, &digest)
     }
 
     /// Commit installed metadata only for the release this machine is actually pointing at.
     ///
     /// Activation and commit are intentionally separate crash barriers: an update must run the
-    /// candidate's apply and health gate after moving the pointer but before making it the
+    /// candidate's converge and health gate after moving the pointer but before making it the
     /// installed head. Keeping the ordering check here gives that protocol one enforceable shape:
     /// verify/activate first, then commit. Metadata-only changes (confirmation and repository
     /// rebinds) pass through the same gate because they retain the active release identity.
@@ -235,7 +217,7 @@ impl Store {
     /// every other installed-state mutation. Keeping the read inside this operation prevents a
     /// caller from observing `Invalid` on a transient Windows sharing fault and silently skipping
     /// confirmation before the retry boundary is reached.
-    pub(crate) fn confirm_provisional(&mut self) -> io::Result<bool> {
+    pub(crate) fn prove_provisional(&mut self) -> io::Result<bool> {
         let mut state = match self.installed()? {
             Installed::Present(state) => state,
             Installed::Missing => {
@@ -251,7 +233,7 @@ impl Store {
                 ));
             }
         };
-        if !state.confirm_provisional() {
+        if !state.prove_provisional() {
             return Ok(false);
         }
         self.commit_installed(&state)?;
@@ -299,8 +281,8 @@ impl Store {
             tx.phase,
             updated::install::InstallPhase::Placed | updated::install::InstallPhase::Committed
         ) && tx.matches_installed(next)
-            && next.pending.is_none()
-            && !next.confirmed)
+            && next.rollback_guard.is_none()
+            && !next.is_proven())
     }
 
     /// The one executable replacement first install may perform: descend from a rejected,
@@ -312,19 +294,15 @@ impl Store {
         current: &InstalledState,
         next: &InstalledState,
     ) -> io::Result<bool> {
-        Ok(!current.confirmed
-            && current.pending.is_none()
+        Ok(!current.is_proven()
+            && current.rollback_guard.is_none()
             && self.journal()?.is_none()
-            && self.rejects_deployment(
-                &current.repository_lineage,
-                &current.archive_sha256,
-                &current.lifecycle.provider_set_sha256,
-            )
-            && !self.rejects_deployment(
-                &next.repository_lineage,
-                &next.archive_sha256,
-                &next.lifecycle.provider_set_sha256,
-            )
+            && (self.rejection_is_durable(&current.repository_lineage, &current.archive_sha256)
+                || updated_contracts::digest::deployment_rejection_sha256(&current.archive_sha256)
+                    .is_some_and(|digest| {
+                        self.rejection_is_durable(&current.repository_lineage, &digest)
+                    }))
+            && !self.rejects_deployment(&next.repository_lineage, &next.archive_sha256)
             && self.install_commit_is_authorized(next)?)
     }
 
@@ -337,23 +315,25 @@ impl Store {
         }
         if current.release != next.release
             || current.archive_sha256 != next.archive_sha256
-            || current.lifecycle != next.lifecycle
+            || current.reconciler != next.reconciler
         {
             return false;
         }
 
         let lineage_changed = current.repository_lineage != next.repository_lineage;
-        let pending_changed = current.pending != next.pending;
-        let confirmed_changed = current.confirmed != next.confirmed;
+        let pending_changed = current.rollback_guard != next.rollback_guard;
+        let confirmed_changed = current.is_proven() != next.is_proven();
         match (lineage_changed, pending_changed, confirmed_changed) {
             // Authenticated rebind. Lifecycle state is carried verbatim.
             (true, false, false) => true,
             // A first successful gate confirms a provisional install.
             (false, false, true) => {
-                !current.confirmed && next.confirmed && current.pending.is_none()
+                !current.is_proven() && next.is_proven() && current.rollback_guard.is_none()
             }
             // The confirmation window settles an update by dropping only its rollback intent.
-            (false, true, false) => current.pending.is_some() && next.pending.is_none(),
+            (false, true, false) => {
+                current.rollback_guard.is_some() && next.rollback_guard.is_none()
+            }
             _ => false,
         }
     }
@@ -365,22 +345,22 @@ impl Store {
         current: &InstalledState,
         next: &InstalledState,
     ) -> bool {
-        let Some(pending) = &current.pending else {
+        let Some(pending) = &current.rollback_guard else {
             return false;
         };
         // With no update journal left, `pending` is the only durable rollback authority. Do not
         // erase it until the candidate verdict it names has reached the rejection store; otherwise
         // committing the predecessor would destroy the last identity of the bytes that must never
         // be retried.
-        self.is_rejected(
+        self.rejection_is_durable(
             &current.repository_lineage,
             &pending.candidate_rejection_sha256,
         ) && next.repository_lineage == pending.previous_repository_lineage
             && next.release == pending.previous_release
             && next.archive_sha256 == pending.previous_archive_sha256
-            && next.lifecycle == pending.lifecycle
-            && next.pending.is_none()
-            && next.confirmed
+            && next.reconciler == pending.reconciler
+            && next.rollback_guard.is_none()
+            && next.is_proven()
     }
 
     fn journal_transition_is_authorized(
@@ -395,29 +375,30 @@ impl Store {
         let current_is_predecessor = tx.matches_previous(current);
         let next_is_candidate = tx.matches_candidate(next);
         let pending_binds_transaction = next
-            .pending
+            .rollback_guard
             .as_ref()
-            .is_some_and(|pending| tx.matches_pending(pending));
-        if tx.phase == updated::transaction::Phase::Committing
-            && !tx.candidate_rejection_required
+            .is_some_and(|guard| tx.matches_rollback_guard(guard));
+        if matches!(
+            tx.phase,
+            updated::transaction::Phase::Converged | updated::transaction::Phase::Verified
+        ) && !tx.candidate_rejection_required
             && current_is_predecessor
             && next_is_candidate
             && pending_binds_transaction
-            && next.confirmed
+            && next.is_proven()
         {
             return Ok(true);
         }
 
         let current_is_candidate = tx.matches_candidate(current);
-        let next_is_predecessor = tx.matches_previous(next) && next.pending.is_none();
+        let next_is_predecessor = tx.matches_previous(next) && next.rollback_guard.is_none();
         Ok(tx.phase == updated::transaction::Phase::RolledBack
             && current_is_candidate
             && next_is_predecessor
-            && (next.confirmed
+            && (next.is_proven()
                 || self.rejects_deployment(
                     &tx.previous_repository_lineage,
                     &tx.previous_archive_sha256,
-                    &tx.previous_lifecycle.provider_set_sha256,
                 )))
     }
 
@@ -482,8 +463,8 @@ impl Store {
 
     /// Persist content evidence against one structurally invalid artifact.
     ///
-    /// Runtime failures must use [`Store::reject_deployment`], whose identity preserves the
-    /// independent reusability of the application and provider artifacts. Keeping the generic
+    /// Runtime failures must use [`Store::reject_deployment`], whose identity distinguishes
+    /// execution evidence from a malformed archive. Keeping the generic
     /// ledger writer private makes that evidence distinction explicit at every production call
     /// site instead of relying on callers to pass the right kind of digest.
     pub(crate) fn reject_artifact(
@@ -504,6 +485,7 @@ impl Store {
                 // failure cannot make it eligible again in the live process. The returned error
                 // still tells the state machine to retain and replay its durable obligation.
                 memory.rejected.insert(key);
+                memory.rejections_dirty = memory.fail_reject;
                 if memory.fail_reject {
                     return Err(io::Error::other("injected rejection write failure"));
                 }
@@ -601,7 +583,7 @@ impl Store {
     /// deleting its file or overwriting it with another id.
     fn journal_may_discard(&self, tx: &Transaction) -> io::Result<bool> {
         if tx.candidate_rejection_required
-            && !self.is_rejected(
+            && !self.rejection_is_durable(
                 &tx.candidate_repository_lineage,
                 &tx.candidate_rejection_sha256,
             )
@@ -616,16 +598,19 @@ impl Store {
             return Ok(false);
         };
         Ok(match tx.phase {
-            updated::transaction::Phase::Committing | updated::transaction::Phase::Committed => {
+            updated::transaction::Phase::Converged
+            | updated::transaction::Phase::Verified
+            | updated::transaction::Phase::Committed => {
                 self.forward_commit_is_durable(tx, &installed)
             }
             updated::transaction::Phase::RolledBack => {
                 active.as_ref() == Some(&tx.previous_release) && tx.matches_previous(&installed)
             }
             updated::transaction::Phase::Prepared
-            | updated::transaction::Phase::Activating
-            | updated::transaction::Phase::RollbackActivating
-            | updated::transaction::Phase::RollbackApplied
+            | updated::transaction::Phase::Activated
+            | updated::transaction::Phase::RollbackPlanned
+            | updated::transaction::Phase::CandidateCompensated
+            | updated::transaction::Phase::Restored
             | updated::transaction::Phase::RollbackVerified => false,
         })
     }
@@ -677,7 +662,7 @@ impl Store {
             }
             if existing.id == tx.id
                 && existing.phase == updated::transaction::Phase::Committed
-                && tx.phase == updated::transaction::Phase::RollbackActivating
+                && tx.phase == updated::transaction::Phase::RollbackPlanned
                 && !self.pending_authorizes_rollback_journal(tx)?
             {
                 return Err(io::Error::new(
@@ -715,9 +700,9 @@ impl Store {
         !tx.candidate_rejection_required
             && tx.matches_candidate(installed)
             && installed
-                .pending
+                .rollback_guard
                 .as_ref()
-                .is_some_and(|pending| tx.matches_pending(pending))
+                .is_some_and(|guard| tx.matches_rollback_guard(guard))
     }
 
     fn journal_start_is_authorized(&self, tx: &Transaction) -> io::Result<bool> {
@@ -730,8 +715,8 @@ impl Store {
         Ok(tx.phase == updated::transaction::Phase::Prepared
             && !tx.candidate_rejection_required
             && tx.rollback_health_failures == 0
-            && installed.confirmed
-            && installed.pending.is_none()
+            && installed.is_proven()
+            && installed.rollback_guard.is_none()
             && tx.matches_previous(&installed)
             && self.active_release()?.as_ref() == Some(&installed.release))
     }
@@ -743,12 +728,12 @@ impl Store {
         let Installed::Present(installed) = self.installed()? else {
             return Ok(false);
         };
-        let Some(pending) = &installed.pending else {
+        let Some(pending) = &installed.rollback_guard else {
             return Ok(false);
         };
-        Ok(tx.phase == updated::transaction::Phase::RollbackActivating
+        Ok(tx.phase == updated::transaction::Phase::RollbackPlanned
             && tx.rollback_health_failures == 0
-            && tx.matches_pending(pending)
+            && tx.matches_rollback_guard(pending)
             && tx.matches_candidate(&installed))
     }
     /// Persist first-install intent without ever burying a different interrupted install. An
@@ -804,11 +789,7 @@ impl Store {
     /// this same journal and commit grammar; no clearing/reseeding side path exists between them.
     fn install_start_is_authorized(&self, tx: &InstallTransaction) -> io::Result<bool> {
         if tx.phase != updated::install::InstallPhase::Started
-            || self.rejects_deployment(
-                &tx.repository_lineage,
-                &tx.archive_sha256,
-                &tx.lifecycle.provider_set_sha256,
-            )
+            || self.rejects_deployment(&tx.repository_lineage, &tx.archive_sha256)
         {
             return Ok(false);
         }
@@ -816,14 +797,10 @@ impl Store {
         Ok(match self.installed()? {
             Installed::Missing => active.is_none(),
             Installed::Present(current) => {
-                !current.confirmed
-                    && current.pending.is_none()
+                !current.is_proven()
+                    && current.rollback_guard.is_none()
                     && active.as_ref() == Some(&current.release)
-                    && self.rejects_deployment(
-                        &current.repository_lineage,
-                        &current.archive_sha256,
-                        &current.lifecycle.provider_set_sha256,
-                    )
+                    && self.rejects_deployment(&current.repository_lineage, &current.archive_sha256)
                     && !tx.matches_installed(&current)
             }
             Installed::Invalid => false,
@@ -938,6 +915,7 @@ pub(crate) struct MemoryBackend {
     pub(crate) rejected: std::collections::HashSet<String>,
     /// Simulate a state directory that has gone unwritable (ENOSPC, a read-only remount).
     pub(crate) fail_reject: bool,
+    pub(crate) rejections_dirty: bool,
     /// Simulate corrupt immutable release bytes at the activation gate.
     pub(crate) fail_verify_release: bool,
     /// Simulate platform I/O failing after verification but before the pointer moves.
@@ -957,7 +935,7 @@ impl Default for Store {
 mod tests {
     use super::*;
     use updated::install::InstallPhase;
-    use updated::state::ProviderRelease;
+    use updated::state::ReconcilerRelease;
 
     fn install_transaction(id_byte: char, phase: InstallPhase) -> InstallTransaction {
         let release = ReleaseId {
@@ -972,12 +950,10 @@ mod tests {
                 "https://repo.example/metadata/",
             )
             .expect("fixture metadata URL is valid"),
-            lifecycle: Box::new(ProviderRelease {
-                provider_set_sha256: "c".repeat(64),
+            reconciler: Box::new(ReconcilerRelease {
+                definition_sha256: "c".repeat(64),
                 product: "reconciler".into(),
-                release,
-                archive_sha256: "d".repeat(64),
-                args: Vec::new(),
+                api: 1,
                 timeout_millis: 1_000,
             }),
             phase,
@@ -986,11 +962,9 @@ mod tests {
 
     fn update_transaction() -> Transaction {
         let candidate = install_transaction('3', InstallPhase::Started);
-        let candidate_rejection_sha256 = updated_contracts::digest::deployment_rejection_sha256(
-            &candidate.archive_sha256,
-            &candidate.lifecycle.provider_set_sha256,
-        )
-        .expect("fixture artifact identities are canonical");
+        let candidate_rejection_sha256 =
+            updated_contracts::digest::deployment_rejection_sha256(&candidate.archive_sha256)
+                .expect("fixture artifact identities are canonical");
         Transaction {
             id: "4".repeat(64),
             previous_release: ReleaseId {
@@ -1004,8 +978,8 @@ mod tests {
             candidate_rejection_sha256,
             candidate_repository_lineage: candidate.repository_lineage,
             candidate_rejection_required: false,
-            previous_lifecycle: candidate.lifecycle.clone(),
-            candidate_lifecycle: candidate.lifecycle,
+            previous_reconciler: candidate.reconciler.clone(),
+            candidate_reconciler: candidate.reconciler,
             rollback_health_failures: 0,
             phase: updated::transaction::Phase::Prepared,
         }
@@ -1056,22 +1030,22 @@ mod tests {
             "a terminal phase cannot substitute for the exact installed record"
         );
 
-        store.memory_backend_mut().installed = Some(InstalledState::confirmed(
+        store.memory_backend_mut().installed = Some(InstalledState::proven(
             prepared.repository_lineage.clone(),
             prepared.release.clone(),
             "e".repeat(64),
-            prepared.lifecycle.clone(),
+            prepared.reconciler.clone(),
         ));
         assert!(
             store.clear_install_journal().is_err(),
             "the same ReleaseId cannot conceal substituted deployed bytes"
         );
 
-        store.memory_backend_mut().installed = Some(InstalledState::confirmed(
+        store.memory_backend_mut().installed = Some(InstalledState::proven(
             prepared.repository_lineage.clone(),
             prepared.release.clone(),
             prepared.archive_sha256.clone(),
-            prepared.lifecycle.clone(),
+            prepared.reconciler.clone(),
         ));
         store
             .write_install_journal(&premature_commit)
@@ -1089,7 +1063,7 @@ mod tests {
             head_tx.repository_lineage.clone(),
             head_tx.release,
             head_tx.archive_sha256,
-            head_tx.lifecycle,
+            head_tx.reconciler,
         );
         let mut fallback = install_transaction('2', InstallPhase::Started);
         fallback.release.version = "0.9.0".into();
@@ -1106,11 +1080,7 @@ mod tests {
             "a healthy provisional head is not replaceable through cold fallback"
         );
         store
-            .reject_deployment(
-                &head.repository_lineage,
-                &head.archive_sha256,
-                &head.lifecycle.provider_set_sha256,
-            )
+            .reject_deployment(&head.repository_lineage, &head.archive_sha256)
             .unwrap();
         assert!(
             !store.is_rejected(&head.repository_lineage, &head.archive_sha256),
@@ -1129,7 +1099,7 @@ mod tests {
             fallback.repository_lineage.clone(),
             fallback.release.clone(),
             fallback.archive_sha256.clone(),
-            fallback.lifecycle.clone(),
+            fallback.reconciler.clone(),
         );
         store
             .commit_installed(&replacement)
@@ -1144,42 +1114,28 @@ mod tests {
     }
 
     #[test]
-    fn selection_rejections_distinguish_bad_artifacts_from_bad_combinations() {
+    fn runtime_rejection_blocks_deployment_but_allows_exact_byte_repair() {
         let tx = install_transaction('1', InstallPhase::Started);
-        let lineage = tx.repository_lineage;
-        let application = tx.archive_sha256;
-        let provider = tx.lifecycle.provider_set_sha256.clone();
-        let other_provider = "e".repeat(64);
         let mut store = Store::default();
-
         store
-            .reject_deployment(&lineage, &application, &provider)
+            .reject_deployment(&tx.repository_lineage, &tx.archive_sha256)
             .unwrap();
-        assert!(store.rejects_selection(&lineage, &application, Some(&provider)));
-        assert!(
-            !store.rejects_selection(&lineage, &application, Some(&other_provider)),
-            "the same application remains eligible with a different provider"
-        );
-        assert!(
-            !store.rejects_selection(&lineage, &application, None),
-            "repairing the application alone ignores pair-specific runtime evidence"
-        );
-        assert!(!store.is_rejected(&lineage, &application));
-        assert!(!store.is_rejected(&lineage, &provider));
-
-        store.reject_artifact(&lineage, &application).unwrap();
-        assert!(store.rejects_selection(&lineage, &application, Some(&other_provider)));
-        assert!(store.rejects_selection(&lineage, &application, None));
+        assert!(store.rejects_deployment(&tx.repository_lineage, &tx.archive_sha256));
+        assert!(!store.is_rejected(&tx.repository_lineage, &tx.archive_sha256));
+        store
+            .reject_artifact(&tx.repository_lineage, &tx.archive_sha256)
+            .unwrap();
+        assert!(store.is_rejected(&tx.repository_lineage, &tx.archive_sha256));
     }
 
     #[test]
     fn update_intent_cannot_be_rewritten_while_it_is_still_discardable() {
         let started = update_transaction();
-        let installed = InstalledState::confirmed(
+        let installed = InstalledState::proven(
             started.previous_repository_lineage.clone(),
             started.previous_release.clone(),
             started.previous_archive_sha256.clone(),
-            started.previous_lifecycle.clone(),
+            started.previous_reconciler.clone(),
         );
         let mut store = Store::memory(MemoryBackend {
             active: Some(installed.release.clone()),
@@ -1201,7 +1157,7 @@ mod tests {
     fn durable_intent_cannot_be_created_after_its_initial_barrier() {
         let mut skipped_update = update_transaction();
         skipped_update
-            .advance(updated::transaction::Phase::Activating)
+            .advance(updated::transaction::Phase::Activated)
             .unwrap();
         let mut store = Store::default();
         assert!(
@@ -1220,11 +1176,11 @@ mod tests {
     #[test]
     fn update_and_install_intent_are_mutually_exclusive_at_both_write_boundaries() {
         let update = update_transaction();
-        let installed = InstalledState::confirmed(
+        let installed = InstalledState::proven(
             update.previous_repository_lineage.clone(),
             update.previous_release.clone(),
             update.previous_archive_sha256.clone(),
-            update.previous_lifecycle.clone(),
+            update.previous_reconciler.clone(),
         );
         let install = install_transaction('1', InstallPhase::Started);
         let mut update_store = Store::memory(MemoryBackend {
@@ -1259,19 +1215,19 @@ mod tests {
     #[test]
     fn executable_identity_cannot_change_without_matching_durable_intent() {
         let tx = update_transaction();
-        let current = InstalledState::confirmed(
+        let current = InstalledState::proven(
             tx.previous_repository_lineage.clone(),
             tx.previous_release.clone(),
             tx.previous_archive_sha256.clone(),
-            tx.previous_lifecycle.clone(),
+            tx.previous_reconciler.clone(),
         );
         let candidate = InstalledState::provisional(
             tx.candidate_repository_lineage,
             tx.candidate_release.clone(),
             tx.candidate_archive_sha256,
-            Box::new(ProviderRelease {
-                provider_set_sha256: "1".repeat(64),
-                ..(*tx.candidate_lifecycle).clone()
+            Box::new(ReconcilerRelease {
+                definition_sha256: "1".repeat(64),
+                ..(*tx.candidate_reconciler).clone()
             }),
         );
         let mut store = Store::memory(MemoryBackend {
@@ -1294,11 +1250,11 @@ mod tests {
     #[test]
     fn update_intent_binds_the_candidate_application_and_reconciler_as_one_unit() {
         let mut tx = update_transaction();
-        let current = InstalledState::confirmed(
+        let current = InstalledState::proven(
             tx.previous_repository_lineage.clone(),
             tx.previous_release.clone(),
             tx.previous_archive_sha256.clone(),
-            tx.previous_lifecycle.clone(),
+            tx.previous_reconciler.clone(),
         );
         let mut store = Store::memory(MemoryBackend {
             installed: Some(current.clone()),
@@ -1306,9 +1262,11 @@ mod tests {
             ..MemoryBackend::default()
         });
         store.write_journal(&tx).unwrap();
-        tx.advance(updated::transaction::Phase::Activating).unwrap();
+        tx.advance(updated::transaction::Phase::Activated).unwrap();
         store.write_journal(&tx).unwrap();
-        tx.advance(updated::transaction::Phase::Committing).unwrap();
+        tx.advance(updated::transaction::Phase::Converged).unwrap();
+        store.write_journal(&tx).unwrap();
+        tx.advance(updated::transaction::Phase::Verified).unwrap();
         store.write_journal(&tx).unwrap();
         store.activate(&tx.candidate_release).unwrap();
 
@@ -1325,20 +1283,20 @@ mod tests {
             repository_lineage: tx.candidate_repository_lineage.clone(),
             release: tx.candidate_release.clone(),
             archive_sha256: tx.candidate_archive_sha256.clone(),
-            lifecycle: tx.candidate_lifecycle.clone(),
-            pending: Some(updated::state::Pending {
-                lifecycle_attempt_id: tx.id.clone(),
+            reconciler: tx.candidate_reconciler.clone(),
+            rollback_guard: Some(updated::state::RollbackGuard {
+                attempt_id: tx.id.clone(),
                 candidate_rejection_sha256: tx.candidate_rejection_sha256.clone(),
                 previous_release: tx.previous_release.clone(),
                 previous_archive_sha256: tx.previous_archive_sha256.clone(),
                 previous_repository_lineage: tx.previous_repository_lineage.clone(),
-                lifecycle: tx.previous_lifecycle.clone(),
+                reconciler: tx.previous_reconciler.clone(),
                 committed_at: 1,
             }),
-            confirmed: true,
+            maturity: updated::state::Maturity::Proven,
         };
         let mut substituted = intended.clone();
-        substituted.lifecycle.provider_set_sha256 = "1".repeat(64);
+        substituted.reconciler.definition_sha256 = "1".repeat(64);
         assert!(
             store.commit_installed(&substituted).is_err(),
             "a journal for the candidate app may not authorize an adjacent reconciler"
@@ -1356,17 +1314,17 @@ mod tests {
         let mut tx = update_transaction();
         tx.phase = updated::transaction::Phase::RolledBack;
         tx.candidate_rejection_required = true;
-        let predecessor = InstalledState::confirmed(
+        let predecessor = InstalledState::proven(
             tx.previous_repository_lineage.clone(),
             tx.previous_release.clone(),
             tx.previous_archive_sha256.clone(),
-            tx.previous_lifecycle.clone(),
+            tx.previous_reconciler.clone(),
         );
-        let candidate = InstalledState::confirmed(
+        let candidate = InstalledState::proven(
             tx.candidate_repository_lineage.clone(),
             tx.candidate_release.clone(),
             tx.candidate_archive_sha256.clone(),
-            tx.candidate_lifecycle.clone(),
+            tx.candidate_reconciler.clone(),
         );
         let mut store = Store::memory(MemoryBackend {
             journal: Some(tx.clone()),
@@ -1384,11 +1342,30 @@ mod tests {
             store.clear_journal().is_err(),
             "the restored predecessor does not discharge a required candidate rejection"
         );
+        store.memory_backend_mut().fail_reject = true;
+        assert!(store
+            .reject_deployment(
+                &tx.candidate_repository_lineage,
+                &tx.candidate_archive_sha256
+            )
+            .is_err());
+        assert!(store.rejects_deployment(
+            &tx.candidate_repository_lineage,
+            &tx.candidate_archive_sha256
+        ));
+        assert!(
+            store.clear_journal().is_err(),
+            "live suppression is not durable evidence"
+        );
+        store.memory_backend_mut().fail_reject = false;
+        assert!(
+            store.clear_journal().is_err(),
+            "restoring storage alone does not persist the verdict"
+        );
         store
             .reject_deployment(
                 &tx.candidate_repository_lineage,
                 &tx.candidate_archive_sha256,
-                &tx.candidate_lifecycle.provider_set_sha256,
             )
             .unwrap();
         store
@@ -1403,23 +1380,23 @@ mod tests {
             repository_lineage: tx.candidate_repository_lineage.clone(),
             release: tx.candidate_release,
             archive_sha256: tx.candidate_archive_sha256,
-            lifecycle: tx.candidate_lifecycle,
-            pending: Some(updated::state::Pending {
-                lifecycle_attempt_id: tx.id,
+            reconciler: tx.candidate_reconciler,
+            rollback_guard: Some(updated::state::RollbackGuard {
+                attempt_id: tx.id,
                 candidate_rejection_sha256: tx.candidate_rejection_sha256.clone(),
                 previous_release: tx.previous_release.clone(),
                 previous_archive_sha256: tx.previous_archive_sha256.clone(),
                 previous_repository_lineage: tx.previous_repository_lineage.clone(),
-                lifecycle: tx.previous_lifecycle.clone(),
+                reconciler: tx.previous_reconciler.clone(),
                 committed_at: 1,
             }),
-            confirmed: true,
+            maturity: updated::state::Maturity::Proven,
         };
-        let predecessor = InstalledState::confirmed(
+        let predecessor = InstalledState::proven(
             tx.previous_repository_lineage,
             tx.previous_release.clone(),
             tx.previous_archive_sha256,
-            tx.previous_lifecycle,
+            tx.previous_reconciler,
         );
         let mut store = Store::memory(MemoryBackend {
             installed: Some(candidate.clone()),
@@ -1431,12 +1408,15 @@ mod tests {
             store.commit_installed(&predecessor).is_err(),
             "pending cannot disappear before its candidate rejection is durable"
         );
+        store.memory_backend_mut().fail_reject = true;
+        assert!(store
+            .reject_deployment(&candidate.repository_lineage, &candidate.archive_sha256)
+            .is_err());
+        assert!(store.commit_installed(&predecessor).is_err());
+        store.memory_backend_mut().fail_reject = false;
+        assert!(store.commit_installed(&predecessor).is_err());
         store
-            .reject_deployment(
-                &candidate.repository_lineage,
-                &candidate.archive_sha256,
-                &candidate.lifecycle.provider_set_sha256,
-            )
+            .reject_deployment(&candidate.repository_lineage, &candidate.archive_sha256)
             .unwrap();
         store
             .commit_installed(&predecessor)
@@ -1481,11 +1461,11 @@ mod tests {
     #[test]
     fn every_backend_refuses_the_same_invalid_installed_state() {
         let transaction = install_transaction('1', InstallPhase::Started);
-        let mut state = InstalledState::confirmed(
+        let mut state = InstalledState::proven(
             transaction.repository_lineage,
             transaction.release,
             transaction.archive_sha256,
-            transaction.lifecycle,
+            transaction.reconciler,
         );
         state.archive_sha256 = "not-a-digest".into();
 
@@ -1508,11 +1488,11 @@ mod tests {
     #[test]
     fn installed_state_can_only_commit_the_active_release() {
         let transaction = install_transaction('1', InstallPhase::Started);
-        let state = InstalledState::confirmed(
+        let state = InstalledState::proven(
             transaction.repository_lineage,
             transaction.release.clone(),
             transaction.archive_sha256,
-            transaction.lifecycle,
+            transaction.reconciler,
         );
         let mut store = Store::memory(MemoryBackend {
             installed: Some(state.clone()),
@@ -1547,7 +1527,7 @@ mod tests {
             transaction.repository_lineage,
             transaction.release.clone(),
             transaction.archive_sha256,
-            transaction.lifecycle,
+            transaction.reconciler,
         );
         let mut store = Store::memory(MemoryBackend {
             installed: Some(state),
@@ -1555,12 +1535,12 @@ mod tests {
             ..MemoryBackend::default()
         });
 
-        assert!(store.confirm_provisional().unwrap());
+        assert!(store.prove_provisional().unwrap());
         assert!(matches!(
             store.installed().unwrap(),
-            Installed::Present(installed) if installed.confirmed && installed.pending.is_none()
+            Installed::Present(installed) if installed.is_proven() && installed.rollback_guard.is_none()
         ));
-        assert!(!store.confirm_provisional().unwrap());
+        assert!(!store.prove_provisional().unwrap());
     }
 
     #[cfg(windows)]
@@ -1572,15 +1552,41 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let paths = Paths::resolve(directory.path(), &directory.path().join("enrollment"));
         let mut store = Store::open(paths.clone()).unwrap();
-        let transaction = install_transaction('1', InstallPhase::Started);
+        let source = directory.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("app.exe"), b"fixture").unwrap();
+        let archive = directory.path().join("app.tar.zst");
+        let platform = foundation::platform::platform_key();
+        updated::bundle::create_bundle(&source, &archive, "app", "1.0.0", &platform).unwrap();
+        let release = updated::bundle_store::BundleStore::for_app(&paths)
+            .install(
+                &archive,
+                &updated::bundle::ExpectedBundle {
+                    product: "app",
+                    version: "1.0.0",
+                    platform: &platform,
+                },
+            )
+            .unwrap();
+
+        let mut transaction = install_transaction('1', InstallPhase::Started);
+        transaction.release = release;
+        store.write_install_journal(&transaction).unwrap();
+        transaction.advance(InstallPhase::Prepared).unwrap();
+        store.write_install_journal(&transaction).unwrap();
+        store.activate(&transaction.release).unwrap();
+        transaction.advance(InstallPhase::Placed).unwrap();
+        store.write_install_journal(&transaction).unwrap();
         let state = InstalledState::provisional(
-            transaction.repository_lineage,
+            transaction.repository_lineage.clone(),
             transaction.release.clone(),
-            transaction.archive_sha256,
-            transaction.lifecycle,
+            transaction.archive_sha256.clone(),
+            transaction.reconciler.clone(),
         );
-        write_active(&paths.active_release, &transaction.release).unwrap();
-        write_installed(&paths.installed, &state).unwrap();
+        store.commit_installed(&state).unwrap();
+        transaction.advance(InstallPhase::Committed).unwrap();
+        store.write_install_journal(&transaction).unwrap();
+        store.clear_install_journal().unwrap();
 
         // Confirmation first reads installed.json, then atomically replaces it. Keep reads legal
         // while withholding delete sharing so this exercises the replacement boundary itself.
@@ -1590,19 +1596,19 @@ mod tests {
             .open(&paths.installed)
             .unwrap();
         assert!(matches!(store.installed().unwrap(), Installed::Present(_)));
-        let error = store.confirm_provisional().unwrap_err();
+        let error = store.prove_provisional().unwrap_err();
         assert!(
             crate::transient::is_node_local_transient(&error),
             "the atomic replacement must retain the sharing violation: {error:?}"
         );
 
         drop(replacement_blocker);
-        assert!(store.confirm_provisional().unwrap());
+        assert!(store.prove_provisional().unwrap());
     }
 
     #[test]
     fn the_memory_backend_reads_durable_values_through_the_production_validators() {
-        let mut invalid_installed = InstalledState::confirmed(
+        let mut invalid_installed = InstalledState::proven(
             RepositoryLineage::from_metadata_url("https://repo.example/metadata/")
                 .expect("fixture metadata URL is valid"),
             ReleaseId {
@@ -1610,7 +1616,7 @@ mod tests {
                 manifest_sha256: "a".repeat(64),
             },
             "b".repeat(64),
-            install_transaction('1', InstallPhase::Started).lifecycle,
+            install_transaction('1', InstallPhase::Started).reconciler,
         );
         invalid_installed.archive_sha256 = "bad".into();
 

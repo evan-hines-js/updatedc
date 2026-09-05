@@ -2,7 +2,7 @@
 //!
 //! It intentionally models an over-engineered Java-era deployment, but implements
 //! that process as one typed, idempotent state machine rather than a pile of shell
-//! entrypoints. The agent downloads this executable as a provider artifact.
+//! entrypoints. The agent downloads this executable as a reconciler artifact.
 
 use std::fs;
 use std::io::Write;
@@ -16,20 +16,18 @@ use demo_lifecycle::PROVIDER_TIMEOUT_MS;
 use foundation::durable;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate; this fixture
 /// answers exactly the operations the agent invokes.
-use updated_contracts::reconciler::{
-    attempt, HostAction, Operation, Reason, ResultDocument, PROTOCOL,
-};
+use updated_contracts::reconciler::{attempt, HostAction, Operation, Reason, ResultDocument};
 
 type Error = Box<dyn std::error::Error>;
 
-/// Wall time an update `apply` spends outside its two dwells: one second each in `preflight`,
+/// Wall time an update `converge` spends outside its two dwells: one second each in `preflight`,
 /// `prepare`, `drain` and `start`, two seconds for the filesystem work of the remaining steps,
-/// and the budget `start` spends stopping the running workload and proving the candidate's own
+/// and the budget `start` spends stopping the running workload and proving the payload's own
 /// entrypoint serves ([`WORKLOAD_START_BUDGET_MS`]).
-const APPLY_FIXED_WORK_MS: u64 = 6_000 + WORKLOAD_START_BUDGET_MS;
+const CONVERGE_FIXED_WORK_MS: u64 = 6_000 + WORKLOAD_START_BUDGET_MS;
 
-/// How long `start` waits for the candidate's workload to answer on [`WORKLOAD_PORT`] before
-/// failing the activation. A release whose entrypoint cannot serve fails its own apply here,
+/// How long `start` waits for the payload's workload to answer on [`WORKLOAD_PORT`] before
+/// failing the activation. A release whose entrypoint cannot serve fails its own converge here,
 /// rather than leaving the agent to infer it from a health observation.
 const WORKLOAD_START_BUDGET_MS: u64 = 5_000;
 
@@ -51,7 +49,7 @@ fn workload_version_url() -> String {
 
 /// Headroom the dwell band leaves the timeout for everything wall time this fixture does not
 /// control: process spawn, artifact staging, and a demo cluster under load.
-const APPLY_MARGIN_MS: u64 = 3_000;
+const CONVERGE_MARGIN_MS: u64 = 3_000;
 
 /// Shortest representative pause for a dwelling phase.
 const DWELL_FLOOR_MS: u64 = 1_000;
@@ -60,16 +58,17 @@ const DWELL_FLOOR_MS: u64 = 1_000;
 /// `rollback` restores.
 const ROLLBACK_SET: [&str; 3] = ["application.war", "content.repository", "server.xml"];
 
-/// Longest one dwell may be: an `apply` performs two of them, and what is left of the provider
+/// Longest one dwell may be: a `converge` performs two of them, and what is left of the provider
 /// timeout after the fixed work and the margin has to cover both.
-const DWELL_CEILING_MS: u64 = (PROVIDER_TIMEOUT_MS - APPLY_FIXED_WORK_MS - APPLY_MARGIN_MS) / 2;
+const DWELL_CEILING_MS: u64 =
+    (PROVIDER_TIMEOUT_MS - CONVERGE_FIXED_WORK_MS - CONVERGE_MARGIN_MS) / 2;
 
 /// Where one deployment TRANSACTION's rollback backup lives — keyed by transaction, not by
-/// attempt. The agent drives the compensating direction — the predecessor's re-`apply` after a
-/// crash, and `rollback` — under the forward attempt's id with an `r` appended
+/// attempt. The agent drives candidate `rollback` and predecessor `converge` under the forward
+/// attempt's id with an `r` appended
 /// (`rollback_attempt_id`); attempt ids are dashless hex, so a trailing `r` can only be that
-/// marker. Keying per attempt was a poison path: the compensating apply's `prepare` ran with the
-/// crashed forward attempt's candidate bytes already live, captured THAT as "the predecessor's
+/// marker. Keying per attempt was a poison path: predecessor converge's `prepare` ran with the
+/// crashed forward attempt's payload bytes already live, captured THAT as "the predecessor's
 /// state", and a later rollback under the same compensating id faithfully restored the
 /// contamination — the node then failed its boot converge forever, on a state no release ever
 /// shipped. One backup per transaction means it is only ever captured by the forward `prepare` —
@@ -80,12 +79,12 @@ fn transaction_backup(state: &Path, attempt: &str) -> PathBuf {
     state.join("backups").join(transaction)
 }
 
+#[derive(Clone)]
 struct Deployment {
     phase: Operation,
     attempt: String,
-    candidate: String,
-    predecessor: String,
-    candidate_dir: PathBuf,
+    payload: String,
+    payload_root: PathBuf,
     reason: Reason,
     state: PathBuf,
     effects: PathBuf,
@@ -101,33 +100,22 @@ struct Deployment {
 
 impl Deployment {
     fn load() -> Result<Self, Error> {
-        let mut args = std::env::args().skip(1);
-        let phase = args
-            .next()
-            .ok_or("missing reconciler operation")?
-            .parse::<Operation>()?;
-        let values = named_arguments(args)?;
-        let attempt = required_argument(&values, "--attempt-id")?.to_string();
-        let candidate = required_argument(&values, "--candidate-version")?.to_string();
-        let state = PathBuf::from(required_argument(&values, "--state-dir")?);
+        let env = |name: &str| -> Result<String, Error> { Ok(std::env::var(name)?) };
+        let state = PathBuf::from(env("UPDATED_STATE_DIR")?);
+        let attempt = env("UPDATED_ATTEMPT_ID")?;
         Ok(Self {
-            phase,
+            phase: env("UPDATED_OPERATION")?.parse()?,
             effects: state.join("attempts").join(&attempt),
             live: state.join("legacy-java-home"),
             backup: transaction_backup(&state, &attempt),
             state,
             attempt,
-            candidate,
-            predecessor: required_argument(&values, "--predecessor-version")?.to_string(),
-            candidate_dir: PathBuf::from(required_argument(&values, "--candidate")?),
-            // Parsed by the contract that owns the vocabulary — never against literals of this
-            // fixture's own, which would compile clean through a renamed spelling and silently
-            // stop taking the per-boot path. A reason outside the grammar is refused, not treated
-            // as an update.
-            reason: required_argument(&values, "--reason")?.parse::<Reason>()?,
-            input_dir: PathBuf::from(required_argument(&values, "--input-dir")?),
-            output_dir: PathBuf::from(required_argument(&values, "--output-dir")?),
-            result_file: PathBuf::from(required_argument(&values, "--result-file")?),
+            payload: env("UPDATED_PAYLOAD_VERSION")?,
+            payload_root: env("UPDATED_PAYLOAD_ROOT")?.into(),
+            reason: env("UPDATED_REASON")?.parse()?,
+            input_dir: env("UPDATED_INPUT_DIR")?.into(),
+            output_dir: env("UPDATED_OUTPUT_DIR")?.into(),
+            result_file: env("UPDATED_RESULT_FILE")?.into(),
         })
     }
 
@@ -135,7 +123,7 @@ impl Deployment {
         fs::create_dir_all(&self.effects)?;
         fs::create_dir_all(&self.live)?;
         fs::create_dir_all(self.state.join("audit"))?;
-        // Completion markers make ONE update attempt idempotent, so a crash mid-apply resumes
+        // Completion markers make ONE update attempt idempotent, so a crash mid-converge resumes
         // without repeating finished work. A per-boot hook is not an attempt: the agent
         // invokes it under a constant id on every launch, so honouring a marker there would turn
         // "run this before every start" into "run this once, ever".
@@ -151,7 +139,7 @@ impl Deployment {
         }
         self.audit("started")?;
         match self.phase {
-            Operation::Apply => self.apply()?,
+            Operation::Converge => self.converge()?,
             Operation::Healthcheck => self.periodic()?,
             Operation::Rollback => self.rollback()?,
             Operation::Inspect => self.fingerprint()?,
@@ -185,11 +173,10 @@ impl Deployment {
         Ok(())
     }
 
-    /// Converge onto the candidate. A restart — or a transaction whose candidate and predecessor
-    /// are the same release — moves no bytes: it re-establishes the live state and brings the
-    /// workload back up rather than running the update steps against the release already live.
-    fn apply(&self) -> Result<(), Error> {
-        if self.reason == Reason::Restart || self.candidate == self.predecessor {
+    /// Converge onto this invocation's payload. A restart moves no bytes: it re-establishes the
+    /// live state and brings the workload back up rather than running update steps.
+    fn converge(&self) -> Result<(), Error> {
+        if self.reason == Reason::Restart {
             self.pre_start()?;
             return self.start();
         }
@@ -214,15 +201,17 @@ impl Deployment {
     }
 
     fn preflight(&self) -> Result<(), Error> {
-        executable(&self.candidate_dir.join("bin/app"))?;
-        required_file(&self.candidate_dir.join("config/release.toml"))?;
+        executable(&self.payload_root.join("bin/app"))?;
+        required_file(&self.payload_root.join("config/release.toml"))?;
         thread::sleep(Duration::from_secs(1));
         Ok(())
     }
 
     fn prepare(&self) -> Result<(), Error> {
         self.require("preflight")?;
-        self.initialize_legacy_file("application.war", &self.predecessor)?;
+        // Existing machine state, not protocol history, is the source of truth. The legacy demo
+        // starts at its documented baseline only when no prior reconciler state exists.
+        self.initialize_legacy_file("application.war", "1.0.0")?;
         self.initialize_legacy_file("content.repository", "schema=1 owner=legacy")?;
         self.initialize_legacy_file(
             "server.xml",
@@ -231,7 +220,7 @@ impl Deployment {
         self.capture_rollback_backup()?;
         self.write(
             self.effects.join("generated-install.properties"),
-            format!("candidate={} attempt={}\n", self.candidate, self.attempt).as_bytes(),
+            format!("payload={} attempt={}\n", self.payload, self.attempt).as_bytes(),
         )?;
         thread::sleep(Duration::from_secs(1));
         Ok(())
@@ -239,9 +228,9 @@ impl Deployment {
 
     /// Copy the predecessor's live state aside, exactly once per TRANSACTION.
     ///
-    /// `apply` is replayed — after a crash mid-apply under the same attempt id, and by the
-    /// agent's recovery activation under the transaction's compensating id (candidate and
-    /// predecessor swapped). By then `activate` may already have written the candidate into
+    /// `converge` is replayed — after a crash mid-converge under the same attempt id, and by the
+    /// agent's recovery activation under the transaction's compensating id (payload and
+    /// predecessor swapped). By then `activate` may already have written the payload into
     /// `live`, so a later copy would overwrite the predecessor bytes that this transaction's
     /// `rollback` restores; the shared transaction-keyed `backup` dir (see [`Deployment::load`])
     /// plus this marker is what makes every replay and both directions skip it. The window is
@@ -257,6 +246,12 @@ impl Deployment {
         fs::create_dir_all(&self.backup)?;
         for name in ROLLBACK_SET {
             self.copy(&self.live.join(name), &self.backup.join(name))?;
+        }
+        for name in ["workload.path", "workload.release"] {
+            let path = self.workload_record(name);
+            if path.is_file() {
+                self.copy(&path, &self.backup.join(name))?;
+            }
         }
         self.write(marker, b"captured\n")
     }
@@ -283,7 +278,7 @@ impl Deployment {
         fs::create_dir_all(&self.live)?;
         self.write(
             self.live.join("pre-start-prepared"),
-            self.candidate.as_bytes(),
+            self.payload.as_bytes(),
         )?;
         thread::sleep(self.dwell("pre-start"));
         Ok(())
@@ -293,7 +288,7 @@ impl Deployment {
     /// [`DWELL_FLOOR_MS`]–[`DWELL_CEILING_MS`] band. It is derived from the attempt id, the
     /// operation and the step, so it is stable across a step's crash-recovery retries (the work
     /// "takes as long as it takes") yet varies across agents and across the two dwelling steps of
-    /// one `apply` — the fleet looks alive. The band is sized so that both dwells plus every fixed
+    /// one `converge` — the fleet looks alive. The band is sized so that both dwells plus every fixed
     /// step still fit the provider's execution timeout with margin, for *every* attempt id.
     fn dwell(&self, step: &str) -> Duration {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -323,17 +318,17 @@ impl Deployment {
     fn stop(&self) -> Result<(), Error> {
         self.require("drain")?;
         expect(&self.live.join("removed-from-load-balancer"), &self.attempt)?;
-        // The drained workload is this hook's to stop; `start` brings the candidate's own
+        // The drained workload is this hook's to stop; `start` brings the payload's own
         // entrypoint up in its place.
         self.stop_workload()
     }
 
     fn activate(&self) -> Result<(), Error> {
         self.require("stop")?;
-        self.write(self.live.join("application.war"), self.candidate.as_bytes())?;
+        self.write(self.live.join("application.war"), self.payload.as_bytes())?;
         self.write(
             self.live.join("migration.plan"),
-            format!("pending schema=2 version={}\n", self.candidate).as_bytes(),
+            format!("pending schema=2 version={}\n", self.payload).as_bytes(),
         )?;
         self.copy(
             &self.effects.join("generated-install.properties"),
@@ -345,7 +340,7 @@ impl Deployment {
     /// Materialize the release's durable state, then converge the process onto it. This hook owns
     /// the workload — the agent starts none — so starting it is what `start` means. Convergence,
     /// not restart: a workload already running these bytes is left alone, so its pid is stable
-    /// across agent boots, restarts and self-updates.
+    /// across agent boots and restarts.
     fn start(&self) -> Result<(), Error> {
         self.publish_release()?;
         self.converge_workload()
@@ -358,22 +353,22 @@ impl Deployment {
             // Cold install and ordinary restart have no update transaction. Materialize any
             // provider-owned steady state that an update's activate/finalize phases would have
             // produced, without overwriting an existing deployment on restart.
-            self.initialize_legacy_file("application.war", &self.candidate)?;
+            self.initialize_legacy_file("application.war", &self.payload)?;
             self.initialize_legacy_file(
                 "content.repository",
-                &format!("schema=2 version={} migrated=true", self.candidate),
+                &format!("schema=2 version={} migrated=true", self.payload),
             )?;
             self.initialize_legacy_file(
                 "change-ticket.receipt",
-                &format!("green release {} established on boot", self.candidate),
+                &format!("green release {} established on boot", self.payload),
             )?;
         } else {
             self.require("activate")?;
         }
-        expect(&self.live.join("application.war"), &self.candidate)?;
+        expect(&self.live.join("application.war"), &self.payload)?;
         self.write(
             self.live.join("cache-warmup"),
-            format!("warming caches for {}\n", self.candidate).as_bytes(),
+            format!("warming caches for {}\n", self.payload).as_bytes(),
         )?;
         thread::sleep(Duration::from_secs(1));
         Ok(())
@@ -387,17 +382,17 @@ impl Deployment {
     /// from.
     fn verify(&self) -> Result<(), Error> {
         self.require("start")?;
-        expect(&self.live.join("application.war"), &self.candidate)?;
+        expect(&self.live.join("application.war"), &self.payload)?;
         expect(
             &self.live.join("install.properties"),
-            &format!("candidate={} attempt={}", self.candidate, self.attempt),
+            &format!("payload={} attempt={}", self.payload, self.attempt),
         )?;
         required_file(&self.live.join("migration.plan"))
     }
 
     fn validate_running_version(&self, observed: &str) -> Result<(), Error> {
-        if observed.trim() != self.candidate {
-            return Err(format!("expected {}, observed {observed:?}", self.candidate).into());
+        if observed.trim() != self.payload {
+            return Err(format!("expected {}, observed {observed:?}", self.payload).into());
         }
         Ok(())
     }
@@ -412,7 +407,7 @@ impl Deployment {
         // post-finalize state instead of requiring transaction-temporary evidence.
         expect(
             &self.live.join("content.repository"),
-            &format!("schema=2 version={} migrated=true", self.candidate),
+            &format!("schema=2 version={} migrated=true", self.payload),
         )?;
         required_file(&self.live.join("change-ticket.receipt"))
     }
@@ -434,7 +429,7 @@ impl Deployment {
         self.require("verify")?;
         self.write(
             self.live.join("content.repository"),
-            format!("schema=2 version={} migrated=true\n", self.candidate).as_bytes(),
+            format!("schema=2 version={} migrated=true\n", self.payload).as_bytes(),
         )?;
         remove_if_present(&self.live.join("migration.plan"))?;
         remove_if_present(&self.live.join("removed-from-load-balancer"))?;
@@ -442,18 +437,25 @@ impl Deployment {
             self.live.join("change-ticket.receipt"),
             format!(
                 "green release {} published by attempt {}\n",
-                self.candidate, self.attempt
+                self.payload, self.attempt
             )
             .as_bytes(),
         )
     }
 
-    /// Restore the predecessor's durable state, then converge the process back onto it. On a
-    /// rollback `--candidate` IS the release being restored, so both directions converge the
-    /// workload the same way onto the same argument.
+    /// Compensate the failed payload's durable changes. The predecessor's own reconciler performs
+    /// the subsequent convergence, so rollback never guesses or starts another payload.
     fn rollback(&self) -> Result<(), Error> {
         self.restore_release()?;
-        self.converge_workload()
+        if let Ok(path) = fs::read_to_string(self.backup.join("workload.path")) {
+            let mut previous = self.clone();
+            previous.payload_root = PathBuf::from(path.trim());
+            previous.payload = fs::read_to_string(self.backup.join("workload.release"))?
+                .trim()
+                .into();
+            previous.converge_workload()?;
+        }
+        Ok(())
     }
 
     /// The durable half of `rollback`.
@@ -478,7 +480,7 @@ impl Deployment {
         durable::atomic_write(
             &self.output_dir.join("release.version"),
             ".demo-outputs",
-            self.candidate.as_bytes(),
+            self.payload.as_bytes(),
         )?;
         // The fixture's dataflow scenario wires this PUBLIC release version into a consumer. Echo
         // that one named value as an advertised output so the cluster test can prove the hook read
@@ -623,8 +625,8 @@ impl Deployment {
         remove_if_present(&self.workload_record("workload.release"))
     }
 
-    /// Converge the workload onto the candidate: leave one already running these bytes alone,
-    /// otherwise stop what is running and start the candidate's own entrypoint, detached into its
+    /// Converge the workload onto the payload: leave one already running these bytes alone,
+    /// otherwise stop what is running and start the payload's own entrypoint, detached into its
     /// own session so it belongs to the release rather than to this bounded invocation (the agent
     /// tears the hook's process tree down the moment the hook returns).
     ///
@@ -633,16 +635,16 @@ impl Deployment {
     fn converge_workload(&self) -> Result<(), Error> {
         let release =
             fs::read_to_string(self.workload_record("workload.release")).unwrap_or_default();
-        if self.workload_liveness() == Some(true) && release.trim() == self.candidate {
+        if self.workload_liveness() == Some(true) && release.trim() == self.payload {
             return Ok(());
         }
         self.stop_workload()?;
         let log = foundation::file::open_append_file(&self.workload_record("workload.log"))?;
         let pidfile = self.workload_record("workload.pid");
         let address = workload_address();
-        let mut command = std::process::Command::new(self.candidate_dir.join("bin/app"));
+        let mut command = std::process::Command::new(self.payload_root.join("bin/app"));
         command
-            .current_dir(&self.candidate_dir)
+            .current_dir(&self.payload_root)
             .args(["--addr", &address, "--await-record"])
             .arg(&pidfile)
             .stdin(std::process::Stdio::null())
@@ -655,12 +657,16 @@ impl Deployment {
         self.write(pidfile, format!("{}\n", child.id()).as_bytes())?;
         self.await_workload()?;
         self.write(
+            self.workload_record("workload.path"),
+            self.payload_root.to_string_lossy().as_bytes(),
+        )?;
+        self.write(
             self.workload_record("workload.release"),
-            format!("{}\n", self.candidate).as_bytes(),
+            format!("{}\n", self.payload).as_bytes(),
         )
     }
 
-    /// Wait for the started workload to serve its own version, within the budget `apply`'s dwell
+    /// Wait for the started workload to serve its own version, within the budget `converge`'s dwell
     /// arithmetic reserves for it. A release whose entrypoint cannot run at all fails its own
     /// activation here.
     fn await_workload(&self) -> Result<(), Error> {
@@ -668,7 +674,7 @@ impl Deployment {
         let mut last = String::from("no response");
         while std::time::Instant::now() < deadline {
             match self.observed_version() {
-                Ok(observed) if observed.trim() == self.candidate => return Ok(()),
+                Ok(observed) if observed.trim() == self.payload => return Ok(()),
                 Ok(observed) => last = format!("serving {observed:?}"),
                 Err(error) => last = error.to_string(),
             }
@@ -676,14 +682,14 @@ impl Deployment {
         }
         Err(format!(
             "the workload from {} never served {} ({last})",
-            self.candidate_dir.display(),
-            self.candidate
+            self.payload_root.display(),
+            self.payload
         )
         .into())
     }
 
     /// Ask the running application which release it is serving — the one probe of the live
-    /// socket, used both while `start` waits for the candidate to come up and by the steady-state
+    /// socket, used both while `start` waits for the payload to come up and by the steady-state
     /// `periodic` observation. The running application exists only outside the activation
     /// transaction (`periodic` runs after the agent has relaunched the process, and after agent or
     /// pod restarts), which is why in-transaction `verify` proves the activation from durable live
@@ -716,38 +722,6 @@ fn signal(pid: i32, signal: libc::c_int) {
     unsafe {
         libc::kill(pid, signal);
     }
-}
-
-fn named_arguments(
-    mut args: impl Iterator<Item = String>,
-) -> Result<std::collections::BTreeMap<String, String>, Error> {
-    let mut values = std::collections::BTreeMap::new();
-    while let Some(name) = args.next() {
-        if name == "--" {
-            break;
-        }
-        if !name.starts_with("--") {
-            return Err(format!("unexpected reconciler argument {name:?}").into());
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| format!("missing value for {name}"))?;
-        values.insert(name, value);
-    }
-    if values.get("--protocol").map(String::as_str) != Some(PROTOCOL) {
-        return Err("unsupported or missing reconciler protocol".into());
-    }
-    Ok(values)
-}
-
-fn required_argument<'a>(
-    values: &'a std::collections::BTreeMap<String, String>,
-    name: &str,
-) -> Result<&'a str, Error> {
-    values
-        .get(name)
-        .map(String::as_str)
-        .ok_or_else(|| format!("missing {name}").into())
 }
 
 fn required_file(path: &Path) -> Result<(), Error> {
@@ -803,32 +777,10 @@ pub(crate) fn run() {
 mod tests {
     use super::*;
 
-    /// The hook may only read flags the agent actually emits. A flag deleted from the published
-    /// grammar must fail here rather than silently become an always-absent value at runtime.
-    #[test]
-    fn every_flag_this_hook_reads_is_one_the_agent_emits() {
-        const SOURCE: &str = include_str!("reconciler.rs");
-        let mut read = Vec::new();
-        let mut rest = SOURCE;
-        while let Some(at) = rest.find("required_argument(&values, \"") {
-            rest = &rest[at + "required_argument(&values, \"".len()..];
-            let end = rest.find('"').expect("a terminated flag literal");
-            read.push(&rest[..end]);
-            rest = &rest[end..];
-        }
-        assert!(!read.is_empty(), "the flag reads must be discoverable");
-        for flag in read {
-            assert!(
-                updated_contracts::reconciler::FLAGS.contains(&flag),
-                "{flag} is read by this hook but is not part of the published invocation grammar"
-            );
-        }
-    }
-
     /// The `--reason` vocabulary is the published one, not literals of this fixture's own: the
     /// restart short-path and the per-boot marker rule both hinge on it, and a hook spelling the
     /// words itself would compile clean through a renamed spelling while silently running a full
-    /// update apply on every boot.
+    /// update converge on every boot.
     #[test]
     fn every_reason_the_agent_emits_selects_this_hooks_matching_path() {
         for reason in [Reason::Install, Reason::Restart, Reason::Update] {
@@ -839,7 +791,7 @@ mod tests {
             "a reason outside the grammar is refused, not silently treated as an update"
         );
 
-        let mut deployment = deployment(PathBuf::from("/nonexistent"), Operation::Apply, "a1");
+        let mut deployment = deployment(PathBuf::from("/nonexistent"), Operation::Converge, "a1");
         for (reason, per_boot) in [
             (Reason::Install, true),
             (Reason::Restart, true),
@@ -877,7 +829,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("provider");
         fs::create_dir_all(&root).unwrap();
-        let deployment = deployment(root, Operation::Apply, "a1");
+        let deployment = deployment(root, Operation::Converge, "a1");
 
         assert_eq!(
             deployment.workload_liveness(),
@@ -912,15 +864,14 @@ mod tests {
         root: PathBuf,
         phase: Operation,
         attempt: &str,
-        candidate: &str,
-        predecessor: &str,
+        payload: &str,
+        _predecessor: &str,
     ) -> Deployment {
         Deployment {
             phase,
             attempt: attempt.into(),
-            candidate: candidate.into(),
-            predecessor: predecessor.into(),
-            candidate_dir: root.join("candidate"),
+            payload: payload.into(),
+            payload_root: root.join("payload"),
             reason: Reason::Update,
             state: root.clone(),
             effects: root.join("attempts").join(attempt),
@@ -960,9 +911,9 @@ mod tests {
     fn a_completed_replay_reemits_the_complete_output_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let deployment = deployment(root.clone(), Operation::Apply, "replayed");
+        let deployment = deployment(root.clone(), Operation::Converge, "replayed");
         fs::create_dir_all(&deployment.effects).unwrap();
-        fs::write(deployment.effects.join("apply.done"), b"done\n").unwrap();
+        fs::write(deployment.effects.join("converge.done"), b"done\n").unwrap();
         fs::create_dir_all(&deployment.input_dir).unwrap();
         fs::write(deployment.input_dir.join("upstream_release"), b"21.0.0").unwrap();
 
@@ -979,7 +930,7 @@ mod tests {
     }
 
     /// The double-crash lifecycle that wedged real fleet nodes: a forward update captured the
-    /// true predecessor, crashed after `activate` had put the candidate live, and the agent then
+    /// true predecessor, crashed after `activate` had put the payload live, and the agent then
     /// drove the compensating direction under `<id>r`. Both compensating operations must act on
     /// the FORWARD attempt's capture — treating `<id>r` as a fresh attempt captured the
     /// crash-contaminated live files as "the predecessor", and a rollback under that id then
@@ -991,23 +942,28 @@ mod tests {
 
         // Steady predecessor state, then the forward attempt's capture — the one taken while the
         // live files are genuinely the predecessor's.
-        let forward =
-            deployment_between(root.clone(), Operation::Apply, "abc123", "23.0.0", "22.0.0");
+        let forward = deployment_between(
+            root.clone(),
+            Operation::Converge,
+            "abc123",
+            "23.0.0",
+            "22.0.0",
+        );
         fs::create_dir_all(&forward.live).unwrap();
         for name in ROLLBACK_SET {
             forward.write(forward.live.join(name), b"22.0.0").unwrap();
         }
         forward.capture_rollback_backup().unwrap();
 
-        // The crash: `activate` already published the candidate into live when the node died.
+        // The crash: `activate` already published the payload into live when the node died.
         forward
             .write(forward.live.join("application.war"), b"23.0.0")
             .unwrap();
 
-        // The compensating apply's `prepare` must not recapture over the transaction's backup.
+        // The compensating converge's `prepare` must not recapture over the transaction's backup.
         let compensating = deployment_between(
             root.clone(),
-            Operation::Apply,
+            Operation::Converge,
             "abc123r",
             "22.0.0",
             "23.0.0",
@@ -1034,15 +990,16 @@ mod tests {
     }
 
     #[test]
-    fn an_update_apply_fits_the_signed_provider_timeout_for_every_attempt_id() {
+    fn an_update_converge_fits_the_signed_provider_timeout_for_every_attempt_id() {
         // The agent bounds the whole hook invocation by the provider timeout the demo signs
         // in, so the WORST case over attempt ids — fixed work plus both dwells — has to fit it
-        // with margin. Otherwise a healthy candidate is killed mid-apply and the cohort rolls
+        // with margin. Otherwise a healthy payload is killed mid-converge and the cohort rolls
         // back, deterministically for that attempt id (the retry re-runs the same steps).
         let root = PathBuf::from("/nonexistent");
         let mut worst = Duration::ZERO;
         for id in 0..5_000u32 {
-            let deployment = deployment(root.clone(), Operation::Apply, &format!("attempt-{id}"));
+            let deployment =
+                deployment(root.clone(), Operation::Converge, &format!("attempt-{id}"));
             let pre_drain = deployment.dwell("pre-drain");
             let pre_start = deployment.dwell("pre-start");
             for dwell in [pre_drain, pre_start] {
@@ -1055,22 +1012,23 @@ mod tests {
             }
             worst = worst.max(pre_drain + pre_start);
         }
-        let apply = Duration::from_millis(APPLY_FIXED_WORK_MS) + worst;
+        let converge = Duration::from_millis(CONVERGE_FIXED_WORK_MS) + worst;
         assert!(
-            apply + Duration::from_millis(APPLY_MARGIN_MS)
+            converge + Duration::from_millis(CONVERGE_MARGIN_MS)
                 <= Duration::from_millis(PROVIDER_TIMEOUT_MS),
-            "worst-case apply {apply:?} leaves less than the margin under the provider timeout"
+            "worst-case converge {converge:?} leaves less than the margin under the provider timeout"
         );
     }
 
     #[test]
-    fn the_two_dwells_of_one_apply_differ() {
-        // Both dwells run under Operation::Apply in one process. Keying only on attempt+operation
+    fn the_two_dwells_of_one_converge_differ() {
+        // Both dwells run under Operation::Converge in one process. Keying only on attempt+operation
         // made them identical, doubling the longest dwell into the timeout; the step must vary it.
         let root = PathBuf::from("/nonexistent");
         let mut distinct = 0;
         for id in 0..1_000u32 {
-            let deployment = deployment(root.clone(), Operation::Apply, &format!("attempt-{id}"));
+            let deployment =
+                deployment(root.clone(), Operation::Converge, &format!("attempt-{id}"));
             if deployment.dwell("pre-drain") != deployment.dwell("pre-start") {
                 distinct += 1;
             }
@@ -1084,8 +1042,8 @@ mod tests {
     #[test]
     fn a_dwell_is_stable_across_crash_recovery_retries_of_its_step() {
         let root = PathBuf::from("/nonexistent");
-        let first = deployment(root.clone(), Operation::Apply, "attempt-7").dwell("pre-drain");
-        let retry = deployment(root, Operation::Apply, "attempt-7").dwell("pre-drain");
+        let first = deployment(root.clone(), Operation::Converge, "attempt-7").dwell("pre-drain");
+        let retry = deployment(root, Operation::Converge, "attempt-7").dwell("pre-drain");
         assert_eq!(first, retry);
     }
 
@@ -1093,7 +1051,7 @@ mod tests {
     fn cold_boot_start_does_not_require_an_update_activation() {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().to_path_buf();
-        let mut deployment = deployment(root.clone(), Operation::Apply, attempt::BOOT);
+        let mut deployment = deployment(root.clone(), Operation::Converge, attempt::BOOT);
         deployment.reason = Reason::Install;
         fs::create_dir_all(&deployment.live).unwrap();
 
@@ -1115,14 +1073,14 @@ mod tests {
         // come from durable live state, or every update fails and rolls back.
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().to_path_buf();
-        let deployment = deployment(root.clone(), Operation::Apply, "T");
+        let deployment = deployment(root.clone(), Operation::Converge, "T");
         fs::create_dir_all(&deployment.effects).unwrap();
         fs::create_dir_all(&deployment.live).unwrap();
         fs::write(deployment.effects.join("start.done"), b"done\n").unwrap();
         fs::write(deployment.live.join("application.war"), b"22.0.0\n").unwrap();
         fs::write(
             deployment.live.join("install.properties"),
-            b"candidate=22.0.0 attempt=T\n",
+            b"payload=22.0.0 attempt=T\n",
         )
         .unwrap();
         fs::write(
@@ -1135,14 +1093,14 @@ mod tests {
     }
 
     #[test]
-    fn a_replayed_apply_keeps_the_attempts_original_rollback_backup() {
-        // A crash after `activate` but before `apply.done` — or the agent's recovery
-        // activation, which re-invokes `apply` under the same attempt id — replays `prepare` with
-        // the candidate already in `live`. Re-copying then would leave `rollback` restoring the
-        // candidate's bytes as if they were the predecessor's.
+    fn a_replayed_converge_keeps_the_attempts_original_rollback_backup() {
+        // A crash after `activate` but before `converge.done` — or the agent's recovery
+        // activation, which re-invokes `converge` under the same attempt id — replays `prepare` with
+        // the payload already in `live`. Re-copying then would leave `rollback` restoring the
+        // payload's bytes as if they were the predecessor's.
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().to_path_buf();
-        let deployment = deployment(root.clone(), Operation::Apply, "T");
+        let deployment = deployment(root.clone(), Operation::Converge, "T");
         fs::create_dir_all(&deployment.effects).unwrap();
         fs::create_dir_all(&deployment.live).unwrap();
         fs::write(deployment.effects.join("preflight.done"), b"done\n").unwrap();

@@ -1,5 +1,5 @@
 {
-  "schema": 4,
+  "schema": 5,
   "deployment": "production-web-2026-07-18.1",
   "metadataUrl": "https://cdn.example.com/tuf/metadata/",
   "targetsUrl": "https://cdn.example.com/tuf/targets/",
@@ -8,10 +8,6 @@
     "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
   },
   "coldInstallFallback": false,
-  "providerSet": {
-    "path": "provider-sets/web-linux-v4.json",
-    "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
-  },
   "releaseRoot": {
     "signed": {
       "_type": "root",
@@ -31,7 +27,9 @@
     "inputs": {
       "generation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "object_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "files": ["database_host"]
+      "files": [
+        "database_host"
+      ]
     },
     "repository": {
       "metadataLimit": 1048576,
@@ -40,8 +38,6 @@
     },
     "storage": {
       "inactiveReleases": 2,
-      "inactiveProviders": 2,
-      "inactiveAgents": 2,
       "inactiveBytes": 1073741824,
       "inactiveRepositoryCaches": 2
     },
@@ -51,8 +47,7 @@
       "healthSuccesses": 2,
       "healthIntervalSeconds": 1,
       "refreshRetrySeconds": 5,
-      "confirmationWindowSeconds": 120,
-      "agentCheckIntervalSeconds": 3600
+      "confirmationWindowSeconds": 120
     }
   }
 }

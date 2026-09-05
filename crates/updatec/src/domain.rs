@@ -604,11 +604,7 @@ fn resolve_one(
             // release's endpoints under the new deployment, with the control plane believing the
             // producer moved.
             if !identity.as_deref().is_some_and(|identity| {
-                report.is_converged_to(
-                    identity,
-                    &producer.deployment.application.sha256,
-                    &producer.deployment.provider_set.sha256,
-                )
+                report.is_converged_to(identity, &producer.deployment.application.sha256)
             }) {
                 return false;
             }
@@ -714,10 +710,6 @@ mod tests {
                 sha256: DIGEST.into(),
             },
             cold_install_fallback: false,
-            provider_set: TargetReference {
-                path: "providers".into(),
-                sha256: DIGEST.into(),
-            },
             release_root: serde_json::json!({}),
             runtime: crate::tests::managed_runtime(),
         }
@@ -1154,10 +1146,6 @@ mod tests {
                 },
                 application: crate::TargetSpec {
                     path: "app".into(),
-                    sha256: DIGEST.into(),
-                },
-                provider_set: crate::TargetSpec {
-                    path: "providers".into(),
                     sha256: DIGEST.into(),
                 },
                 ..crate::tests::deployment_spec("default")
@@ -1937,7 +1925,7 @@ mod tests {
             identity.clone(),
             "1.0.0",
             "b".repeat(64),
-            default.provider_set.sha256.clone(),
+            "f".repeat(64),
             false,
         )
         .unwrap();
@@ -2056,7 +2044,7 @@ mod tests {
             identity.clone(),
             "1.0.0",
             "b".repeat(64),
-            default.provider_set.sha256.clone(),
+            "f".repeat(64),
             false,
         )
         .unwrap();

@@ -602,8 +602,16 @@ fn durable_key_pem(state_dir: &Path) -> io::Result<String> {
     // key file is there, and generating over it destroys the durable identity the control plane
     // pinned: the node's telemetry stops verifying and it can never prove it is itself again.
     match crate::tls::read_private_key_pem(&path, foundation::file::FinalSymlink::Refuse) {
-        Ok(existing) if !existing.trim().is_empty() => return Ok(existing),
-        Ok(_) => {}
+        Ok(existing) if !existing.trim().is_empty() => {
+            // A concurrent creator may have linked the complete key but not yet synced its name.
+            foundation::durable::sync_dir(state_dir)?;
+            return Ok(existing);
+        }
+        Ok(_) => {
+            return Err(invalid(
+                "the durable node key is empty; refusing to replace it",
+            ))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(io::Error::new(
@@ -616,9 +624,23 @@ fn durable_key_pem(state_dir: &Path) -> io::Result<String> {
         }
     }
     let key_pem = crate::csr::generate_key()?;
-    // `atomic_write` commits owner-only, so no chmod follows.
-    foundation::durable::atomic_write(&path, ".agent-key-", key_pem.as_bytes())?;
-    Ok(key_pem)
+    match foundation::durable::atomic_write_new(&path, ".agent-key-", key_pem.as_bytes()) {
+        Ok(()) => Ok(key_pem),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // Another enrollment published first. Its complete key is the only identity either
+            // caller may send to the gateway; never return the losing in-memory key.
+            let key =
+                crate::tls::read_private_key_pem(&path, foundation::file::FinalSymlink::Refuse)?;
+            if key.trim().is_empty() {
+                return Err(invalid(
+                    "the durable node key is empty; refusing to replace it",
+                ));
+            }
+            foundation::durable::sync_dir(state_dir)?;
+            Ok(key)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Durably write the minted leaf. The gateway's CA signs node leaves directly, so the leaf is the
@@ -669,6 +691,52 @@ mod tests {
     };
     use std::cell::Cell;
     use std::ffi::OsString;
+
+    #[test]
+    fn concurrent_enrollment_keeps_one_complete_durable_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let keys = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        durable_key_pem(directory.path()).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let persisted = durable_key_pem(directory.path()).unwrap();
+        assert!(keys.iter().all(|key| *key == persisted));
+        crate::csr::csr_for(&persisted, "test").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(joined_key_path(directory.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn empty_enrollment_key_is_never_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        foundation::durable::atomic_write(&joined_key_path(directory.path()), ".test-", b"")
+            .unwrap();
+        assert!(durable_key_pem(directory.path()).is_err());
+        assert!(std::fs::read(joined_key_path(directory.path()))
+            .unwrap()
+            .is_empty());
+    }
 
     fn bundle() -> Vec<u8> {
         serde_json::to_vec(&EnrollmentBundle {

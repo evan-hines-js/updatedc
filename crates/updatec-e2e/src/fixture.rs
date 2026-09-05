@@ -54,8 +54,6 @@ pub(crate) fn runtime() -> RuntimeSpec {
         },
         storage: updated_contracts::assignment::ManagedStorage {
             inactive_releases: 2,
-            inactive_providers: 2,
-            inactive_agents: 2,
             inactive_bytes: 1_073_741_824,
             inactive_repository_caches: 2,
         },
@@ -66,7 +64,6 @@ pub(crate) fn runtime() -> RuntimeSpec {
             health_interval_seconds: 1,
             refresh_retry_seconds: 2,
             confirmation_window_seconds: 2,
-            agent_check_interval_seconds: 3600,
         },
     }
 }
@@ -76,7 +73,6 @@ pub(crate) fn deployment(
     version: &str,
     platform: &str,
     app_sha: &str,
-    provider_sha: &str,
     root_json: &str,
 ) -> DeploymentSpec {
     deployment_with_name(
@@ -85,7 +81,6 @@ pub(crate) fn deployment(
         version,
         platform,
         app_sha,
-        provider_sha,
         root_json,
     )
 }
@@ -96,7 +91,6 @@ fn deployment_with_name(
     version: &str,
     platform: &str,
     app_sha: &str,
-    provider_sha: &str,
     root_json: &str,
 ) -> DeploymentSpec {
     DeploymentSpec {
@@ -111,10 +105,6 @@ fn deployment_with_name(
             sha256: app_sha.into(),
         },
         cold_install_fallback: false,
-        provider_set: TargetSpec {
-            path: "provider-sets/default.json".into(),
-            sha256: provider_sha.into(),
-        },
         runtime: runtime(),
     }
 }
@@ -257,7 +247,6 @@ pub(crate) fn print_kind_resources(
     let v1_sha = args.next().ok_or("resources needs the v1 sha256")?;
     let v2_sha = args.next().ok_or("resources needs the v2 sha256")?;
     let v3_sha = args.next().ok_or("resources needs the v3 sha256")?;
-    let provider_sha = args.next().ok_or("resources needs the provider sha256")?;
     let root_path = args.next().ok_or("resources needs a root.json path")?;
     let mode = args.next();
     if args.next().is_some() {
@@ -265,15 +254,7 @@ pub(crate) fn print_kind_resources(
     }
     let root = std::fs::read_to_string(root_path)?;
     let kind_deployment = |origin: &str, identity: &str, version: &str, sha: &str| {
-        deployment_with_name(
-            origin,
-            identity,
-            version,
-            &platform,
-            sha,
-            &provider_sha,
-            &root,
-        )
+        deployment_with_name(origin, identity, version, &platform, sha, &root)
     };
 
     match mode.as_deref() {
@@ -313,7 +294,7 @@ mod tests {
         assert_eq!(set.spec.max_regressions, Some(1));
         assert_eq!(set.spec.on_regression, RegressionResponse::Rollback);
         for name in SOAK_GROUPS {
-            let deployment = deployment(name, "1.0.0", "linux-x86_64", "a", "b", "{}");
+            let deployment = deployment(name, "1.0.0", "linux-x86_64", "a", "{}");
             let group = group(name, deployment);
             assert_eq!(
                 group
@@ -329,8 +310,8 @@ mod tests {
 
     #[test]
     fn runtime_bounds_are_shared_by_every_fixture_deployment() {
-        let left = deployment("left", "1.0.0", "linux-x86_64", "a", "b", "{}");
-        let right = deployment("right", "2.0.0", "linux-x86_64", "c", "d", "{}");
+        let left = deployment("left", "1.0.0", "linux-x86_64", "a", "{}");
+        let right = deployment("right", "2.0.0", "linux-x86_64", "c", "{}");
         assert_eq!(
             serde_json::to_value(left.runtime).unwrap(),
             serde_json::to_value(right.runtime).unwrap()
@@ -339,17 +320,13 @@ mod tests {
 
     #[test]
     fn kind_and_soak_share_bytes_but_keep_their_required_identities() {
-        let kind = deployment_with_name("edge", "edge", "2.0.0", "linux-x86_64", "a", "b", "{}");
-        let soak = deployment("edge", "2.0.0", "linux-x86_64", "a", "b", "{}");
+        let kind = deployment_with_name("edge", "edge", "2.0.0", "linux-x86_64", "a", "{}");
+        let soak = deployment("edge", "2.0.0", "linux-x86_64", "a", "{}");
         assert_eq!(kind.name, "edge");
         assert_eq!(soak.name, "edge-2.0.0");
         assert_eq!(
             serde_json::to_value(&kind.application).unwrap(),
             serde_json::to_value(&soak.application).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&kind.provider_set).unwrap(),
-            serde_json::to_value(&soak.provider_set).unwrap()
         );
         assert_eq!(
             serde_json::to_value(&kind.runtime).unwrap(),

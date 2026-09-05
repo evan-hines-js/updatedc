@@ -1,9 +1,9 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 //! The node agent: a package runner. It pulls signed TUF bundles, activates them through a
-//! durable transaction, and invokes the release's own reconciler hooks — `apply`, `healthcheck`,
+//! durable transaction, and invokes the release's own reconciler hooks — `converge`, `healthcheck`,
 //! `rollback`, `inspect`. It never launches, signals, or holds a PID of any workload. The agent
-//! is itself replaceable, by pointer flip through the launcher.
+//! is restarted and upgraded by the platform service manager.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{with_suffix, Application, Paths, Routing, Timeouts};
+use updated::config::{Application, Paths, Routing, Timeouts};
 /// The reconciler protocol vocabulary is defined once, in the contracts crate, and shared with
 /// every reconciler implementation in this workspace.
 use updated_contracts::reconciler::{
@@ -27,14 +27,12 @@ mod gc;
 mod heartbeat;
 mod host;
 mod install;
-mod launcher;
 mod options;
 mod recovery;
 mod repair;
 mod runtime_data;
 mod schedule;
 mod selection;
-mod self_update;
 mod store;
 mod telemetry;
 #[cfg(test)]
@@ -48,26 +46,21 @@ use domain::*;
 use gc::*;
 use heartbeat::*;
 use install::ensure_installed;
-use launcher::Launcher;
 use options::*;
 use recovery::*;
 use repair::*;
 use schedule::*;
 use selection::*;
-use self_update::*;
 use store::*;
 use transient::*;
 use update::*;
 
-use updated::hash::sha256_file;
-use updated_tuf::select::{target_sha, SelectedRelease};
-use updated_tuf::{DefaultPolicy, TrustedRepository};
+use updated_tuf::TrustedRepository;
 
-/// This agent build's version, baked in (see `build.rs`). Self-update selection is
-/// by content hash, not this — it is for logs and for distinguishing builds.
-const SELF_VERSION: &str = env!("AGENT_VERSION");
+const SELF_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct Options {
+    helper_executable: PathBuf,
     deployment: String,
     assignment_sha256: String,
     routing: Routing,
@@ -79,9 +72,8 @@ struct Options {
     storage: updated_contracts::assignment::ManagedStorage,
     /// Canonical bundle installation layout.
     paths: Paths,
-    agent_update: AgentUpdate,
     runtime_data: runtime_data::RuntimeDataManager,
-    /// Latched until the currently resolved inputs survive a successful reconciler apply.
+    /// Latched until the currently resolved inputs survive a successful reconciler converge.
     runtime_converge_pending: bool,
     identity_renewal: IdentityRenewal,
 }
@@ -117,13 +109,6 @@ impl Options {
         self.inputs = inputs;
         self.timeouts = BoundedTimeouts::new(Timeouts::from_runtime(runtime));
         self.storage = runtime.storage.clone();
-        // The agent's OWN update rides the same assignment: its channel and cadence are the
-        // application's, seeded once at `parse_args` from the boot-time config. Reconcile them here
-        // too, or a node the control plane moves from `stable` to `canary` keeps selecting the
-        // `agent` product from `stable` — and keeps checking on the old cadence — for as long
-        // as the process lives, since nothing else ever rewrites these two fields.
-        self.agent_update.channel = self.application.channel.clone();
-        self.agent_update.check_interval = self.timeouts.agent_check_interval;
         self.runtime_converge_pending
     }
 
@@ -140,16 +125,6 @@ impl Options {
     ) -> bool {
         !self.runtime_converge_pending && self.application.input_selection == runtime.inputs
     }
-}
-
-/// The agent stages a verified release from the reserved `agent` product
-/// into the launcher's content-addressed state directory and hands it off for a
-/// readiness-gated replacement.
-struct AgentUpdate {
-    channel: String,
-    /// The launcher's state directory, holding `agents/<id>/` staging dirs.
-    state_dir: PathBuf,
-    check_interval: Duration,
 }
 
 /// Mutable bookkeeping for the update-check loop: the metadata-refresh backoff and the next
@@ -177,12 +152,9 @@ impl LoopState {
 /// observe — so a probe is an observation, never a verdict that ends this process. Only the boot
 /// gate, inside a confirmation window, turns unhealth into action.
 ///
-/// Every converge outside the loop proves the release healthy before returning: boot and the
-/// update transaction both gate on [`update::became_healthy`], which polls for the configured
-/// `health_grace`. A converge the loop performs itself has no such gate, so this type is where that
-/// grace is applied instead: [`HealthWatch::reconverging`] is the single pre-mutation boundary
-/// that restarts tracking. Entering it before the reconciler runs also prevents a failed partial
-/// apply from reporting the previous release's readiness under a new assignment.
+/// Boot, update transactions, and routine convergence all use [`update::became_healthy`].
+/// [`HealthWatch::reconverging`] invalidates readiness before mutation; routine convergence
+/// replaces that provisional value with its bounded gate's verdict before the cycle reports.
 struct HealthWatch {
     next_probe: Instant,
     /// Latest readiness observation, so a report reflects whether the deployed release is
@@ -233,7 +205,7 @@ impl HealthWatch {
     }
 }
 
-/// The loop's one non-transactional reapply path. Readiness turns false before `apply` can make a
+/// The loop's one non-transactional reconvergence path. Readiness turns false before `converge` can make a
 /// partial side effect; a caller therefore cannot publish old readiness or outputs under the
 /// changed assignment when convergence fails.
 async fn reconverge_environment(
@@ -242,41 +214,51 @@ async fn reconverge_environment(
     health: &mut HealthWatch,
 ) -> io::Result<updated_contracts::reconciler::SuccessfulMutation> {
     health.reconverging(&opts.timeouts);
-    let result = converge_environment(opts, store, Reason::Restart, attempt::CONVERGE)?;
-    if result.host_action() == HostAction::Reboot {
-        return Ok(result);
+    let result = converge_environment(
+        opts,
+        store,
+        Reason::Restart,
+        attempt::CONVERGE,
+        Some(update::STEADY_STATE_CONVERGE_TIMEOUT),
+    )?;
+    if result.host_action() != HostAction::Reboot {
+        let Installed::Present(installed) = store.installed()? else {
+            return Err(io::Error::other("no installed release after convergence"));
+        };
+        let target = ReleaseTarget {
+            release: &installed.release,
+            archive_sha256: &installed.archive_sha256,
+        };
+        let mut reconciler = ReleaseReconciler::new(opts, &installed.reconciler, Reason::Restart);
+        let verdict =
+            update::became_healthy(&mut reconciler, attempt::CONVERGE, target, target).await;
+        health.observed(
+            Instant::now(),
+            matches!(verdict, update::Health::Ready),
+            &opts.timeouts,
+        );
     }
-
-    let installed = match store.installed()? {
-        Installed::Present(installed) => installed,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a verified installed release is required after convergence",
-            ))
-        }
-    };
-    let target = ReleaseTarget {
-        release: &installed.release,
-        archive_sha256: &installed.archive_sha256,
-    };
-    let mut reconciler =
-        ReleaseReconciler::new(opts, installed.lifecycle.as_ref(), Reason::Restart);
-    let gate = update::became_healthy(&mut reconciler, attempt::CONVERGE, target, target).await;
-    if let update::Health::Inconclusive(error) = &gate {
-        warn(&format!(
-            "the post-convergence health gate could not reach the reconciler ({error})"
-        ));
-    }
-    health.observed(
-        Instant::now(),
-        matches!(gate, update::Health::Ready),
-        &opts.timeouts,
-    );
     Ok(result)
 }
 
 fn main() {
+    if let Some(code) = updated::native_runtime::dispatch()
+        .or_else(updated::command_adapter::control_dispatch)
+        .or_else(updated::command_adapter::dispatch)
+    {
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
+    if let Some(code) = updated::helper::dispatch() {
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
     // The chaos-feature build can enumerate its own transaction boundaries, so the e2e
     // drives exactly the crossings the agent defines instead of a hand-copied list.
     #[cfg(feature = "chaos")]
@@ -303,7 +285,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let opts = match runtime.block_on(parse_args()) {
+    let (opts, _enrollment_lock) = match runtime.block_on(parse_args()) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("agent: {e}\n");
@@ -311,7 +293,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(e) = runtime.block_on(run(opts)) {
+    let reporter = telemetry::AttentionReporter::new(&opts);
+    let result = runtime.block_on(run(opts));
+    runtime.block_on(reporter.report());
+    if let Err(e) = result {
         eprintln!("agent: fatal: {e}");
         std::process::exit(1);
     }
@@ -326,8 +311,14 @@ fn usage() {
 
 async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // One owner protects the shared binary, state, journal, and staging paths.
-    let _lock = updated::lock::InstanceLock::acquire(&with_suffix(&opts.paths.installed, ".lock"))
+    let _lock = opts
+        .paths
+        .lock_installation()
         .map_err(|e| format!("another agent already owns this install: {e}"))?;
+
+    if let Some(hold) = updated::command_adapter::read_attention(&opts.paths.install_root)? {
+        return Err(format!("operator attention required: {}", hold.message).into());
+    }
 
     // Reconciler exchanges contain plaintext assigned inputs. `InvocationData::drop` removes the
     // ordinary case; this is the crash-recovery half of the same ownership rule. Run it only after
@@ -345,9 +336,12 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut launcher =
-        Launcher::connect().map_err(|e| format!("connecting to the launcher: {e}"))?;
-
+    // A completed hook may have requested reboot just before this process died. Honor it before
+    // recovery, input fetching, any further hook, or a health verdict in the same OS boot.
+    if host::reboot_pending(&opts.paths.pending_reboot)? {
+        request_host_reboot(&shutdown).await?;
+        return Ok(());
+    }
     let mut store = Store::open(opts.paths.clone())?;
 
     // Reconcile any in-flight install journal and cold-install a fresh node, returning whether
@@ -356,9 +350,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // restarts. All first-install placement happens inside this durable, crash-recoverable
     // install; there is no first-install branch after it.
     let first_install = ensure_installed(&opts, &mut store).await?;
-
-    // Claim the launcher's marker once, up front.
-    let mut evidence = launcher::Evidence::read(&opts.agent_update.state_dir)?;
 
     // Whether this boot repaired a damaged committed tree. A permanent, hash-keyed rejection may
     // never be charged to bytes this boot re-downloaded and re-verified, so it is the one input
@@ -397,11 +388,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Gather the whole world into a Situation and let the pure boot planner decide everything:
-    // recovery, drift enforcement, journaled rejections, and pending confirmation. The
-    // rejected-agent claim is surrendered — and only then is its file erased — at the point the
-    // durable consequence it implies has landed.
-    let situation = gather_situation(&opts, &store, &evidence)?;
+    // Gather the whole world into a Situation and let the pure boot planner decide
+    // recovery, drift enforcement, and journaled rejections.
+    let situation = gather_situation(&store)?;
     let mut recovery_transaction = recovery_transaction(&situation);
     let defer_recovery_commit = recovery_transaction
         .as_ref()
@@ -419,8 +408,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     let current = plan.current.clone();
 
-    let mut self_update = SelfUpdateState::load(&opts)?;
-
     // A confirmation-window revert starts rollback by materializing the same phase journal
     // used by ordinary activation failures. From this write onward there is exactly one
     // recovery path, including if this agent dies before touching the pointer.
@@ -435,7 +422,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             &mut store,
             recovery_transaction
                 .as_ref()
-                .expect("pending lifecycle recovery has a transaction"),
+                .expect("pending reconciler recovery has a transaction"),
         )?;
     }
     if let Some(tx) = recovery_transaction.as_mut() {
@@ -445,38 +432,84 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // `RolledBack` file left behind by a tolerated `clear_journal` failure), and the
         // `pending`-derived rollbacks are synthesized already on the path.
         if !tx.is_rollback() {
-            advance_transaction(&mut store, tx, TransactionPhase::RollbackActivating)?;
+            advance_transaction(&mut store, tx, TransactionPhase::RollbackPlanned)?;
         }
+    }
+
+    // Recovery uses the inputs pinned before this transaction touched the host. A newer live
+    // assignment must not replace those credentials, and a network fault must not block rollback.
+    let input_attempt = recovery_transaction
+        .as_ref()
+        .map(|tx| tx.id.as_str())
+        .or_else(|| match &situation.installed {
+            Installed::Present(state) => state
+                .rollback_guard
+                .as_ref()
+                .map(|guard| guard.attempt_id.as_str()),
+            _ => None,
+        });
+    let pinned = match input_attempt {
+        Some(attempt) => opts
+            .runtime_data
+            .restore_pin(&opts.paths.recovery_inputs, attempt)?,
+        None => false,
+    };
+    if pinned {
+        opts.application.input_selection = opts.runtime_data.selection().clone();
+    }
+    if !pinned
+        && !opts
+            .runtime_data
+            .acquire(
+                &opts.assignment_sha256,
+                &opts.application.input_selection,
+                &shutdown,
+            )
+            .await
+            .map_err(|error| {
+                format!("boot input acquisition requires a fresh assignment: {error}")
+            })?
+    {
+        log("shutdown requested while waiting for assigned runtime data; exiting");
+        return Ok(());
+    }
+    opts.inputs = opts.runtime_data.inputs().clone();
+
+    // Candidate compensation is its own completed-effect barrier. It runs with the candidate's
+    // reconciler and payload before the predecessor pointer or machine state is touched.
+    let recovery_action =
+        recover_through_transients("candidate rollback recovery", &shutdown, || {
+            complete_candidate_compensation(&opts, &mut store, recovery_transaction.as_mut())
+        })
+        .await?;
+    if recovery_action == HostAction::Reboot {
+        request_host_reboot(&shutdown).await?;
+        return Ok(());
     }
 
     // Perform the plan's durable reconciliation (binary, rejections, commit), yielding the
     // still-unconfirmed update (if any) for the loop to confirm once its window passes.
-    // A failure here leaves the journal and the unspent marker claim intact and EXITS (see
-    // `exit_for_relaunch`), so the launcher relaunches this agent and boot recovery re-derives
+    // A failure here leaves the journal intact and EXITS (see `exit_for_relaunch`), so the platform
+    // service manager relaunches this agent and boot recovery re-derives
     // the identical, idempotent reconciliation from that durable evidence — unless the cause is a
     // node-local transient, which `recover_through_transients` waits out instead (see there).
-    let mut pending =
-        recover_through_transients("boot/update recovery", &mut launcher, &shutdown, || {
-            execute_boot_plan(
-                &plan,
-                &mut store,
-                &mut self_update,
-                defer_recovery_commit,
-                recovery_transaction.as_mut(),
-                &mut evidence,
-            )
-        })
-        .await?;
-    // Restore the predecessor's machine state (rollback recovery): the predecessor's own `apply`,
+    let mut pending = recover_through_transients("boot/update recovery", &shutdown, || {
+        execute_boot_plan(
+            &plan,
+            &mut store,
+            defer_recovery_commit,
+            recovery_transaction.as_mut(),
+        )
+    })
+    .await?;
+    // Restore the predecessor's machine state (rollback recovery): the predecessor's own `converge`,
     // replayed under the transaction's identity — `complete_recovery_activation` resolves whether
     // this boot still owes it.
-    let recovery_action = recover_through_transients(
-        "predecessor activation recovery",
-        &mut launcher,
-        &shutdown,
-        || complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut()),
-    )
-    .await?;
+    let recovery_action =
+        recover_through_transients("predecessor activation recovery", &shutdown, || {
+            complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut())
+        })
+        .await?;
     if recovery_action == HostAction::Reboot {
         request_host_reboot(&shutdown).await?;
         return Ok(());
@@ -484,7 +517,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if pending.is_some() {
         if let Some(v) = current.as_deref() {
             log(&format!(
-                "update {v} is unconfirmed; a failed health gate within its window reverts it"
+                "update {v} is unconfirmed; failed boot verification reverts it"
             ));
         }
     }
@@ -498,47 +531,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         opts.timeouts.check_interval.as_secs()
     ));
 
-    // Signal *agent* readiness to the launcher now that this boot has reconciled its durable
-    // state — BEFORE fetching assigned inputs or gating the release's health. For a committed agent this is
-    // a no-op; for a candidate it begins the launcher's confirmation window. Signalling here
-    // decouples "the agent process started successfully" from everything downstream that depends on
-    // the control plane or on the release: neither a slow reconciler nor an unreachable input
-    // capability can blow the launcher's ready_timeout and get a perfectly good agent rejected — and
-    // that rejection is by content hash and never expires.
-    //
-    // The price is real and deliberate: from here the confirmation window runs on its own clock, so
-    // a candidate that spends it waiting for inputs is committed WITHOUT having converged the
-    // release, and the boot converge and health gate below both run inside the window rather than
-    // in front of it. That is the trade this ordering buys — commitment attests these agent bytes
-    // started and stayed up, not that the control plane was reachable or that the release is
-    // healthy.
-    let ready = launcher.signal_ready();
-    #[cfg(all(feature = "chaos", agent_chaos_exit_after_ready))]
-    {
-        eprintln!("agent: CHAOS: exiting after readiness, before launcher confirmation");
-        std::process::exit(137);
-    }
-
-    // Acquire the assigned sensitive runtime data, waiting out a control-plane outage: every
-    // reconciler invocation consumes it, so no hook may run without it. `ready` is the
-    // proof that this wait sits behind the readiness signal — in front of it, an unreachable
-    // input capability is indistinguishable from an agent binary that cannot start, and gets the
-    // candidate's bytes rejected for good.
-    if !opts
-        .runtime_data
-        .acquire(
-            &opts.assignment_sha256,
-            &opts.application.input_selection,
-            &shutdown,
-            ready,
-        )
-        .await
-    {
-        log("shutdown requested while waiting for assigned runtime data; exiting");
-        return Ok(());
-    }
-    opts.inputs = opts.runtime_data.inputs().clone();
-
     // One reason for this whole boot, so the converge below and the gate after it can never
     // disagree about what kind of boot the reconciler is being asked to serve.
     let boot_reason = if first_install {
@@ -546,46 +538,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Reason::Restart
     };
-    // The boot converge is the COMMITTED release's `apply` and never runs during recovery: a boot
-    // resuming an interrupted update or rollback replays only that transaction's own minimal,
-    // idempotent steps, and applying the committed candidate here while a rollback commit is still
-    // deferred would converge the machine onto the very release the rollback is undoing. A rollback
-    // recovery instead re-runs the predecessor's own `apply` on every boot until the rollback
-    // completes — see [`complete_recovery_activation`].
-    if recovery_transaction.is_none() {
-        log(&format!(
-            "starting reconciler apply for release {} with reason {}",
-            current.as_deref().unwrap_or("<unknown>"),
-            boot_reason.as_str()
-        ));
-        let convergence =
-            recover_through_transients("boot reconciler apply", &mut launcher, &shutdown, || {
-                converge_environment(&opts, &store, boot_reason, attempt::BOOT)
-            })
-            .await?;
-        log(&format!(
-            "reconciler apply for release {} completed; entering the boot health gate",
-            current.as_deref().unwrap_or("<unknown>")
-        ));
-        if convergence.host_action() == HostAction::Reboot {
-            request_host_reboot(&shutdown).await?;
-            return Ok(());
-        }
-    }
-    // Gate readiness: the release's own `healthcheck` must pass before this boot is trusted. It is
-    // the only health source — the agent owns no workload process to observe — and readiness was
-    // signalled long before it, so for a candidate agent a failure here is an exit *inside* the
-    // launcher's confirmation window.
-    //
-    // During a crash-recovered rollback the predecessor commit is deferred until *after* this gate,
-    // so `store.installed()` still holds the CANDIDATE record. Gate the restored predecessor with
-    // ITS OWN lifecycle provider — carried in the recovery transaction from `pending` (the operator
-    // set staged for exactly this rollback) — not the candidate's. Otherwise an update that revised
-    // the lifecycle provider, then failed, would gate the healthy predecessor with the candidate's
-    // hooks, reject it, and crash-loop a good release.
     let installed_state = recover_through_transients(
         "reading installed state for the boot health gate",
-        &mut launcher,
         &shutdown,
         || match store.installed()? {
             Installed::Present(installed) => Ok(installed),
@@ -600,28 +554,93 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await?;
+    let target = boot_gate_target(recovery_transaction.as_ref(), &installed_state, boot_reason);
+    let mut reconciler = ReleaseReconciler::new(&opts, target.reconciler.as_ref(), target.reason);
+    let mut convergence_failure = None;
+    // The boot converge is the COMMITTED release's `converge` and never runs during recovery: a boot
+    // resuming an interrupted update or rollback replays only that transaction's own minimal,
+    // idempotent steps, and applying the committed candidate here while a rollback commit is still
+    // deferred would converge the machine onto the very release the rollback is undoing. A rollback
+    // recovery instead re-runs the predecessor's own `converge` on every boot until the rollback
+    // completes — see [`complete_recovery_activation`].
+    if recovery_transaction.is_none() {
+        log(&format!(
+            "starting reconciler converge for release {} with reason {}",
+            current.as_deref().unwrap_or("<unknown>"),
+            boot_reason.as_str()
+        ));
+        let convergence = recover_through_transients("boot reconciler converge", &shutdown, || {
+            // Only infrastructure faults use the transient retry/exit path. A hook's own
+            // failure must reach the same rejection/revert decision as a failed health gate.
+            match reconciler.mutate(
+                MutationOperation::Converge,
+                &target.attempt,
+                ReleaseTarget {
+                    release: &target.candidate,
+                    archive_sha256: &target.candidate_archive_sha256,
+                },
+                ReleaseTarget {
+                    release: &target.predecessor,
+                    archive_sha256: &target.predecessor_archive_sha256,
+                },
+            ) {
+                Ok(result) => Ok(Ok(result)),
+                Err(InvocationFailure::ReleaseFault(error)) => Ok(Err(error)),
+                Err(InvocationFailure::Inconclusive(error)) => Err(error),
+            }
+        })
+        .await?;
+        match convergence {
+            Ok(result) => {
+                if result.host_action() == HostAction::Reboot {
+                    request_host_reboot(&shutdown).await?;
+                    return Ok(());
+                }
+                log(&format!(
+                    "reconciler converge for release {} completed; entering the boot health gate",
+                    current.as_deref().unwrap_or("<unknown>")
+                ));
+            }
+            Err(error) => {
+                warn(&format!("boot reconciler converge failed ({error})"));
+                convergence_failure = Some(error);
+            }
+        }
+    }
+    // Gate readiness: the release's own `healthcheck` must pass before this boot is trusted. It is
+    // the only health source — the agent owns no workload process to observe — and readiness was
+    // evaluated only after convergence has completed.
+    //
+    // During a crash-recovered rollback the predecessor commit is deferred until *after* this gate,
+    // so `store.installed()` still holds the CANDIDATE record. Gate the restored predecessor with
+    // ITS OWN reconciler — carried in the recovery transaction from the rollback guard (the operator
+    // set staged for exactly this rollback) — not the candidate's. Otherwise an update that revised
+    // the reconciler, then failed, would gate the healthy predecessor with the candidate's
+    // hooks, reject it, and crash-loop a good release.
     // Attempt identity, release identity and providers are resolved together, from one source, so
     // the gate can never observe one release with another's hooks or under another's attempt.
-    let target = boot_gate_target(recovery_transaction.as_ref(), &installed_state, boot_reason);
-    log(&format!(
-        "starting boot health gate for release {} with reason {}",
-        target.candidate.version,
-        target.reason.as_str()
-    ));
-    let mut reconciler = ReleaseReconciler::new(&opts, target.lifecycle.as_ref(), target.reason);
-    let gate = update::became_healthy(
-        &mut reconciler,
-        &target.attempt,
-        ReleaseTarget {
-            release: &target.candidate,
-            archive_sha256: &target.candidate_archive_sha256,
-        },
-        ReleaseTarget {
-            release: &target.predecessor,
-            archive_sha256: &target.predecessor_archive_sha256,
-        },
-    )
-    .await;
+    let gate = if let Some(error) = convergence_failure {
+        update::Health::Unhealthy(error)
+    } else {
+        log(&format!(
+            "starting boot health gate for release {} with reason {}",
+            target.candidate.version,
+            target.reason.as_str()
+        ));
+        update::became_healthy(
+            &mut reconciler,
+            &target.attempt,
+            ReleaseTarget {
+                release: &target.candidate,
+                archive_sha256: &target.candidate_archive_sha256,
+            },
+            ReleaseTarget {
+                release: &target.predecessor,
+                archive_sha256: &target.predecessor_archive_sha256,
+            },
+        )
+        .await
+    };
     match &gate {
         update::Health::Ready => log(&format!(
             "boot health gate passed for release {}",
@@ -652,34 +671,14 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         let mut gate_failure_state: &updated::state::InstalledState = installed_state.as_ref();
         // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
         // dangerous case: the still-deferred `store.installed()` holds the CONFIRMED candidate, not
-        // the predecessor, so without a bound the launcher relaunches, the journal re-derives the
+        // the predecessor, so without a bound the service manager restarts the agent, the journal re-derives the
         // identical rollback, and it runs forever with nothing converged. Bound it: count failures
         // durably in the journal (which is what survives the relaunch) and, once the limit is hit,
         // finish the rollback onto the exact previously confirmed predecessor and report its current
         // health as unhealthy. Repository history is not a recovery policy.
         if let Some(tx) = recovery_transaction.as_mut().filter(|tx| tx.is_rollback()) {
             let predecessor = tx.previous_release.version.clone();
-            let opts = &opts;
-            match bound_unhealthy_rollback(&mut store, tx, &mut |tx: &Transaction| {
-                run_lifecycle_mutation(
-                    tx.previous_lifecycle.as_ref(),
-                    opts,
-                    MutationOperation::Rollback,
-                    LifecycleInvocation {
-                        reason: Reason::Update,
-                        id: &tx.rollback_attempt_id(),
-                        candidate: ReleaseTarget {
-                            release: &tx.previous_release,
-                            archive_sha256: &tx.previous_archive_sha256,
-                        },
-                        predecessor: ReleaseTarget {
-                            release: &tx.candidate_release,
-                            archive_sha256: &tx.candidate_archive_sha256,
-                        },
-                    },
-                )
-                .map(drop)
-            }) {
+            match bound_unhealthy_rollback(&mut store, tx) {
                 Ok(RollbackHealthOutcome::SettledUnhealthy) => {
                     gate_failure_state = plan.commit.as_ref().ok_or(
                         "a bounded rollback settlement has no predecessor state to commit",
@@ -713,7 +712,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         match boot::plan_gate_failure(gate_failure_state) {
             GateFailure::Revert => {
                 if let Err(error) =
-                    revert_unconfirmed_head(&mut store, &installed_state, bytes_repaired)
+                    revert_guarded_head(&mut store, &installed_state, bytes_repaired)
                 {
                     return Err(exit_for_relaunch("recording the revert", &error));
                 }
@@ -749,13 +748,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if gate_passed {
         // Confirmation is one store operation so both of its installed-state reads remain inside
         // the same Windows sharing/lock retry boundary.
-        let newly_confirmed = recover_through_transients(
-            "confirming the health-proven release",
-            &mut launcher,
-            &shutdown,
-            || store.confirm_provisional(),
-        )
-        .await?;
+        let newly_confirmed =
+            recover_through_transients("confirming the health-proven release", &shutdown, || {
+                store.prove_provisional()
+            })
+            .await?;
         if newly_confirmed {
             log(&format!(
                 "release {} reached a confirmed installed state",
@@ -767,51 +764,14 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .is_some_and(|tx| tx.recovery_pending(TransactionPhase::RollbackVerified))
     {
-        Chaos::from_env().crossing(update::boundary::PREDECESSOR_HEALTH_APPLIED);
+        Chaos::from_env().crossing(update::boundary::PREDECESSOR_HEALTH_PASSED);
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::RollbackVerified)?;
     }
 
-    // A crash may have interrupted the rollback between its journal barriers. Once the
-    // predecessor is healthy again, replay the idempotent `rollback` operation with the same
-    // transaction identity before declaring this boot recovered.
     let rollback_incomplete = recovery_transaction
         .as_ref()
         .is_some_and(|tx| tx.recovery_pending(TransactionPhase::RolledBack));
-    if rollback_incomplete {
-        if let (Some(tx), Some(lifecycle)) = (
-            recovery_transaction.as_ref(),
-            recovery_transaction
-                .as_ref()
-                .map(|tx| tx.previous_lifecycle.as_ref()),
-        ) {
-            let rollback_result = match run_lifecycle_mutation(
-                lifecycle,
-                &opts,
-                MutationOperation::Rollback,
-                LifecycleInvocation {
-                    reason: Reason::Update,
-                    id: &tx.rollback_attempt_id(),
-                    candidate: ReleaseTarget {
-                        release: &tx.previous_release,
-                        archive_sha256: &tx.previous_archive_sha256,
-                    },
-                    predecessor: ReleaseTarget {
-                        release: &tx.candidate_release,
-                        archive_sha256: &tx.candidate_archive_sha256,
-                    },
-                },
-            ) {
-                Ok(result) => result,
-                Err(error) => return Err(exit_for_relaunch("rollback recovery hook", &error)),
-            };
-            if rollback_result.host_action() == HostAction::Reboot {
-                request_host_reboot(&shutdown).await?;
-                return Ok(());
-            }
-            Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
-        }
-    }
     if rollback_incomplete {
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::RolledBack)?;
@@ -819,7 +779,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if defer_recovery_commit {
         if let Some(state) = &plan.commit {
             store.commit_installed(state)?;
-            pending = installed_pending(&store)?;
+            pending = installed_rollback_guard(&store)?;
         }
     }
     // Keep the journal until both release reconciliation and any environmental rollback
@@ -833,11 +793,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     run_steady_state(SteadyState {
         opts,
         shutdown,
-        launcher,
         store,
-        pending,
+        rollback_guard: pending,
         current,
-        self_update,
         boot_gate_passed: gate_passed,
     })
     .await
@@ -846,11 +804,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 struct SteadyState {
     opts: Options,
     shutdown: Arc<AtomicBool>,
-    launcher: Launcher,
     store: Store,
-    pending: Option<updated::state::Pending>,
+    rollback_guard: Option<updated::state::RollbackGuard>,
     current: Option<String>,
-    self_update: SelfUpdateState,
     boot_gate_passed: bool,
 }
 
@@ -858,11 +814,9 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
     let SteadyState {
         mut opts,
         shutdown,
-        mut launcher,
         mut store,
-        mut pending,
+        rollback_guard: mut pending,
         mut current,
-        mut self_update,
         boot_gate_passed,
     } = state;
 
@@ -913,13 +867,44 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
     // whose silence would be misread as death.
     let mut last_repo: Option<TrustedRepository> = None;
     loop {
-        // An unconfirmed update that ran its whole window without crashing is confirmed.
+        // Keep the guard until a fresh bounded gate proves the candidate healthy. Elapsed
+        // time alone is not evidence: the workload can fail while this agent stays alive.
         let confirm_due = pending
             .as_ref()
             .is_some_and(|p| window_passed(p, opts.timeouts.confirmation_window, now_unix()));
-        let mut confirm_failed = false;
-        if confirm_due {
-            if confirm_update(&mut store) {
+        let mut confirmation_ready = false;
+        if pending.is_some()
+            && (Instant::now() >= health.next_probe || (confirm_due && health.last_ready))
+        {
+            let Installed::Present(installed) = store.installed()? else {
+                return Err("an unconfirmed update has no installed release".into());
+            };
+            let target = ReleaseTarget {
+                release: &installed.release,
+                archive_sha256: &installed.archive_sha256,
+            };
+            let mut reconciler =
+                ReleaseReconciler::new(&opts, &installed.reconciler, Reason::Restart);
+            match update::became_healthy(&mut reconciler, attempt::PERIODIC, target, target).await {
+                update::Health::Ready => confirmation_ready = true,
+                update::Health::Unhealthy(error) => {
+                    warn(&format!(
+                        "unconfirmed release failed its health gate: {error}"
+                    ));
+                    revert_guarded_head(&mut store, &installed, false)?;
+                    return Err(
+                        "unconfirmed release became unhealthy; restarting for rollback".into(),
+                    );
+                }
+                update::Health::Inconclusive(error) => {
+                    warn(&format!("confirmation health gate was inconclusive; retaining rollback protection: {error}"));
+                }
+            }
+            health.observed(Instant::now(), confirmation_ready, &opts.timeouts);
+        }
+        let mut confirm_failed = confirm_due && !confirmation_ready;
+        if confirm_due && confirmation_ready {
+            if disarm_update_rollback(&mut store) {
                 pending = None;
                 log(&format!(
                     "update {} confirmed; confirmation window passed",
@@ -949,7 +934,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                 ));
             }
         }
-        let mut wait = app_wait.min(self_update.due_in(now));
+        let mut wait = app_wait;
         wait = wait.min(health.next_probe.saturating_duration_since(now));
         wait = wait.min(
             loop_state
@@ -1005,22 +990,22 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                 )),
             }
         }
-        if now >= health.next_probe {
+        if now >= health.next_probe && pending.is_none() {
             // One periodic `healthcheck` per tick is the node's whole readiness answer, invoked
             // through the provider the committed record names *now* — see `probe_steady_target`,
             // which is why this tick's target exists only inside the call. It is reported, never
             // acted on: past the confirmation window the reconciler owns the workload, and the
             // control plane owns what to do about an unhealthy one.
-            let healthy = probe_steady_target(&store, |installed, archive_sha256, lifecycle| {
+            let healthy = probe_steady_target(&store, |installed, archive_sha256, reconciler| {
                 let target = ReleaseTarget {
                     release: installed,
                     archive_sha256,
                 };
-                let healthy = run_lifecycle_observation(
-                    lifecycle,
+                let healthy = run_reconciler_observation(
+                    reconciler,
                     &opts,
                     ObservationOperation::Healthcheck,
-                    LifecycleInvocation {
+                    ReconcilerInvocation {
                         reason: Reason::Restart,
                         id: attempt::PERIODIC,
                         candidate: target,
@@ -1034,9 +1019,9 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                     heartbeat.node.as_deref().unwrap_or("unidentified-node"),
                     || {
                         prepare_fingerprint_job(
-                            lifecycle,
+                            reconciler,
                             &opts,
-                            LifecycleInvocation {
+                            ReconcilerInvocation {
                                 reason: Reason::Restart,
                                 id: attempt::FINGERPRINT,
                                 candidate: target,
@@ -1053,9 +1038,8 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
             })?;
             health.observed(now, healthy, &opts.timeouts);
         }
-        let self_due = self_update.due(now);
         let cycle = cycle_due(pending.is_some(), now, loop_state.next_app_check);
-        if !self_due && !cycle.due {
+        if !cycle.due {
             continue;
         }
         if cycle.due {
@@ -1086,7 +1070,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                         // The revert is journaled but nothing has moved: the record still names the
                         // candidate, so `current`, the heartbeat and the converge below would all
                         // speak for a release this node is no longer going to run. Exit and let the
-                        // launcher relaunch into boot recovery, which is the one rollback path.
+                        // platform service restart into boot recovery, which is the one rollback path.
                         Repair::RollbackJournaled => {
                             return Err(exit_for_relaunch(
                                 "repair fallback to the local predecessor",
@@ -1106,16 +1090,15 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                     // days later would be read by the boot gate as an unconfirmed release inside its
                     // window: a revert to the predecessor plus a permanent rejection of a release
                     // that had long since proven itself.
-                    pending = installed_pending(&store)?;
+                    pending = installed_rollback_guard(&store)?;
                     // The SAME converge the runtime arm below runs, for the same reason: the
-                    // reconciler owns every workload process, so `apply` is the only step that puts
+                    // reconciler owns every workload process, so `converge` is the only step that puts
                     // the repaired bytes into service. Without it the tampered image would keep
                     // running and the next probe would report it ready. NOT best effort: a converge
                     // that fails would leave the old image serving, so it propagates and this agent
                     // exits, leaving boot recovery to converge the repaired release.
-                    let result = reconverge_environment(&opts, &store, &mut health)
-                        .await
-                        .map_err(|error| {
+                    let result =
+                        reconverge_environment(&opts, &store, &mut health).await.map_err(|error| {
                             format!("converging the environment onto the repaired bundle: {error}")
                         })?;
                     if result.host_action() == HostAction::Reboot {
@@ -1126,16 +1109,11 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                     // release, but reaching it here would drive a whole update transaction over a
                     // release the reconciler has only just been asked to converge onto.
                     //
-                    // On the normal cadence, and deferring the self-update check with it, for the same
-                    // reason the input-data arm below does: `check` is the only thing that advances the
-                    // self-update clock and this early exit skips it, so scheduling the next cycle
-                    // immediately would leave `self_due` true forever and collapse `wait` to its 100 ms
-                    // floor. Drift that survives a repair (a reconciler `apply` writing into the
-                    // content-addressed release directory) would then re-run a full TUF refresh,
-                    // re-download and converge ten times a second, forever.
+                    // Retry on the normal cadence. Drift that survives a repair (a reconciler
+                    // `converge` writing into the content-addressed release directory) must not collapse
+                    // the loop to its 100 ms floor and repeatedly re-run a full TUF refresh.
                     let retry = jitter(opts.timeouts.check_interval, REPORT_CADENCE_JITTER_PERCENT);
                     loop_state.next_app_check = Instant::now() + retry;
-                    self_update.defer(Instant::now() + retry);
                     // Hand the repository the repair resolved to the heartbeat below. That report is
                     // the node's only word about itself, and this arm is one of the paths that ends a
                     // cycle early — under drift that survives the repair (the arm's own stated case) a
@@ -1148,7 +1126,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
             }
 
             // Resolve the agent document afresh, then load its release repository.
-            // One verified result serves application and self checks this cycle, and a
+            // One verified result serves the application check this cycle, and a
             // control-plane reassignment therefore takes effect without process restart.
             let resolved = match TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
                 .await
@@ -1178,7 +1156,6 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                 }
                     loop_state.next_app_check =
                         Instant::now() + jitter(retry, REPORT_CADENCE_JITTER_PERCENT);
-                    self_update.defer(Instant::now() + retry);
                     return Ok(TickFlow::Next);
                 }
             };
@@ -1193,7 +1170,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
             // rest of the runtime — repository bounds, cadence, retention, and resolved inputs —
             // is signed into the same assignment and can change on a control-plane reassignment
             // with no version bump. Applying it here keeps every converge on the current contract.
-            if let Some(assignment_context) = repo.assignment_context() {
+            if let Some(assignment_context) = repo.assignment_context().filter(|_| pending.is_none()) {
                 let assignment = assignment_context.document();
                 let assignment_sha256 = assignment_context.sha256();
                 match opts
@@ -1208,12 +1185,6 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                         ));
                         let retry = jitter(opts.timeouts.refresh_retry, REPORT_CADENCE_JITTER_PERCENT);
                         loop_state.next_app_check = Instant::now() + retry;
-                        // Defer the self-update check too. It is due right after boot and is only
-                        // advanced by `check` below — which this early exit skips — so leaving it alone
-                        // collapses `wait` to its 100 ms floor and turns a failing input capability into
-                        // every node in the fleet re-running a TUF refresh and an input fetch ten times
-                        // a second, against the control plane that is already unwell.
-                        self_update.defer(Instant::now() + retry);
                         return Ok(TickFlow::Next);
                     }
                 };
@@ -1222,7 +1193,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                 let inputs = opts.runtime_data.inputs().clone();
                 if opts.apply_runtime(&assignment.runtime, inputs) {
                     // The runtime changed under the deployed release. Resolved `inputs` reach the
-                    // reconciler only through its input directory, so `apply --reason restart` is
+                    // reconciler only through its input directory, so `converge --reason restart` is
                     // the one thing that can act on the change — the agent has no process of its
                     // own to reconfigure.
                     log("assignment runtime changed; converging the environment onto it");
@@ -1230,28 +1201,19 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                     // The SAME converge the boot path runs, through the same function. Readiness
                     // comes back only through the ordinary observed-healthy path once `reconverging`
                     // re-arms probing, so a converge that fails leaves this node reporting unready.
-                    let result = reconverge_environment(&opts, &store, &mut health)
-                        .await
-                        .map_err(|error| {
+                    let result =
+                        reconverge_environment(&opts, &store, &mut health).await.map_err(|error| {
                             format!("converging the environment onto the new runtime: {error}")
                         })?;
                     opts.runtime_converged();
                     if result.host_action() == HostAction::Reboot {
                         return Ok(TickFlow::Reboot);
                     }
-                    // Re-gate readiness from scratch — under the configured start grace, since
-                    // nothing has proven the re-applied release yet — and let the next tick drive
-                    // the version/provider reconciliation against it.
+                    // The re-applied release has its own gate verdict now. Let the next tick
+                    // drive version/provider reconciliation against the updated runtime.
                     loop_state.next_app_check = Instant::now();
                     return Ok(TickFlow::Next);
                 }
-            }
-
-            // Self-update first: on an accepted handoff this process exits.
-            if self_due {
-                self_update
-                    .check(&opts.agent_update, repo, &mut launcher)
-                    .await;
             }
 
             if cycle.updates {
@@ -1268,7 +1230,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                         current = Some(version);
                         // The commit recorded the update as unconfirmed; pick it up so its
                         // window is watched and a crash is caught on the next boot.
-                        pending = installed_pending(&store)?;
+                        pending = installed_rollback_guard(&store)?;
                         garbage_collect(&opts, &store);
                         if host_action == HostAction::Reboot {
                             return Ok(TickFlow::Reboot);
@@ -1285,11 +1247,11 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                         // enforce its desired state even when release selection has nothing new.
                         // Scripts own idempotence; the platform owns making convergence recur.
                         fingerprints.pause_for_mutation();
-                        let result = reconverge_environment(&opts, &store, &mut health)
-                            .await
-                            .map_err(|error| {
+                        let result = reconverge_environment(&opts, &store, &mut health).await.map_err(
+                            |error| {
                                 format!("periodically converging the desired state: {error}")
-                            })?;
+                            },
+                        )?;
                         if result.changed() {
                             fingerprints.restart_after_deployment(Instant::now());
                         }
@@ -1299,7 +1261,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                     }
                     AppOutcome::RestartForRecovery => {
                         // A post-activation failure left a durable rollback journal. Terminate this
-                        // disposable agent cleanly; the launcher relaunches it and boot recovery
+                        // disposable agent cleanly; the platform service restarts it and boot recovery
                         // performs the rollback (the single rollback path).
                         log("update failed after activation; restarting so boot recovery rolls back");
                         return Ok(TickFlow::Exit);
@@ -1337,6 +1299,9 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                 fingerprints.current(),
             )
             .await;
+        if let Some(hold) = updated::command_adapter::read_attention(&opts.paths.install_root)? {
+            return Err(format!("operator attention required: {}", hold.message).into());
+        }
         match flow? {
             TickFlow::Next => {}
             TickFlow::Exit => return Ok(()),
@@ -1350,12 +1315,11 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
 
 /// Request a reboot and remain alive until the operating system begins shutdown.
 ///
-/// Remaining alive is deliberate: the launcher must not mistake this planned host transition for
-/// an agent exit and immediately relaunch another copy before the machine goes down. If the OS
+/// Remaining alive avoids a service-manager restart racing a planned host transition. If the OS
 /// accepted the request but never starts shutdown, fail after a bound so service supervision can
 /// retry the still-required, idempotent convergence instead of leaving the node wedged forever.
 async fn request_host_reboot(shutdown: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
-    host::request_reboot()?;
+    tokio::task::spawn_blocking(host::request_reboot).await??;
     log("host reboot requested; waiting for the operating system to stop the agent");
     let deadline = Instant::now() + Duration::from_secs(10 * 60);
     while Instant::now() < deadline {
@@ -1375,7 +1339,7 @@ async fn request_host_reboot(shutdown: &AtomicBool) -> Result<(), Box<dyn std::e
 enum TickFlow {
     /// Go around again.
     Next,
-    /// Leave this agent process; the launcher relaunches it.
+    /// Leave this agent process; the platform service restarts it.
     Exit,
     /// The reconciler requested a host reboot. The cycle has already reported the node unsettled.
     Reboot,
@@ -1398,11 +1362,11 @@ pub(crate) struct Cycle {
     pub(crate) updates: bool,
 }
 
-pub(crate) fn cycle_due(pending: bool, now: Instant, next_check: Instant) -> Cycle {
+pub(crate) fn cycle_due(rollback_guard: bool, now: Instant, next_check: Instant) -> Cycle {
     let due = now >= next_check;
     Cycle {
         due,
-        updates: due && !pending,
+        updates: due && !rollback_guard,
     }
 }
 
@@ -1429,9 +1393,9 @@ mod tests {
     use updated::transaction::Phase;
 
     /// One loop tick's steady-state probe, recording exactly what it was lent.
-    fn tick(store: &Store) -> (ReleaseId, Box<updated::state::ProviderRelease>) {
-        probe_steady_target(store, |installed, _, lifecycle| {
-            (installed.clone(), Box::new(lifecycle.clone()))
+    fn tick(store: &Store) -> (ReleaseId, Box<updated::state::ReconcilerRelease>) {
+        probe_steady_target(store, |installed, _, reconciler| {
+            (installed.clone(), Box::new(reconciler.clone()))
         })
         .expect("an installed record")
     }
@@ -1471,10 +1435,9 @@ mod tests {
     fn an_unrecoverable_boot_step_ends_the_process_instead_of_holding_the_node_down() {
         // Regression: every one of these used to route into an infinite `while !shutdown { sleep }`
         // hold. A single failed durable write — ENOSPC recording a rejection, a read-only remount —
-        // then meant the agent never exited, so the launcher never relaunched it, so the "next
-        // boot" that was supposed to redo the recovery never happened, with the node serving
-        // nothing. The only correct answer is to end the process and let the launcher (which
-        // throttles relaunches through one capped backoff) start the next boot.
+        // then meant the agent never exited, so the "next boot" that was supposed to redo the
+        // recovery never happened, with the node serving nothing. End the process so the platform
+        // service can start the next boot under its configured restart policy.
         let cause = io::Error::new(io::ErrorKind::StorageFull, "no space left on device");
         let error = exit_for_relaunch("recording the candidate's rejection", &cause);
         let message = error.to_string();
@@ -1499,9 +1462,9 @@ mod tests {
         // loop cannot compile without a deliberate clone.
         let lineage = crate::test_support::lineage();
         let mut damaged = provider();
-        damaged.release = release("1.0.0", "damaged-provider-manifest");
+        damaged.definition_sha256 = digest("damaged-execution");
         let damaged_release = release("1.0.0", "damaged");
-        let damaged_state = InstalledState::confirmed(
+        let damaged_state = InstalledState::proven(
             lineage.clone(),
             damaged_release.clone(),
             digest("archive-damaged"),
@@ -1523,21 +1486,20 @@ mod tests {
             previous_repository_lineage: damaged_state.repository_lineage.clone(),
             candidate_release: repaired.clone(),
             candidate_archive_sha256: digest("archive-repaired"),
-            candidate_rejection_sha256: deployment_rejection(
-                &digest("archive-repaired"),
-                &provider().provider_set_sha256,
-            ),
+            candidate_rejection_sha256: deployment_rejection(&digest("archive-repaired")),
             candidate_repository_lineage: lineage.clone(),
             candidate_rejection_required: false,
-            previous_lifecycle: damaged_state.lifecycle.clone(),
-            candidate_lifecycle: provider(),
+            previous_reconciler: damaged_state.reconciler.clone(),
+            candidate_reconciler: provider(),
             rollback_health_failures: 0,
             phase: Phase::Prepared,
         };
         store.write_journal(&tx).unwrap();
-        tx.advance(Phase::Activating).unwrap();
+        tx.advance(Phase::Activated).unwrap();
         store.write_journal(&tx).unwrap();
-        tx.advance(Phase::Committing).unwrap();
+        tx.advance(Phase::Converged).unwrap();
+        store.write_journal(&tx).unwrap();
+        tx.advance(Phase::Verified).unwrap();
         store.write_journal(&tx).unwrap();
         store.activate(&repaired).unwrap();
         store
@@ -1545,17 +1507,17 @@ mod tests {
                 repository_lineage: lineage,
                 release: repaired.clone(),
                 archive_sha256: digest("archive-repaired"),
-                lifecycle: provider(),
-                pending: Some(Pending {
-                    lifecycle_attempt_id: tx.id.clone(),
+                reconciler: provider(),
+                rollback_guard: Some(RollbackGuard {
+                    attempt_id: tx.id.clone(),
                     candidate_rejection_sha256: tx.candidate_rejection_sha256,
                     previous_release: tx.previous_release,
                     previous_archive_sha256: tx.previous_archive_sha256,
                     previous_repository_lineage: tx.previous_repository_lineage,
-                    lifecycle: tx.previous_lifecycle,
+                    reconciler: tx.previous_reconciler,
                     committed_at: 1,
                 }),
-                confirmed: true,
+                maturity: Maturity::Proven,
             })
             .unwrap();
 
@@ -1568,7 +1530,7 @@ mod tests {
         // The collector derives its protected set from that same record, so probe and collector
         // cannot name different provider releases.
         match store.installed().unwrap() {
-            Installed::Present(state) => assert_eq!(state.lifecycle, after_repair.1),
+            Installed::Present(state) => assert_eq!(state.reconciler, after_repair.1),
             _ => panic!("expected the repaired record"),
         }
     }
@@ -1578,14 +1540,14 @@ mod tests {
     /// never skip its compensation": no call site — present or future — can discard mid-flight
     /// evidence, because the refusal lives on the destroy operation itself. Pre-activation
     /// journals displaced nothing; a landed forward commit has transferred its exact rollback
-    /// authority to `installed.pending`; and a finished rollback has committed its exact
+    /// authority to `installed.rollback_guard`; and a finished rollback has committed its exact
     /// predecessor. Those proofs — never a terminal phase by itself — make a journal disposable.
     #[test]
     fn a_journal_that_owes_compensation_cannot_be_discarded() {
         for phase in Phase::ALL {
             let discardable = matches!(
                 phase,
-                Phase::Prepared | Phase::Committing | Phase::Committed
+                Phase::Prepared | Phase::Converged | Phase::Verified | Phase::Committed
             );
             let situation = interrupted_revert(Some(phase));
             let installed = match situation.installed {
@@ -1617,12 +1579,12 @@ mod tests {
     }
 
     /// The one non-terminal phase whose journal can still be spent: a crash between the durable
-    /// commit and the journal's own terminal write leaves `Committing` on disk while active
+    /// commit and the journal's own terminal write leaves `Verified` on disk while active
     /// and installed state prove the commit landed. The store admits exactly that evidence — and
     /// still refuses the same phase when the machine does NOT corroborate it.
     #[test]
     fn a_commit_that_landed_makes_its_journal_discardable() {
-        let situation = interrupted_revert(Some(Phase::Committing));
+        let situation = interrupted_revert(Some(Phase::Verified));
         let tx = situation.journal.unwrap();
         let candidate = tx.candidate_release.clone();
         let landed = match situation.installed {
@@ -1654,9 +1616,9 @@ mod tests {
     /// same id admits only exact state-machine successors; a different id needs A settled.
     #[test]
     fn an_unsettled_journal_cannot_be_buried_by_another_transaction() {
-        let situation = interrupted_revert(Some(Phase::RollbackApplied));
+        let situation = interrupted_revert(Some(Phase::Restored));
         let unsettled = situation.journal.unwrap();
-        let candidate = InstalledState::confirmed(
+        let candidate = InstalledState::proven(
             unsettled.candidate_repository_lineage.clone(),
             unsettled.candidate_release.clone(),
             unsettled.candidate_archive_sha256.clone(),
@@ -1688,11 +1650,11 @@ mod tests {
         store.write_journal(&settled).unwrap();
         store.activate(&settled.previous_release).unwrap();
         store
-            .commit_installed(&InstalledState::confirmed(
+            .commit_installed(&InstalledState::proven(
                 settled.previous_repository_lineage.clone(),
                 settled.previous_release.clone(),
                 settled.previous_archive_sha256.clone(),
-                settled.previous_lifecycle.clone(),
+                settled.previous_reconciler.clone(),
             ))
             .unwrap();
         assert!(store.write_journal(&other).is_ok());
@@ -1709,20 +1671,17 @@ mod tests {
             repository_lineage: lineage.clone(),
             release: candidate.clone(),
             archive_sha256: digest("archive-two"),
-            lifecycle: provider(),
-            pending: Some(updated::state::Pending {
-                lifecycle_attempt_id: digest("attempt"),
-                candidate_rejection_sha256: deployment_rejection(
-                    &digest("archive-two"),
-                    &provider().provider_set_sha256,
-                ),
+            reconciler: provider(),
+            rollback_guard: Some(updated::state::RollbackGuard {
+                attempt_id: digest("attempt"),
+                candidate_rejection_sha256: deployment_rejection(&digest("archive-two")),
                 previous_release: predecessor.clone(),
                 previous_archive_sha256: digest("archive-one"),
                 previous_repository_lineage: lineage.clone(),
                 committed_at: 100,
-                lifecycle: provider(),
+                reconciler: provider(),
             }),
-            confirmed: true,
+            maturity: Maturity::Proven,
         };
         Situation {
             installed: Installed::Present(Box::new(installed)),
@@ -1734,20 +1693,14 @@ mod tests {
                 previous_repository_lineage: lineage.clone(),
                 candidate_release: candidate,
                 candidate_archive_sha256: digest("archive-two"),
-                candidate_rejection_sha256: deployment_rejection(
-                    &digest("archive-two"),
-                    &provider().provider_set_sha256,
-                ),
+                candidate_rejection_sha256: deployment_rejection(&digest("archive-two")),
                 candidate_repository_lineage: lineage,
                 candidate_rejection_required: false,
-                previous_lifecycle: provider(),
-                candidate_lifecycle: provider(),
+                previous_reconciler: provider(),
+                candidate_reconciler: provider(),
                 rollback_health_failures: 0,
                 phase,
             }),
-            bad_agent: None,
-            confirm_window: Duration::from_secs(60),
-            now: 120,
         }
     }
 
@@ -1840,20 +1793,17 @@ mod tests {
             repository_lineage: lineage.clone(),
             release: release("2.0.0", "two"),
             archive_sha256: digest("archive-two"),
-            lifecycle: provider(),
-            pending: Some(updated::state::Pending {
-                lifecycle_attempt_id: digest("attempt"),
-                candidate_rejection_sha256: deployment_rejection(
-                    &digest("archive-two"),
-                    &provider().provider_set_sha256,
-                ),
+            reconciler: provider(),
+            rollback_guard: Some(updated::state::RollbackGuard {
+                attempt_id: digest("attempt"),
+                candidate_rejection_sha256: deployment_rejection(&digest("archive-two")),
                 previous_release: release("1.0.0", "one"),
                 previous_archive_sha256: digest("archive-one"),
                 previous_repository_lineage: lineage,
                 committed_at: 100,
-                lifecycle: provider(),
+                reconciler: provider(),
             }),
-            confirmed: true,
+            maturity: Maturity::Proven,
         }
     }
 
@@ -1861,7 +1811,7 @@ mod tests {
     fn output_retention_uses_the_same_manifest_identity_as_its_writer_and_reader() {
         let head = unconfirmed_head();
         let predecessor_manifest = head
-            .pending
+            .rollback_guard
             .as_ref()
             .unwrap()
             .previous_release
@@ -1869,17 +1819,20 @@ mod tests {
             .clone();
         assert_ne!(head.release.manifest_sha256, head.archive_sha256);
         assert_ne!(
-            head.pending
+            head.rollback_guard
                 .as_ref()
                 .unwrap()
                 .previous_release
                 .manifest_sha256,
-            head.pending.as_ref().unwrap().previous_archive_sha256
+            head.rollback_guard
+                .as_ref()
+                .unwrap()
+                .previous_archive_sha256
         );
         assert_eq!(
             protected_output_snapshot_manifests(&head),
             vec![head.release.manifest_sha256.clone(), predecessor_manifest],
-            "GC must protect the exact paths lifecycle output writes and telemetry reads"
+            "GC must protect the exact paths reconciler output writes and telemetry reads"
         );
     }
 
@@ -1901,15 +1854,19 @@ mod tests {
         let head = unconfirmed_head();
         let mut store = store_holding(&head);
 
-        revert_unconfirmed_head(&mut store, &head, false).unwrap();
+        revert_guarded_head(&mut store, &head, false).unwrap();
 
         let journal = store.journal().unwrap().expect("a durable rollback intent");
         assert!(journal.is_rollback());
         assert_eq!(journal.previous_release, release("1.0.0", "one"));
         assert!(journal.candidate_rejection_required);
-        assert!(journal.recovery_pending(Phase::RollbackApplied));
+        assert!(journal.recovery_pending(Phase::Restored));
         assert!(journal.recovery_pending(Phase::RolledBack));
-        let rejection = &head.pending.as_ref().unwrap().candidate_rejection_sha256;
+        let rejection = &head
+            .rollback_guard
+            .as_ref()
+            .unwrap()
+            .candidate_rejection_sha256;
         assert!(store.is_rejected(&head.repository_lineage, rejection));
         assert!(!store.is_rejected(&head.repository_lineage, &digest("archive-two")));
     }
@@ -1923,12 +1880,16 @@ mod tests {
         let head = unconfirmed_head();
         let mut store = store_holding(&head);
 
-        revert_unconfirmed_head(&mut store, &head, true).unwrap();
+        revert_guarded_head(&mut store, &head, true).unwrap();
 
         let journal = store.journal().unwrap().expect("the revert is still owed");
         assert!(journal.is_rollback());
         assert!(!journal.candidate_rejection_required);
-        let rejection = &head.pending.as_ref().unwrap().candidate_rejection_sha256;
+        let rejection = &head
+            .rollback_guard
+            .as_ref()
+            .unwrap()
+            .candidate_rejection_sha256;
         assert!(
             !store.is_rejected(&head.repository_lineage, rejection),
             "the repair re-verified the application; the deployment must not be blacklisted"
@@ -1941,7 +1902,7 @@ mod tests {
         // locally on a later unhealthy gate. The reconciler owns the workload and may converge it,
         // there is no predecessor image left, and reverting would fight the assignment — so it is
         // reported unhealthy and the agent keeps reconciling.
-        let confirmed = InstalledState::confirmed(
+        let confirmed = InstalledState::proven(
             crate::test_support::lineage(),
             release("2.0.0", "two"),
             digest("archive-two"),
@@ -1963,21 +1924,21 @@ mod tests {
     fn a_spent_journal_still_derives_a_drivable_revert() {
         // Regression: `switch_over` tolerates a failed `clear_journal`, and an agent can die
         // between `commit_installed` and the journal's terminal write — either way a spent
-        // Committing/Committed journal survives. A later boot then finds the pointer already
+        // Verified/Committed journal survives. A later boot then finds the pointer already
         // back on the predecessor (the revert a failed gate began). `classify_recovery` reads
         // `RestorePredecessor`, but the phase machine refuses to BEGIN a rollback from a terminal
         // `Committed`, so returning that journal verbatim produced a "recovery" with no rollback
         // rank: every resume gate closed, the plan's reconciliation was silently discarded, and
         // the candidate's machine-state changes were never compensated.
-        for phase in [Phase::Committing, Phase::Committed] {
+        for phase in [Phase::Verified, Phase::Committed] {
             let mut tx = recovery_transaction(&interrupted_revert(Some(phase)))
                 .unwrap_or_else(|| panic!("a spent {phase:?} journal still owes the revert"));
             if !tx.is_rollback() {
-                tx.advance(Phase::RollbackActivating)
+                tx.advance(Phase::RollbackPlanned)
                     .expect("a non-terminal journal is moved onto the rollback path");
             }
             assert_eq!(tx.previous_release, release("1.0.0", "one"));
-            assert!(tx.recovery_pending(Phase::RollbackApplied));
+            assert!(tx.recovery_pending(Phase::Restored));
             assert!(tx.recovery_pending(Phase::RolledBack));
         }
     }
@@ -2002,14 +1963,11 @@ mod tests {
             previous_repository_lineage: lineage.clone(),
             candidate_release: candidate.clone(),
             candidate_archive_sha256: digest("archive-two"),
-            candidate_rejection_sha256: deployment_rejection(
-                &digest("archive-two"),
-                &provider().provider_set_sha256,
-            ),
+            candidate_rejection_sha256: deployment_rejection(&digest("archive-two")),
             candidate_repository_lineage: lineage.clone(),
             candidate_rejection_required: true,
-            previous_lifecycle: provider(),
-            candidate_lifecycle: provider(),
+            previous_reconciler: provider(),
+            candidate_reconciler: provider(),
             rollback_health_failures: 0,
             // Reproduce a later resume boot: a prior process recorded a healthy predecessor, then
             // a machine reboot lost the workload before this boot's authoritative gate. The
@@ -2017,7 +1975,7 @@ mod tests {
             phase: Phase::RollbackVerified,
         };
         let mut store = Store::memory(MemoryBackend {
-            installed: Some(InstalledState::confirmed(
+            installed: Some(InstalledState::proven(
                 lineage.clone(),
                 candidate.clone(),
                 digest("archive-two"),
@@ -2031,31 +1989,17 @@ mod tests {
         // verdict is durable. Keep the synthetic machine state complete so the final clear proves
         // both the original rejection and this test's later predecessor rejection.
         store
-            .reject_deployment(
-                &lineage,
-                &digest("archive-two"),
-                &provider().provider_set_sha256,
-            )
+            .reject_deployment(&lineage, &digest("archive-two"))
             .unwrap();
 
         // Each iteration models one boot that re-derives the rollback from the durable journal and
         // fails the predecessor's health gate. The loop must terminate on the exact predecessor,
         // never spin and never reinterpret repository history as a recovery plan.
-        let mut compensations = Vec::new();
         let mut outcomes = Vec::new();
         for _ in 0..MAX_ROLLBACK_HEALTH_ATTEMPTS + 5 {
             let mut derived = store.journal().unwrap().expect("the rollback journal");
             assert!(derived.is_rollback());
-            let outcome =
-                bound_unhealthy_rollback(&mut store, &mut derived, &mut |tx: &Transaction| {
-                    compensations.push((
-                        tx.rollback_attempt_id(),
-                        tx.previous_release.clone(),
-                        tx.candidate_release.clone(),
-                    ));
-                    Ok(())
-                })
-                .unwrap();
+            let outcome = bound_unhealthy_rollback(&mut store, &mut derived).unwrap();
             let done = outcome == RollbackHealthOutcome::SettledUnhealthy;
             outcomes.push(outcome);
             if done {
@@ -2072,24 +2016,12 @@ mod tests {
             ],
             "the rollback must be bounded at {MAX_ROLLBACK_HEALTH_ATTEMPTS} attempts, then settle"
         );
-        // Settlement is not an abandonment: the failed candidate's `apply` is compensated by the
-        // release's own `rollback` — once, under the transaction's compensating identity, with the
-        // restored predecessor as the candidate — before the journal that carries the evidence is
-        // destroyed.
-        assert_eq!(
-            compensations,
-            vec![(
-                format!("{}r", digest("attempt")),
-                predecessor.clone(),
-                candidate.clone()
-            )],
-            "settlement compensates exactly once, with the rollback direction's arguments"
-        );
+        // Candidate compensation completed at an earlier barrier; predecessor health settlement
+        // never invokes another reconciler mutation.
         // The bounded helper leaves finalization to the one ordinary recovery path. It must not
         // reject or rewrite the predecessor, because that would turn a failed direct update into a
         // hidden search for an intermediate release on the next boot.
-        let predecessor_rejection =
-            deployment_rejection(&digest("archive-one"), &provider().provider_set_sha256);
+        let predecessor_rejection = deployment_rejection(&digest("archive-one"));
         assert!(!store.is_rejected(&lineage, &predecessor_rejection));
         assert!(!store.is_rejected(&lineage, &digest("archive-one")));
         let terminal = store
@@ -2100,23 +2032,22 @@ mod tests {
         match store.installed().unwrap() {
             Installed::Present(state) => {
                 assert_eq!(state.release, candidate);
-                assert!(state.confirmed, "the helper never rewrites committed state");
+                assert!(
+                    state.is_proven(),
+                    "the helper never rewrites committed state"
+                );
             }
             _ => panic!("expected the pre-finalization candidate record"),
         }
     }
 
     #[test]
-    fn a_failing_compensation_delays_settlement_for_exactly_one_more_boot() {
-        // The compensation must be durable-intent-first and one-shot: the boot that reaches the
-        // bound journals the tally, invokes the hook, and — if the hook fails — exits with the
-        // journal intact so the launcher relaunches. The next boot must NOT re-invoke it forever;
-        // it settles without repeating the hook, which is what bounds the whole thing at two boots.
+    fn bounded_unhealthy_settlement_does_not_repeat_candidate_compensation() {
         let lineage = crate::test_support::lineage();
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = Store::memory(MemoryBackend {
-            installed: Some(InstalledState::confirmed(
+            installed: Some(InstalledState::proven(
                 lineage.clone(),
                 candidate.clone(),
                 digest("archive-two"),
@@ -2130,60 +2061,25 @@ mod tests {
                 previous_repository_lineage: lineage.clone(),
                 candidate_release: candidate,
                 candidate_archive_sha256: digest("archive-two"),
-                candidate_rejection_sha256: deployment_rejection(
-                    &digest("archive-two"),
-                    &provider().provider_set_sha256,
-                ),
+                candidate_rejection_sha256: deployment_rejection(&digest("archive-two")),
                 candidate_repository_lineage: lineage.clone(),
                 candidate_rejection_required: true,
-                previous_lifecycle: provider(),
-                candidate_lifecycle: provider(),
+                previous_reconciler: provider(),
+                candidate_reconciler: provider(),
                 // Two boots have already failed the gate; this is the boot that reaches the bound.
                 rollback_health_failures: MAX_ROLLBACK_HEALTH_ATTEMPTS - 1,
-                phase: Phase::RollbackApplied,
+                phase: Phase::Restored,
             }),
             ..MemoryBackend::default()
         });
         store
-            .reject_deployment(
-                &lineage,
-                &digest("archive-two"),
-                &provider().provider_set_sha256,
-            )
+            .reject_deployment(&lineage, &digest("archive-two"))
             .unwrap();
 
-        let mut invocations = 0u32;
         let mut derived = store.journal().unwrap().expect("the rollback journal");
-        let failed = bound_unhealthy_rollback(&mut store, &mut derived, &mut |_| {
-            invocations += 1;
-            Err(io::Error::other("the rollback hook exited non-zero"))
-        });
-        assert!(failed.is_err(), "a failed compensation is not a settlement");
-        assert_eq!(invocations, 1);
-        let held = store
-            .journal()
-            .unwrap()
-            .expect("the journal survives so the next boot still owes settlement");
-        assert_eq!(held.rollback_health_failures, MAX_ROLLBACK_HEALTH_ATTEMPTS);
-        assert!(
-            !store.is_rejected(&lineage, &digest("archive-one")),
-            "nothing is decided until settlement actually runs"
-        );
-
-        // The next boot settles without a second invocation.
-        let mut derived = store.journal().unwrap().expect("the rollback journal");
-        let outcome = bound_unhealthy_rollback(&mut store, &mut derived, &mut |_| {
-            invocations += 1;
-            Ok(())
-        })
-        .unwrap();
+        let outcome = bound_unhealthy_rollback(&mut store, &mut derived).unwrap();
         assert_eq!(outcome, RollbackHealthOutcome::SettledUnhealthy);
-        assert_eq!(
-            invocations, 1,
-            "the durable tally makes the compensation one-shot, never a relaunch loop"
-        );
-        let predecessor_rejection =
-            deployment_rejection(&digest("archive-one"), &provider().provider_set_sha256);
+        let predecessor_rejection = deployment_rejection(&digest("archive-one"));
         assert!(!store.is_rejected(&lineage, &predecessor_rejection));
         assert!(!store.is_rejected(&lineage, &digest("archive-one")));
         assert_eq!(
@@ -2197,27 +2093,27 @@ mod tests {
         match store.installed().unwrap() {
             Installed::Present(state) => {
                 assert_eq!(state.release.version, "2.0.0");
-                assert!(state.confirmed);
+                assert!(state.is_proven());
             }
             _ => panic!("expected the pre-finalization candidate record"),
         }
     }
 
     #[test]
-    fn every_pre_terminal_rollback_phase_still_owes_the_predecessor_apply() {
-        // The resume gate on the predecessor's `apply` is "is this rollback still incomplete", not
-        // "has the apply ever run": a machine reboot (rather than an agent kill) at any later
+    fn every_pre_terminal_rollback_phase_still_owes_the_predecessor_converge() {
+        // The resume gate on the predecessor's `converge` is "is this rollback still incomplete", not
+        // "has the converge ever run": a machine reboot (rather than an agent kill) at any later
         // rollback phase leaves the predecessor's workload stopped, and the boot gate would then
-        // fail a perfectly healthy release three times and reject it. The apply is idempotent, so
+        // fail a perfectly healthy release three times and reject it. The converge is idempotent, so
         // replaying it on every resume boot is the correct semantics.
-        let mut tx = rollback_of_unconfirmed(
+        let mut tx = rollback_of_guarded(
             &unconfirmed_head(),
-            unconfirmed_head().pending.as_ref().unwrap(),
+            unconfirmed_head().rollback_guard.as_ref().unwrap(),
             false,
         );
         for phase in [
-            Phase::RollbackActivating,
-            Phase::RollbackApplied,
+            Phase::RollbackPlanned,
+            Phase::Restored,
             Phase::RollbackVerified,
         ] {
             tx.phase = phase;
@@ -2230,10 +2126,10 @@ mod tests {
         assert!(!tx.recovery_pending(Phase::RolledBack));
 
         // Which is why recording the phase stays guarded: the machine admits only the true forward
-        // edges, so a second resume boot must replay the apply without re-advancing.
-        tx.phase = Phase::RollbackApplied;
+        // edges, so a second resume boot must replay the converge without re-advancing.
+        tx.phase = Phase::Restored;
         assert!(
-            tx.advance(Phase::RollbackApplied).is_err(),
+            tx.advance(Phase::Restored).is_err(),
             "re-advancing into a phase already reached is rejected, so the advance stays guarded"
         );
     }
@@ -2241,12 +2137,12 @@ mod tests {
     #[test]
     fn the_compensating_direction_carries_its_own_stable_attempt_id() {
         // A reconciler that marks completion under the attempt id would skip the predecessor's
-        // `apply` if it reused the forward token — the forward switchover already ran `apply` under
-        // it with a different `--candidate`. The compensating identity is derived, so it is
+        // `converge` if it reused the forward token — the forward switchover already ran `converge` under
+        // it for a different payload. The compensating identity is derived, so it is
         // identical on every replay and on every boot, and dashless so the reference hook's
         // `{attempt-id}-{operation}` effect names still split on the first `-`.
         let head = unconfirmed_head();
-        let tx = rollback_of_unconfirmed(&head, head.pending.as_ref().unwrap(), false);
+        let tx = rollback_of_guarded(&head, head.rollback_guard.as_ref().unwrap(), false);
         assert_ne!(tx.rollback_attempt_id(), tx.id);
         assert_eq!(tx.rollback_attempt_id(), tx.clone().rollback_attempt_id());
         assert!(!tx.rollback_attempt_id().contains('-'));
@@ -2260,7 +2156,7 @@ mod tests {
         // candidate's machine-state changes are compensated by a real `rollback` invocation.
         let head = unconfirmed_head();
         let pending = head
-            .pending
+            .rollback_guard
             .clone()
             .expect("an unconfirmed head has pending");
         let mut store = store_holding(&head);
@@ -2269,10 +2165,14 @@ mod tests {
 
         assert_eq!(
             store.journal().unwrap(),
-            Some(rollback_of_unconfirmed(&head, &pending, false)),
+            Some(rollback_of_guarded(&head, &pending, false)),
             "the fallback's revert is the one shape every other revert produces"
         );
-        let rejection = &head.pending.as_ref().unwrap().candidate_rejection_sha256;
+        let rejection = &head
+            .rollback_guard
+            .as_ref()
+            .unwrap()
+            .candidate_rejection_sha256;
         assert!(
             !store.is_rejected(&head.repository_lineage, rejection),
             "damage to this disk is never charged to the deployment"
@@ -2283,9 +2183,6 @@ mod tests {
             installed: store.installed().unwrap(),
             active: Some(head.release.clone()),
             journal: store.journal().unwrap(),
-            bad_agent: None,
-            confirm_window: Duration::from_secs(60),
-            now: 120,
         };
         let derived = recovery_transaction(&situation).expect("a drivable revert");
         assert!(derived.is_rollback());
@@ -2313,7 +2210,7 @@ mod tests {
         );
 
         // The control plane publishes a reassignment that changes only the runtime; the loop runs
-        // `apply --reason restart` and the reconciler brings the workload back up on its own time.
+        // `converge --reason restart` and the reconciler brings the workload back up on its own time.
         let converged_at = Instant::now();
         health.reconverging(&timeouts);
         assert!(
@@ -2348,9 +2245,40 @@ mod tests {
         assert_eq!(health.next_probe, now + timeouts.health_interval);
     }
 
+    #[tokio::test]
+    async fn an_attention_hold_stops_boot_before_recovery_or_workload_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut opts = options();
+        opts.paths = updated::config::Paths::resolve(root.path(), root.path());
+        updated::command_adapter::write_attention(
+            root.path(),
+            &updated_contracts::attention::Attention {
+                product: "app".into(),
+                receipt: "a".repeat(64),
+                operation: updated_contracts::reconciler::MutationOperation::Converge,
+                attempt: "b".repeat(64),
+                version: "4.0.0".into(),
+                message: "verify external migration".into(),
+            },
+        )
+        .unwrap();
+        // Even stale invocation cleanup must wait for the operator decision.
+        let evidence = opts
+            .paths
+            .reconciler_state_dir("app")
+            .join("invocations/evidence");
+        std::fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+        std::fs::write(&evidence, b"keep").unwrap();
+        let active = opts.paths.active_release.clone();
+        let error = run(opts).await.unwrap_err();
+        assert!(error.to_string().contains("operator attention required"));
+        assert_eq!(std::fs::read(evidence).unwrap(), b"keep");
+        assert!(!active.exists());
+    }
+
     /// Options in the shape [`crate::options::parse_args`] produces, against a local routing
     /// repository so nothing here reaches the network.
-    fn options() -> Options {
+    pub(crate) fn options() -> Options {
         use updated::config::{Paths, Routing};
         let root = crate::test_support::nonexistent_root();
         let routing = Routing {
@@ -2365,11 +2293,13 @@ mod tests {
             ),
         };
         Options {
+            helper_executable: std::env::current_exe().unwrap(),
             deployment: "test".into(),
             assignment_sha256: "a".repeat(64),
             runtime_data: crate::runtime_data::RuntimeDataManager::new(
                 &routing,
                 &updated_contracts::dataflow::InputSelection::default(),
+                &root.join("enrollment/runtime-inputs.json"),
             )
             .expect("a local repository"),
             runtime_converge_pending: false,
@@ -2384,11 +2314,6 @@ mod tests {
             routing,
             timeouts: BoundedTimeouts::new(Timeouts::default()),
             storage: runtime().storage,
-            agent_update: AgentUpdate {
-                channel: "stable".into(),
-                state_dir: root.join("state"),
-                check_interval: Duration::from_secs(60),
-            },
             identity_renewal: IdentityRenewal {
                 config: root.join("config.toml"),
                 state_dir: root.join("enrollment"),
@@ -2426,10 +2351,6 @@ mod tests {
                 sha256: "a".repeat(64),
             },
             cold_install_fallback: false,
-            provider_set: TargetReference {
-                path: "provider-sets/default.json".into(),
-                sha256: "b".repeat(64),
-            },
             release_root: serde_json::json!({}),
             runtime: runtime(),
         };
@@ -2448,16 +2369,11 @@ mod tests {
             "a rejection of OTHER bytes says nothing about the assigned release"
         );
         store
-            .reject_deployment(
-                &lineage,
-                &assignment.application.sha256,
-                &assignment.provider_set.sha256,
-            )
+            .reject_deployment(&lineage, &assignment.application.sha256)
             .unwrap();
         assert!(rejects_release(&store, &lineage, &assignment));
         assert!(
-            !store.is_rejected(&lineage, &assignment.application.sha256)
-                && !store.is_rejected(&lineage, &assignment.provider_set.sha256),
+            !store.is_rejected(&lineage, &assignment.application.sha256),
             "a failed combination does not poison either reusable artifact"
         );
 
@@ -2484,7 +2400,7 @@ mod tests {
     fn a_reassignment_converges_exactly_when_the_release_could_observe_the_change() {
         // The agent owns no process to reconfigure, so the ONLY way a changed input reaches the
         // release is another reconciler invocation. Answering "no change" leaves the node running
-        // on values the assignment has replaced; answering "changed" on a cadence tweak re-applies
+        // on values the assignment has replaced; answering "changed" on a cadence tweak re-converges
         // the whole fleet for nothing.
         let mut opts = options();
         let mut reinput = runtime();
@@ -2540,9 +2456,9 @@ mod tests {
     }
 
     #[test]
-    fn every_converge_the_loop_runs_is_apply_reason_restart() {
+    fn every_converge_the_loop_runs_is_reason_restart() {
         // A changed input, repaired bundle, and ordinary steady-state cycle all reach the release
-        // the same way: `apply --reason restart`, which is the reconciler's cue to re-converge
+        // the same way: `converge --reason restart`, which is the reconciler's cue to re-converge
         // whatever it owns onto the current values. `install` is the first boot's alone.
         let source = crate::test_support::normalized_source(include_str!("main.rs"));
         let loop_body = &source[source
@@ -2561,7 +2477,7 @@ mod tests {
     #[test]
     fn a_bad_disk_is_still_recognised_behind_a_post_commit_wrapper() {
         // `foundation::durable` wraps a failure that happens AFTER the rename landed, so the
-        // launcher does not roll back a pointer that already moved. Attaching that marker costs the
+        // durable wrapper does not roll back a pointer that already moved. Attaching that marker costs the
         // `io::Error` its raw-code representation (`Os` and `Custom` are alternatives), so the errno
         // is only reachable one `source` hop down — the shape rebuilt here, and the contract
         // foundation documents on `Unsynced` and pins with its own regression test. A bad disk is a
@@ -2642,22 +2558,6 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_retry_budget_outlasts_the_launchers_readiness_and_confirmation_windows() {
-        // The shipped launcher defaults (launcher/src/main.rs): 45s to prove ready, then a 30s
-        // confirmation window. The budget must outlast their sum, because that is what makes the
-        // retry safe: a candidate that spends the transient behind its readiness signal is
-        // COMMITTED, so an exit after the budget is an ordinary relaunch, not a permanent,
-        // by-content-hash rejection.
-        let launcher_windows = Duration::from_secs(45) + Duration::from_secs(30);
-        assert!(
-            TRANSIENT_RETRY_BUDGET > launcher_windows,
-            "a boot-recovery retry budget of {TRANSIENT_RETRY_BUDGET:?} does not outlast the \
-             launcher's {launcher_windows:?}"
-        );
-        assert!(TRANSIENT_RETRY_INTERVAL < TRANSIENT_RETRY_BUDGET);
-    }
-
-    #[test]
     fn the_identity_tick_cannot_stall_the_loop_into_a_health_drain() {
         // The tick runs inline on the loop that emits the heartbeat, so its bound is a health
         // property: a stall anywhere near REPORT_FRESHNESS drains a healthy node out of rotation.
@@ -2669,41 +2569,5 @@ mod tests {
              window the healthproxy drains on",
             updated_contracts::telemetry::REPORT_FRESHNESS
         );
-    }
-
-    #[test]
-    fn a_marker_is_forwarded_for_rejection_exactly_when_the_rejection_record_would_take_it() {
-        // Regression: `execute_boot_plan` decides up front whether a rejected-agent marker
-        // names a candidate worth recording, and `SelfUpdateState::reject_candidate` then hands
-        // that hash to `Rejections::reject`. If the two grammars ever disagree, a marker this
-        // forwards fails the boot with `InvalidData` — and the marker is only ever cleared after a
-        // successful write, so every subsequent boot fails identically: the permanent boot loop.
-        // They cannot disagree by construction now (both go through
-        // `updated::reject::is_rejection_key`); this pins that they agree in behaviour too.
-        let digest: String = std::iter::repeat_n('a', 64).collect();
-        let scratch = tempfile::tempdir().unwrap();
-        let path = scratch.path().join("marker-agreement");
-        for candidate in [
-            digest.clone(),
-            format!("{digest}:{digest}"),
-            digest.to_ascii_uppercase(),
-            "not-a-digest".into(),
-            String::new(),
-            format!("{digest}:"),
-            format!("{digest}:{digest}:{digest}"),
-        ] {
-            let marker = std::path::Path::new("/var/lib/updated/agents")
-                .join(&candidate)
-                .join("agent");
-            let forwarded = rejected_agent_hash(&marker).is_some();
-            let mut rejections = updated::reject::Rejections::load(&path).unwrap();
-            let recordable = rejections.reject(&candidate).is_ok();
-            std::fs::remove_file(&path).ok();
-            assert_eq!(
-                forwarded, recordable,
-                "{candidate:?}: forwarded={forwarded} but the rejection record would take it \
-                 ={recordable}"
-            );
-        }
     }
 }

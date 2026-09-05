@@ -15,8 +15,8 @@ pub(crate) fn tampered_root_fails_closed(ctx: &Ctx) -> R {
         .workload(svc)
         .check_interval("1s")
         .health_grace("1s")
-        .launcher()?;
-    let enrollment_path = dir.join("launcher-state/enrollment.json");
+        .command()?;
+    let enrollment_path = dir.join("agent-state/enrollment.json");
     let mut enrollment: updated_contracts::enrollment::EnrollmentBundle =
         serde_json::from_slice(&std::fs::read(&enrollment_path).map_err(str_err)?)
             .map_err(|error| error.to_string())?;
@@ -64,7 +64,7 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
         .check_interval("1s")
         .workload(svc)
         .health_grace("2s");
-    let cmd = node.clone().launcher()?;
+    let cmd = node.clone().command()?;
     let stack = Service::spawn("local-repair", &cmd);
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail(format!(
@@ -78,7 +78,7 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
     // Do not sample `active-release` immediately after publishing. Under load the assignment can
     // be visible before the running node has completed its update, which makes this scenario
     // corrupt 1.0.0, observe its perfectly valid repair, and then falsely demand a 2.0.0 repair.
-    // The success log is emitted only after `apply_update` has returned and cleared its journal;
+    // The success log is emitted only after `execute_update` has returned and cleared its journal;
     // pair it with the durable installed record so the bytes modified below are unambiguously the
     // committed 2.0.0 deployment this scenario intends to repair.
     if !wait_until(EVENT_TIMEOUT, || {
