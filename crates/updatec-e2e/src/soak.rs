@@ -35,6 +35,8 @@ use updatec::{
 
 use crate::{agent_resource_name, fixture, NAMESPACE};
 
+mod resources;
+
 const STATE_SCHEMA: u8 = 4;
 const BASELINE_VERSION: &str = "1.0.0";
 const CAMPAIGN_VERSION_MAJOR: u64 = 1_000_000;
@@ -87,11 +89,14 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if !self.agent_count.is_multiple_of(fixture::SOAK_GROUPS.len()) {
+        if !self
+            .agent_count
+            .is_multiple_of(resources::SOAK_GROUPS.len())
+        {
             return Err(format!(
                 "agent count {} must divide evenly across {} soak groups",
                 self.agent_count,
-                fixture::SOAK_GROUPS.len()
+                resources::SOAK_GROUPS.len()
             )
             .into());
         }
@@ -232,7 +237,7 @@ impl CampaignState {
             round: 0,
             release_generation: 0,
             recovery_target: None,
-            desired: fixture::SOAK_GROUPS
+            desired: resources::SOAK_GROUPS
                 .into_iter()
                 .map(|name| (name.into(), BASELINE_VERSION.into()))
                 .collect(),
@@ -286,7 +291,7 @@ impl CampaignState {
             .into());
         }
         let keys: Vec<&str> = self.desired.keys().map(String::as_str).collect();
-        if keys != fixture::SOAK_GROUPS.to_vec() {
+        if keys != resources::SOAK_GROUPS.to_vec() {
             return Err(format!("persisted desired groups are not canonical: {keys:?}").into());
         }
         let fault_kinds = FaultKind::ALL.into_iter().collect::<BTreeSet<_>>();
@@ -333,11 +338,11 @@ impl CampaignState {
             .checked_add(self.forward_recoveries)
             .ok_or("persisted release assignment event bound overflow")?;
         let maximum_assignments = maximum_assignment_events
-            .checked_mul(fixture::SOAK_GROUPS.len() as u64)
+            .checked_mul(resources::SOAK_GROUPS.len() as u64)
             .ok_or("persisted release assignment bound overflow")?;
         let minimum_recovery_assignments = self
             .forward_recoveries
-            .checked_mul(fixture::SOAK_GROUPS.len() as u64)
+            .checked_mul(resources::SOAK_GROUPS.len() as u64)
             .and_then(|count| count.checked_add(self.successful_campaigns))
             .ok_or("persisted minimum release assignment bound overflow")?;
         if total_faults < self.successful_campaigns
@@ -427,9 +432,9 @@ fn plan_round(state: &CampaignState, agent_count: usize) -> RoundPlan {
     let group_count = if expected_rejection {
         1
     } else {
-        1 + (splitmix64(&mut rng) as usize) % fixture::SOAK_GROUPS.len()
+        1 + (splitmix64(&mut rng) as usize) % resources::SOAK_GROUPS.len()
     };
-    let mut groups = fixture::SOAK_GROUPS.map(str::to_owned);
+    let mut groups = resources::SOAK_GROUPS.map(str::to_owned);
     for index in (1..groups.len()).rev() {
         let selected = (splitmix64(&mut rng) as usize) % (index + 1);
         groups.swap(index, selected);
@@ -680,7 +685,7 @@ impl ReleaseCatalog {
     }
 
     fn deployment(&self, group: &str, version: &str, sha: &str) -> DeploymentSpec {
-        fixture::deployment(group, version, &self.platform, sha, &self.root_json)
+        resources::deployment(group, version, &self.platform, sha, &self.root_json)
     }
 
     async fn ensure_candidate(
@@ -812,10 +817,13 @@ impl Campaign {
                     complete = false;
                     continue;
                 }
-                let group = fixture::SOAK_GROUPS[ordinal % fixture::SOAK_GROUPS.len()];
+                let group = resources::SOAK_GROUPS[ordinal % resources::SOAK_GROUPS.len()];
                 let expected = BTreeMap::from([
-                    (fixture::SOAK_COHORT_LABEL.to_owned(), group.to_owned()),
-                    (fixture::SOAK_NODE_LABEL.to_owned(), agent_hostname(ordinal)),
+                    (resources::SOAK_COHORT_LABEL.to_owned(), group.to_owned()),
+                    (
+                        resources::SOAK_NODE_LABEL.to_owned(),
+                        agent_hostname(ordinal),
+                    ),
                 ]);
                 let current: BTreeMap<&str, &str> = agent
                     .spec
@@ -840,7 +848,7 @@ impl Campaign {
                 println!(
                     "[soak] all {} agents are enrolled and assigned across {:?}",
                     self.config.agent_count,
-                    fixture::SOAK_GROUPS
+                    resources::SOAK_GROUPS
                 );
                 return Ok(());
             }
@@ -886,7 +894,7 @@ impl Campaign {
             .ensure_candidate(generation, CandidateKind::Valid)
             .await?;
         let mut forward = state.clone();
-        for group in fixture::SOAK_GROUPS {
+        for group in resources::SOAK_GROUPS {
             forward.desired.insert(group.into(), version.clone());
         }
         ensure_control_resources(&self.client, &self.config, &self.catalog, &forward).await?;
@@ -894,7 +902,7 @@ impl Campaign {
         let duration = self.wait_converged(&forward.desired).await?;
         forward.release_assignments = forward
             .release_assignments
-            .checked_add(fixture::SOAK_GROUPS.len() as u64)
+            .checked_add(resources::SOAK_GROUPS.len() as u64)
             .ok_or("release assignment counter overflow")?;
         forward.forward_recoveries = forward
             .forward_recoveries
@@ -1039,7 +1047,7 @@ impl Campaign {
             last.clear();
             for ordinal in 0..self.config.agent_count {
                 let resource = agent_resource_name(ordinal);
-                let group = fixture::SOAK_GROUPS[ordinal % fixture::SOAK_GROUPS.len()];
+                let group = resources::SOAK_GROUPS[ordinal % resources::SOAK_GROUPS.len()];
                 let expected = desired
                     .get(group)
                     .ok_or_else(|| format!("no desired version for {group}"))?;
@@ -1119,7 +1127,7 @@ impl Campaign {
             .ok_or_else(|| format!("no stable version for {group}"))?;
         let agents: Api<UpdateAgent> = Api::namespaced(self.client.clone(), &self.config.namespace);
         for ordinal in 0..self.config.agent_count {
-            if fixture::SOAK_GROUPS[ordinal % fixture::SOAK_GROUPS.len()] != group {
+            if resources::SOAK_GROUPS[ordinal % resources::SOAK_GROUPS.len()] != group {
                 continue;
             }
             let Some(agent) = agents.get_opt(&agent_resource_name(ordinal)).await? else {
@@ -1133,7 +1141,7 @@ impl Campaign {
     }
 
     async fn inject_fault(&self, plan: &RoundPlan) -> FaultExecution {
-        let name = format!("{}{}", fixture::SOAK_CHAOS_NAME_PREFIX, plan.round);
+        let name = format!("{}{}", resources::SOAK_CHAOS_NAME_PREFIX, plan.round);
         let (api, object) = match self.fault_object(plan, &name).await {
             Ok(value) => value,
             Err(error) => {
@@ -1228,7 +1236,7 @@ impl Campaign {
             "metadata": {
                 "name": name,
                 "namespace": self.config.namespace,
-                "labels": {fixture::SOAK_CHAOS_LABEL: fixture::SOAK_CHAOS_VALUE},
+                "labels": {resources::SOAK_CHAOS_LABEL: resources::SOAK_CHAOS_VALUE},
             },
             "spec": spec,
         }))?;
@@ -1274,8 +1282,8 @@ async fn cleanup_faults(
 ) -> Result<()> {
     let selector = format!(
         "{}={}",
-        fixture::SOAK_CHAOS_LABEL,
-        fixture::SOAK_CHAOS_VALUE
+        resources::SOAK_CHAOS_LABEL,
+        resources::SOAK_CHAOS_VALUE
     );
     // Derive cleanup from the exhaustive descriptor table and deduplicate shared resources.
     // PodChaos backs both kill variants; new fault kinds cannot silently escape cleanup.
@@ -1482,7 +1490,7 @@ async fn ensure_control_resources(
         )
         .await?;
     let groups: Api<UpdateGroup> = Api::namespaced(client.clone(), &config.namespace);
-    for name in fixture::SOAK_GROUPS {
+    for name in resources::SOAK_GROUPS {
         let version = state
             .desired
             .get(name)
@@ -1492,7 +1500,7 @@ async fn ensure_control_resources(
             .patch(
                 name,
                 &apply,
-                &Patch::Apply(&fixture::group(
+                &Patch::Apply(&resources::group(
                     name,
                     catalog.deployment(name, version, &sha),
                 )),
@@ -1501,9 +1509,9 @@ async fn ensure_control_resources(
     }
     let sets: Api<UpdateGroupSet> = Api::namespaced(client.clone(), &config.namespace);
     sets.patch(
-        fixture::SOAK_GROUP_SET,
+        resources::SOAK_GROUP_SET,
         &apply,
-        &Patch::Apply(&fixture::group_set()),
+        &Patch::Apply(&resources::group_set()),
     )
     .await?;
     Ok(())
@@ -1932,7 +1940,7 @@ mod tests {
         state.last_convergence_seconds = 12.5;
         state
             .desired
-            .insert(fixture::SOAK_GROUPS[0].into(), "1000000.1.0".into());
+            .insert(resources::SOAK_GROUPS[0].into(), "1000000.1.0".into());
         *state.faults.get_mut(&FaultKind::IoError).unwrap() = 1;
 
         let restored: CampaignState =
@@ -1959,7 +1967,7 @@ mod tests {
         state.last_success_timestamp = 1;
         state
             .desired
-            .insert(fixture::SOAK_GROUPS[0].into(), "1000000.1.0".into());
+            .insert(resources::SOAK_GROUPS[0].into(), "1000000.1.0".into());
         *state.faults.get_mut(&FaultKind::IoError).unwrap() = 1;
 
         state.persist(&config).unwrap();
@@ -2104,7 +2112,7 @@ mod tests {
         state.seed += 1;
         assert!(state.validate(&config).is_err());
         state.seed = config.seed;
-        state.desired.remove(fixture::SOAK_GROUPS[0]);
+        state.desired.remove(resources::SOAK_GROUPS[0]);
         assert!(state.validate(&config).is_err());
     }
 
@@ -2188,7 +2196,7 @@ mod tests {
         recovered.recoveries = 1;
         recovered.forward_recoveries = 1;
         recovered.release_generation = 2;
-        recovered.release_assignments = fixture::SOAK_GROUPS.len() as u64;
+        recovered.release_assignments = resources::SOAK_GROUPS.len() as u64;
         recovered.consecutive_failures = 1;
         recovered.last_failure_timestamp = 1;
         for version in recovered.desired.values_mut() {

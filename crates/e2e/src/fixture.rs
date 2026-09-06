@@ -394,19 +394,7 @@ pub fn run() -> R {
         // Rollback restores the saved workload itself. The platform then health-gates the
         // predecessor without running its deployment command again.
         Some(address) if operation == Operation::Rollback => {
-            let previous: Option<WorkloadRecord> =
-                serde_json::from_slice(&std::fs::read(&backup).map_err(str_err)?)
-                    .map_err(str_err)?;
-            match previous {
-                Some(previous) => converge(
-                    &root,
-                    Path::new(&previous.release),
-                    &previous.version,
-                    address,
-                    &mode,
-                ),
-                None => Ok(()),
-            }
+            restore_workload(&root, &backup, address, &mode)
         }
         Some(address) if operation == Operation::Healthcheck => {
             if read_workload(&root)
@@ -473,7 +461,7 @@ fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &s
 /// compares its managed files/state, while the fixture's workload consumes no assigned inputs.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WorkloadRecord {
-    pid: u32,
+    pid: Option<u32>,
     release: String,
     version: String,
 }
@@ -483,7 +471,39 @@ fn record_path(root: &Path) -> PathBuf {
 }
 
 fn read_workload(root: &Path) -> Option<WorkloadRecord> {
-    serde_json::from_slice(&std::fs::read(record_path(root)).ok()?).ok()
+    load_workload(&record_path(root)).ok().flatten()
+}
+
+fn load_workload(path: &Path) -> R<Option<WorkloadRecord>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(str_err),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(str_err(error)),
+    }
+}
+
+/// A killed deployment can reach recovery before it created its backup. The backup is durable
+/// before any workload effect, so in that case the actual workload record still describes the
+/// predecessor. Restore it if its process was lost too. Other read/parse failures are not evidence
+/// that deployment never began and must not silently discard the restore point.
+fn restore_workload(root: &Path, backup: &Path, address: &str, mode: &Mode) -> R {
+    let previous: Option<WorkloadRecord> = match std::fs::read(backup) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(str_err)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            load_workload(&record_path(root))?
+        }
+        Err(error) => return Err(str_err(error)),
+    };
+    match previous {
+        Some(previous) => converge(
+            root,
+            Path::new(&previous.release),
+            &previous.version,
+            address,
+            mode,
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Converge the workload onto `release`: leave it alone if it already runs these bytes under this
@@ -492,12 +512,12 @@ fn read_workload(root: &Path) -> Option<WorkloadRecord> {
 fn converge(root: &Path, release: &Path, version: &str, address: &str, mode: &Mode) -> R {
     let release_id = release.display().to_string();
     let replacing = match read_workload(root) {
-        Some(current) if current.release == release_id && pid_alive(current.pid) => {
+        Some(current) if current.release == release_id && current.pid.is_some_and(pid_alive) => {
             // Already converged. Rotation is still derived rather than assumed: a workload that
             // came up after a previous `converge` gave up waiting is put back in rotation here.
             return restore_rotation(root, address, mode);
         }
-        Some(current) => Some(current.pid),
+        Some(current) => current.pid,
         None => None,
     };
     // Withdraw before stopping, never after: a load balancer that is still routing to this node
@@ -542,7 +562,7 @@ fn converge(root: &Path, release: &Path, version: &str, address: &str, mode: &Mo
         .map_err(|error| format!("starting {}: {error}", program.display()))?;
     let workload = WorkloadRecord {
         version: version.into(),
-        pid: child.id(),
+        pid: Some(child.id()),
         release: release_id,
     };
     // Renamed into place, never truncate-then-write: a kill mid-write would otherwise leave an
@@ -706,10 +726,22 @@ fn wait_for_exit(pid: u32) -> bool {
 /// the victim of a stale pid would be a production process.
 fn stop_workload(dir: &Path) {
     let root = root(dir);
-    if let Some(workload) = read_workload(&root) {
-        stop_pid(workload.pid);
+    if let Some(mut workload) = read_workload(&root) {
+        if let Some(pid) = workload.pid.take() {
+            stop_pid(pid);
+        }
+        // Ending a process does not uninstall the application. Keep its durable identity so
+        // recovery before the first deployment instruction can still restore it after a crash.
+        let saved = serde_json::to_vec(&workload)
+            .map_err(str_err)
+            .and_then(|bytes| {
+                foundation::durable::atomic_write(&record_path(&root), ".workload-", &bytes)
+                    .map_err(str_err)
+            });
+        if let Err(error) = saved {
+            eprintln!("saving stopped fixture workload: {error}");
+        }
     }
-    let _ = std::fs::remove_file(record_path(&root));
 }
 
 /// Ends the fixture's workload when the scenario's scope ends. The workload is deliberately outside
@@ -739,7 +771,7 @@ impl Drop for Workload {
 
 /// The PID of the workload the fixture under `dir` currently manages.
 pub fn workload_pid(dir: &Path) -> Option<u32> {
-    read_workload(&root(dir)).map(|workload| workload.pid)
+    read_workload(&root(dir)).and_then(|workload| workload.pid)
 }
 
 // ---------------------------- migration-shaped adapter ----------------------------
@@ -809,7 +841,13 @@ fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version
             std::fs::write(state.join("migration-finalized"), id.as_bytes()).map_err(str_err)
         }
         Operation::Rollback => {
-            let taken_by = std::fs::read_to_string(&restore_point).map_err(str_err)?;
+            let taken_by = match std::fs::read_to_string(&restore_point) {
+                Ok(taken_by) => taken_by,
+                // The restore point is written before either migrated file. Recovery can run
+                // before that boundary, in which case there are no migration effects to undo.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(str_err(error)),
+            };
             let backup = backup(taken_by.trim());
             std::fs::copy(backup.join("content.db"), live.join("content.db")).map_err(str_err)?;
             std::fs::copy(backup.join("app.war"), live.join("app.war")).map_err(str_err)?;
@@ -845,6 +883,20 @@ mod tests {
     }
 
     #[test]
+    fn recovery_before_deployment_has_no_effect_but_corrupt_backups_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("workload-before-attempt.json");
+        let mode = Mode::parse("workload=127.0.0.1:1").unwrap();
+        restore_workload(root.path(), &backup, "127.0.0.1:1", &mode)
+            .expect("recovery can precede the first deployment instruction");
+        std::fs::write(record_path(root.path()), b"corrupt").unwrap();
+        assert!(restore_workload(root.path(), &backup, "127.0.0.1:1", &mode).is_err());
+        std::fs::remove_file(record_path(root.path())).unwrap();
+        std::fs::write(&backup, b"corrupt").unwrap();
+        assert!(restore_workload(root.path(), &backup, "127.0.0.1:1", &mode).is_err());
+    }
+
+    #[test]
     fn a_rollback_failure_is_unconditional() {
         let mode = Mode::parse("fail=converge,fail=rollback").unwrap();
         assert!(mode.fails(Operation::Rollback, "1.0.0"));
@@ -860,6 +912,35 @@ mod tests {
     #[test]
     fn an_unknown_directive_is_refused_rather_than_silently_ignored() {
         assert!(Mode::parse("workload=127.0.0.1:1,drain-hold=5s").is_err());
+    }
+
+    #[test]
+    fn migration_recovery_before_any_effect_can_repeat() {
+        let root = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            migrate(
+                root.path(),
+                Migration::On,
+                Operation::Rollback,
+                "attempt",
+                "2.0.0",
+            )
+            .expect("there is no migration to undo before its restore point exists");
+        }
+        assert!(!root.path().join("migration-state/restore-point").exists());
+        std::fs::write(
+            root.path().join("migration-state/restore-point"),
+            b"missing",
+        )
+        .unwrap();
+        assert!(migrate(
+            root.path(),
+            Migration::On,
+            Operation::Rollback,
+            "attempt",
+            "2.0.0"
+        )
+        .is_err());
     }
 
     /// The double-execution window, at unit scope: a crash between the migrating write and the

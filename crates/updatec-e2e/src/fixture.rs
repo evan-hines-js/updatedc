@@ -24,23 +24,6 @@ pub(crate) const SIGNING_SECRET: &str = "tuf-signing-keys";
 pub(crate) const STORAGE_SECRET: &str = "s3-credentials";
 pub(crate) const ASSIGNMENT_PREFIX: &str = "assignments";
 pub(crate) const STATE_MAX_SHARDS: u8 = 8;
-pub(crate) const SOAK_FLEET_LABEL: &str = "soak.updated.dev/fleet";
-pub(crate) const SOAK_FLEET_VALUE: &str = "managed";
-pub(crate) const SOAK_COHORT_LABEL: &str = "soak.updated.dev/cohort";
-#[cfg(unix)]
-pub(crate) const SOAK_NODE_LABEL: &str = "soak.updated.dev/node";
-#[cfg(unix)]
-pub(crate) const SOAK_CHAOS_LABEL: &str = "soak.updated.dev/campaign";
-#[cfg(unix)]
-pub(crate) const SOAK_CHAOS_VALUE: &str = "managed";
-#[cfg(unix)]
-pub(crate) const SOAK_CHAOS_NAME_PREFIX: &str = "soak-round-";
-pub(crate) const SOAK_GROUPS: [&str; 3] = ["soak-a", "soak-b", "soak-c"];
-pub(crate) const SOAK_GROUP_SET: &str = "soak-fleet";
-pub(crate) const SOAK_MAX_UNAVAILABLE: usize = 1;
-pub(crate) const SOAK_MAX_CONCURRENT: u32 = 2;
-pub(crate) const SOAK_MAX_REGRESSIONS: u32 = 1;
-pub(crate) const SOAK_STUCK_AFTER_SECONDS: u64 = 300;
 
 pub(crate) fn runtime() -> RuntimeSpec {
     RuntimeSpec {
@@ -68,24 +51,7 @@ pub(crate) fn runtime() -> RuntimeSpec {
     }
 }
 
-pub(crate) fn deployment(
-    name: &str,
-    version: &str,
-    platform: &str,
-    app_sha: &str,
-    root_json: &str,
-) -> DeploymentSpec {
-    deployment_with_name(
-        name,
-        &versioned_deployment_name(name, version),
-        version,
-        platform,
-        app_sha,
-        root_json,
-    )
-}
-
-fn deployment_with_name(
+pub(crate) fn deployment_with_name(
     origin: &str,
     deployment_name: &str,
     version: &str,
@@ -107,15 +73,6 @@ fn deployment_with_name(
         cold_install_fallback: false,
         runtime: runtime(),
     }
-}
-
-fn versioned_deployment_name(group: &str, version: &str) -> String {
-    let name = format!("{group}-{version}");
-    assert!(
-        updated_contracts::identity::is_segment(&name),
-        "fixture deployment identity {name:?} violates the shared identity grammar"
-    );
-    name
 }
 
 pub(crate) fn repository(default_deployment: DeploymentSpec) -> UpdateRepository {
@@ -148,31 +105,6 @@ pub(crate) fn repository(default_deployment: DeploymentSpec) -> UpdateRepository
     repository
 }
 
-pub(crate) fn group(name: &str, deployment: DeploymentSpec) -> UpdateGroup {
-    let mut group = UpdateGroup::new(
-        name,
-        UpdateGroupSpec {
-            repository_ref: LocalObjectReference {
-                name: REPOSITORY_NAME.into(),
-            },
-            selector: LabelSelector {
-                match_labels: BTreeMap::from([(SOAK_COHORT_LABEL.into(), name.into())]),
-            },
-            depends_on: vec![],
-            inputs: BTreeMap::new(),
-            deployment,
-            max_unavailable: Some(SOAK_MAX_UNAVAILABLE),
-            emergency_correction: false,
-        },
-    );
-    group.metadata.namespace = Some(NAMESPACE.into());
-    group.metadata.labels = Some(BTreeMap::from([(
-        SOAK_FLEET_LABEL.into(),
-        SOAK_FLEET_VALUE.into(),
-    )]));
-    group
-}
-
 /// Construct every fleet fixture's set through the typed API. In particular, repository scope is
 /// required here rather than repeated in JSON call sites, so a CRD change cannot leave the CI
 /// driver's rollout sets orphaned from the controller that owns them.
@@ -197,18 +129,6 @@ pub(crate) fn group_set_resource(
         },
     );
     set.metadata.namespace = Some(NAMESPACE.into());
-    set
-}
-
-pub(crate) fn group_set() -> UpdateGroupSet {
-    let mut set = group_set_resource(
-        SOAK_GROUP_SET,
-        BTreeMap::from([(SOAK_FLEET_LABEL.into(), SOAK_FLEET_VALUE.into())]),
-        Some(SOAK_MAX_CONCURRENT),
-    );
-    set.spec.max_regressions = Some(SOAK_MAX_REGRESSIONS);
-    set.spec.on_regression = RegressionResponse::Rollback;
-    set.spec.stuck_after_seconds = Some(SOAK_STUCK_AFTER_SECONDS);
     set
 }
 
@@ -288,64 +208,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn soak_groups_share_one_safe_regression_boundary() {
-        let set = group_set();
-        assert_eq!(set.spec.max_concurrent, Some(2));
-        assert_eq!(set.spec.max_regressions, Some(1));
-        assert_eq!(set.spec.on_regression, RegressionResponse::Rollback);
-        for name in SOAK_GROUPS {
-            let deployment = deployment(name, "1.0.0", "linux-x86_64", "a", "{}");
-            let group = group(name, deployment);
-            assert_eq!(
-                group
-                    .metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|labels| labels.get(SOAK_FLEET_LABEL))
-                    .map(String::as_str),
-                Some(SOAK_FLEET_VALUE)
-            );
-        }
-    }
-
-    #[test]
     fn runtime_bounds_are_shared_by_every_fixture_deployment() {
-        let left = deployment("left", "1.0.0", "linux-x86_64", "a", "{}");
-        let right = deployment("right", "2.0.0", "linux-x86_64", "c", "{}");
+        let left = deployment_with_name("left", "left", "1.0.0", "linux-x86_64", "a", "{}");
+        let right = deployment_with_name("right", "right", "2.0.0", "linux-x86_64", "c", "{}");
         assert_eq!(
             serde_json::to_value(left.runtime).unwrap(),
             serde_json::to_value(right.runtime).unwrap()
-        );
-    }
-
-    #[test]
-    fn kind_and_soak_share_bytes_but_keep_their_required_identities() {
-        let kind = deployment_with_name("edge", "edge", "2.0.0", "linux-x86_64", "a", "{}");
-        let soak = deployment("edge", "2.0.0", "linux-x86_64", "a", "{}");
-        assert_eq!(kind.name, "edge");
-        assert_eq!(soak.name, "edge-2.0.0");
-        assert_eq!(
-            serde_json::to_value(&kind.application).unwrap(),
-            serde_json::to_value(&soak.application).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&kind.runtime).unwrap(),
-            serde_json::to_value(&soak.runtime).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&kind.release_repository).unwrap(),
-            serde_json::to_value(&soak.release_repository).unwrap()
-        );
-
-        let repository = repository(kind);
-        assert_eq!(repository.spec.s3.bucket, RELEASE_BUCKET);
-        assert_eq!(
-            repository.spec.s3.endpoint.as_deref(),
-            Some(RELEASE_ENDPOINT)
-        );
-        assert_eq!(
-            repository.spec.s3.public_endpoint.as_deref(),
-            Some(RELEASE_PUBLIC_ENDPOINT)
         );
     }
 }

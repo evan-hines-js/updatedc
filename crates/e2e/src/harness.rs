@@ -1164,6 +1164,11 @@ mod workload_guard_tests {
             "the guard must end the workload even on an early return"
         );
         assert!(fixture::workload_pid(&dir).is_none());
+        let stopped: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("workload.json")).unwrap()).unwrap();
+        assert!(stopped["pid"].is_null());
+        assert_eq!(stopped["release"], "r");
+        assert_eq!(stopped["version"], "1.0.0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

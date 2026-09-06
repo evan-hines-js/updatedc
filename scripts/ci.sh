@@ -322,12 +322,12 @@ run_charts() {
   helm template updatec-soak lab/chaos/infrastructure/soak -n updated-system \
     >"$soak_manifests"
   python3 - "$soak_manifests" crates/updated-tuf/src/repo.rs "$runtime_uid" \
-    crates/updatec-e2e/src/fixture.rs <<'PY'
+    crates/updatec-e2e/src/fixture.rs crates/updatec-e2e/src/soak/resources.rs <<'PY'
 import re, sys, yaml
 documents = [doc for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")) if doc]
 source = open(sys.argv[2], encoding="utf-8").read()
 runtime_uid = int(sys.argv[3])
-fixture_source = open(sys.argv[4], encoding="utf-8").read()
+fixture_source = "\n".join(open(path, encoding="utf-8").read() for path in sys.argv[4:])
 body = re.search(r"pub const KEY_FILE_NAMES: \[&str; \d+\] = \[(.*?)\];", source, re.S)
 assert body, "the canonical signing-key list is missing"
 signing_keys = set(re.findall(r'"([^"]+)"', body.group(1)))
