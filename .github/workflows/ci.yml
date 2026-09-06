@@ -287,7 +287,9 @@ jobs:
   updatec-fleet-e2e:
     name: updatec fleet E2E (lifecycle, rollback, HAProxy)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Cold native/image builds take roughly 18 minutes before the real fleet campaign.
+    # Each assertion retains its own deadline; allow the full campaign to finish here.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
