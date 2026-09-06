@@ -257,8 +257,14 @@ REPO_PID="$!"
   --cert "$CERTS/server.crt" --key "$CERTS/server.key" >>"$REPO_LOG" 2>&1 &
 OBJECT_PID="$!"
 # Model systemd's Restart=always policy around the directly supervised agent.
-( set +e; while true; do
-    UPDATED_STATE_DIR="$WORK/agent-state" "$BIN/updated-agent" --config "$CONFIG" >>"$STACK_LOG" 2>&1
+( set +e
+  # Stopping the simulated service manager also stops and reaps its agent. Keep the agent
+  # as a shell job so an EXIT trap covers termination even between spawn and wait.
+  trap 'exit 0' TERM INT
+  trap 'jobs -pr | xargs -r kill -TERM; wait' EXIT
+  while true; do
+    UPDATED_STATE_DIR="$WORK/agent-state" "$BIN/updated-agent" --config "$CONFIG" >>"$STACK_LOG" 2>&1 &
+    wait "$!"
     sleep 0.2
   done ) &
 STACK_PID="$!"
@@ -335,8 +341,16 @@ kill "$TRAFFIC_PID"; wait "$TRAFFIC_PID" 2>/dev/null || true; TRAFFIC_PID=""
 # The other half of the reconciler's process duty: with the master gone, `converge` STARTS HAProxy —
 # nothing else ever will. This is the first-deployment path again, run against an
 # already-upgraded node. The traffic probe is stopped first, so the deliberate outage is not counted
-# as a dropped request; while it lasts the agent simply reports the node unhealthy (it has no
-# workload process to react to, so no restart races this).
+# as a dropped request. Stop the agent before invoking lifecycle directly: its normal drift repair
+# would otherwise race these deliberate outages and start another master beside the test's hook.
+kill -TERM "$STACK_PID"
+for _ in {1..200}; do
+  kill -0 "$STACK_PID" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$STACK_PID" 2>/dev/null && fail "the agent supervisor did not stop before direct lifecycle checks"
+wait "$STACK_PID" 2>/dev/null || true
+STACK_PID=""
 release4="$(find "$INSTALL/versions" -maxdepth 1 -type d -name '4.0.0-*' -print -quit)"
 [[ -n "$release4" ]] || fail "could not locate the immutable HAProxy 4.0.0 release"
 kill "$master_pid"
