@@ -10,18 +10,16 @@ jobs:
       - shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $profileVars = @('USERPROFILE', 'APPDATA', 'HOMEDRIVE', 'HOMEPATH')
-          $programVars = @('ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432', 'ComSpec')
-          $identityVars = @('USERNAME', 'USERDOMAIN', 'COMPUTERNAME')
           $cases = @(
             @{Name='ambient'; Extra=@()},
+            @{Name='ambient-pinned-modules'; Extra=@()},
             @{Name='baseline'; Extra=@()},
-            @{Name='baseline-engine'; Extra=@()},
-            @{Name='profile'; Extra=$profileVars},
-            @{Name='profile-minimal'; Extra=@('USERPROFILE','APPDATA')},
-            @{Name='program'; Extra=$programVars},
-            @{Name='identity'; Extra=$identityVars},
-            @{Name='standard'; Extra=($profileVars + $programVars + $identityVars)}
+            @{Name='modulepath'; Extra=@()},
+            @{Name='path'; Extra=@()},
+            @{Name='pathext'; Extra=@('PATHEXT')},
+            @{Name='policy'; Extra=@()},
+            @{Name='policy-env'; Extra=@('PSExecutionPolicyPreference')},
+            @{Name='modulecache'; Extra=@('PSModuleAnalysisCachePath')}
           )
           foreach ($case in $cases) {
             $start = New-Object System.Diagnostics.ProcessStartInfo
@@ -30,7 +28,7 @@ jobs:
             $start.RedirectStandardInput = $true
             $start.RedirectStandardOutput = $true
             $start.RedirectStandardError = $true
-            if ($case.Name -ne 'ambient') {
+            if (-not $case.Name.StartsWith('ambient')) {
               $start.EnvironmentVariables.Clear()
               foreach ($name in (@('SystemRoot','WINDIR','TEMP','TMP','SystemDrive','LOCALAPPDATA') + $case.Extra)) {
                 $value = [Environment]::GetEnvironmentVariable($name)
@@ -39,10 +37,15 @@ jobs:
               $start.EnvironmentVariables['PATH'] = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
               $start.EnvironmentVariables['PSModulePath'] = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
             }
+            if ($case.Name -eq 'ambient-pinned-modules') {
+              $start.EnvironmentVariables['PSModulePath'] = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
+            }
+            if ($case.Name -eq 'modulepath') { $start.EnvironmentVariables['PSModulePath'] = $env:PSModulePath }
+            if ($case.Name -eq 'path') { $start.EnvironmentVariables['PATH'] = $env:PATH }
             $script = '$p=[IO.Path]::GetTempFileName(); Set-Content -NoNewline -Path $p -Value ready; Get-Content -Raw $p; Remove-Item $p'
-            if ($case.Name -eq 'baseline-engine') { $script = '[Console]::Write("ready")' }
             $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
             $start.Arguments = "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+            if ($case.Name -eq 'policy') { $start.Arguments = "-ExecutionPolicy Bypass " + $start.Arguments }
             $watch = [Diagnostics.Stopwatch]::StartNew()
             $process = [Diagnostics.Process]::Start($start)
             $process.StandardInput.Close()
