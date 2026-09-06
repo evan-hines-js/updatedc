@@ -783,24 +783,25 @@ fn run(context: &Context) -> io::Result<()> {
             receipt.exit_code = outcome.as_ref().ok().copied().flatten();
             receipt.message = match &outcome {
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                    "command deadline exceeded"
+                    "command deadline exceeded".into()
                 }
-                _ => "command failed",
-            }
-            .into();
+                Err(error) => format!("command failed: {error}"),
+                Ok(_) => "command failed".into(),
+            };
             write(&path, &receipt)?;
             if context.operation == Operation::Rollback {
                 attention(
                     context,
                     &path,
                     &definition,
-                    "recovery command failed; operator attention required",
+                    &format!("recovery {}; operator attention required", receipt.message),
                 )
             } else {
-                Err(io::Error::other(format!(
-                    "deployment {} (exit {:?})",
-                    receipt.message, receipt.exit_code
-                )))
+                let detail = match receipt.exit_code {
+                    Some(code) => format!("{} (exit {code})", receipt.message),
+                    None => receipt.message,
+                };
+                Err(io::Error::other(format!("deployment {detail}")))
             }
         }
     }

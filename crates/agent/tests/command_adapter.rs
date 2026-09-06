@@ -132,6 +132,28 @@ fn clean_install_replay_and_health_drift_use_actual_state() {
     );
 }
 #[test]
+fn launch_errors_survive_in_deployment_and_recovery_diagnostics() {
+    let f = Fixture::new(json!({"policy":"safe"}), recovery());
+    let missing = f.payload.join("missing-interpreter.exe");
+    let error = Command::new(&missing).status().unwrap_err().to_string();
+    let path = f.payload.join(updated::command_adapter::CONFIG);
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let missing_command = json!({"argv": [missing], "timeoutSeconds": 1});
+    config["deploy"] = missing_command.clone();
+    config["recovery"]["command"] = missing_command;
+    std::fs::write(path, config.to_string()).unwrap();
+
+    let output = f.command("converge", TOKEN).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&error));
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(f.receipt("converge")).unwrap()).unwrap();
+    assert!(receipt["message"].as_str().unwrap().contains(&error));
+    let (_, recovery) = f.call("rollback", &format!("{TOKEN}r"));
+    assert_eq!(recovery["status"], "needs-attention");
+    assert!(recovery["message"].as_str().unwrap().contains(&error));
+}
+#[test]
 fn changed_inputs_run_deploy_even_when_the_health_command_still_passes() {
     let f = Fixture::new(json!({"policy":"manual"}), recovery());
     assert_eq!(f.call("converge", TOKEN).1["status"], "succeeded");
