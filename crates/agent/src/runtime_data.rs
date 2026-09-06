@@ -697,12 +697,15 @@ input=$UPDATED_INPUT_DIR
 state=$UPDATED_STATE_DIR
 operation=$UPDATED_OPERATION
 [ "$(cat "$input/password")" = recovery-credential ]
+# The deadline can kill this hook during its copy. Publish only complete observations,
+# preserving the previous successful observation if a later health attempt is interrupted.
+cp "$input/password" "$state/$operation-observed.next"
+mv -f "$state/$operation-observed.next" "$state/$operation-observed"
 case "$operation" in
   rollback|converge)
-    cp "$input/password" "$state/$operation-observed"
     printf '%s' '{"api":1,"command":"succeed","changed":false}' | "$UPDATED_RECONCILER_HELPER" reconciler-helper
     ;;
-  healthcheck) cp "$input/password" "$state/healthcheck-observed"; test -f "$state/healthy" ;;
+  healthcheck) test -f "$state/healthy" ;;
 esac
 "#;
         let hook = source.join("hook");
@@ -824,6 +827,8 @@ esac
             .unwrap();
         store.write_journal(&tx).unwrap();
         let state_dir = opts.paths.reconciler_state_dir("app");
+        // Only a fresh recovery health invocation may satisfy the input-delivery assertion.
+        std::fs::remove_file(state_dir.join("healthcheck-observed")).unwrap();
         let error = crate::run(opts).await.unwrap_err();
         assert!(
             error

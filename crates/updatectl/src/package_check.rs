@@ -32,8 +32,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use updated_contracts::dataflow::FileSnapshot;
-#[cfg(all(test, unix))]
-use updated_contracts::reconciler::FLAGS;
 use updated_contracts::reconciler::{Arguments, Operation, Reason};
 
 use crate::Error;
@@ -48,9 +46,6 @@ const TRANSACTION_ATTEMPT: &str =
 /// convergence cannot accidentally act on the same payload.
 const CANDIDATE_VERSION: &str = "2.0.0";
 const PREDECESSOR_VERSION: &str = "1.0.0";
-
-#[cfg(test)]
-const FIXTURE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the wait loop looks for the hook's exit — the agent's own polling cadence.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -607,11 +602,6 @@ pub(crate) fn check_package(
         ],
     )
 }
-#[cfg(test)]
-fn reconciler_check(args: CheckSetup) -> Result<(), Error> {
-    run_check(args, false, [FIXTURE_TIMEOUT; 2])
-}
-
 fn run_check(args: CheckSetup, manual_recovery: bool, budgets: [Duration; 2]) -> Result<(), Error> {
     let hook = std::fs::canonicalize(&args.hook)
         .map_err(|error| format!("{}: {error}", args.hook.display()))?;
@@ -958,6 +948,13 @@ fn run_check(args: CheckSetup, manual_recovery: bool, budgets: [Duration; 2]) ->
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use updated_contracts::reconciler::FLAGS;
+
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn reconciler_check(args: CheckSetup) -> Result<(), Error> {
+        run_check(args, false, [FIXTURE_TIMEOUT; 2])
+    }
 
     /// The body of a reconciler that answers the whole protocol correctly: it parses the published
     /// grammar, refuses an unknown operation and an unimplemented protocol, keys its work to the
