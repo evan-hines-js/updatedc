@@ -23,6 +23,13 @@ pub(crate) struct ProcedureArgs {
     /// Interpreter executable, such as python3 or pwsh. Omit for a native executable or shebang script.
     #[arg(long, requires = "entrypoint")]
     interpreter: Option<String>,
+    /// Literal interpreter option placed before the script path (repeatable).
+    #[arg(
+        long = "interpreter-arg",
+        requires = "interpreter",
+        allow_hyphen_values = true
+    )]
+    interpreter_arguments: Vec<String>,
     /// Literal argument for the entrypoint (repeatable). Assigned secrets belong in input files.
     #[arg(long = "arg", requires = "entrypoint", allow_hyphen_values = true)]
     arguments: Vec<String>,
@@ -98,6 +105,7 @@ pub(crate) fn prepare(source: &Path, procedure: &ProcedureArgs) -> Result<Prepar
             let mut argv = Vec::new();
             if let Some(interpreter) = &procedure.interpreter {
                 argv.push(interpreter.clone());
+                argv.extend_from_slice(&procedure.interpreter_arguments);
             }
             argv.push(format!("./{path}"));
             argv.extend_from_slice(arguments);
@@ -203,6 +211,67 @@ mod tests {
         );
         assert_eq!(config["replay"]["policy"], "manual");
         assert_eq!(package.info.timeout_millis, 305_000);
+    }
+    #[test]
+    fn interpreter_options_precede_every_script_and_preserve_literal_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.py"), b"print('hello')").unwrap();
+        let Command::Check(args) = Cli::try_parse_from([
+            "updatectl",
+            "check",
+            ".",
+            "--entrypoint",
+            "run.py",
+            "--interpreter",
+            "python3",
+            "--interpreter-arg=-I",
+            "--interpreter-arg=-W",
+            "--interpreter-arg=error::ResourceWarning",
+            "--arg=literal space; $(text)",
+            "--healthcheck",
+            "run.py",
+            "--inspect",
+            "run.py",
+            "--replay-check",
+            "run.py",
+            "--recover",
+            "run.py",
+            "--recovery-check",
+            "run.py",
+        ])
+        .unwrap()
+        .command
+        else {
+            unreachable!()
+        };
+        let package = prepare(root.path(), &args.procedure).unwrap();
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(package.source.join(updated::command_adapter::CONFIG)).unwrap(),
+        )
+        .unwrap();
+        let expected =
+            serde_json::json!(["python3", "-I", "-W", "error::ResourceWarning", "./run.py"]);
+        for command in [
+            &config["health"],
+            &config["inspect"],
+            &config["replay"]["command"],
+            &config["recovery"]["command"],
+            &config["recovery"]["replay"]["command"],
+        ] {
+            assert_eq!(command["argv"], expected);
+        }
+        let mut deploy = expected.as_array().unwrap().clone();
+        deploy.push("literal space; $(text)".into());
+        assert_eq!(config["deploy"]["argv"], serde_json::json!(deploy));
+        assert!(Cli::try_parse_from([
+            "updatectl",
+            "check",
+            ".",
+            "--entrypoint",
+            "run.py",
+            "--interpreter-arg=-I"
+        ])
+        .is_err());
     }
     #[test]
     fn invalid_entrypoints_and_conflicting_configurations_fail_before_publication() {

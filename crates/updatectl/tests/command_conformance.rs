@@ -6,9 +6,7 @@ fn customer_payload_fixtures_run_through_the_real_conformance_harness() {
     let (name, interpreter, script) = if cfg!(windows) {
         (
             "run.ps1",
-            // Use the runner's current PowerShell runtime. Legacy Windows PowerShell startup
-            // can exceed the agent's entire health budget before this script gets control.
-            "pwsh",
+            "powershell",
             r#"$ErrorActionPreference = 'Stop'
 $actual = Join-Path $env:UPDATED_STATE_DIR 'actual'
 switch ($env:UPDATED_OPERATION) {
@@ -39,8 +37,18 @@ esac
         std::fs::write(payload.join("expected"), expected).unwrap();
         std::fs::write(payload.join(name), script).unwrap();
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_updatectl"))
-        .arg("check")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_updatectl"));
+    command.arg("check");
+    if cfg!(windows) {
+        // Interpreter options must precede the script. Profiles and interactive startup do
+        // not belong in a service invocation, and must not consume its health-check budget.
+        for argument in ["-NoLogo", "-NoProfile", "-NonInteractive", "-File"] {
+            command.arg(format!("--interpreter-arg={argument}"));
+        }
+    } else {
+        command.arg("--interpreter-arg=-eu");
+    }
+    let output = command
         .arg(root.path().join("candidate"))
         .arg("--against")
         .arg(root.path().join("predecessor"))

@@ -15,8 +15,12 @@ This publishes a package and prints its immutable reference. Operators select th
 [CI publication workflow](ci-publication.md).
 
 For an interpreted program, add `--interpreter python3` or `--interpreter pwsh` and name the
-appropriate package file as the entrypoint. Interpreters must exist on the target machine.
-Use repeated `--arg=value` options for literal arguments. No reconciler operation or protocol
+appropriate package file as the entrypoint. Interpreters must exist on the target machine; use
+an absolute path for installations outside the runtime's minimal system search path.
+Use repeated `--interpreter-arg=value` options before the script path and `--arg=value` options
+after it. For example, Windows PowerShell can run with `--interpreter powershell
+--interpreter-arg=-NoProfile --interpreter-arg=-NonInteractive --interpreter-arg=-File`.
+Arguments are passed literally, without shell parsing. No reconciler operation or protocol
 flags are appended to your command. Native executables work directly on their target OS. On Unix, scripts run directly when executable
 with a shebang; otherwise specify an interpreter such as `--interpreter sh`.
 
