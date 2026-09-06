@@ -151,8 +151,8 @@ fn scenarios() -> Vec<Scenario> {
         rollback_chaos_recovery,
     ));
     s.push((
-        "a reboot mid-rollback holds when restored predecessor health is lost",
-        a_reboot_mid_rollback_holds_when_predecessor_health_is_lost,
+        "a reboot mid-rollback bounds lost predecessor health without repeating deployment",
+        a_reboot_mid_rollback_bounds_lost_predecessor_health,
     ));
     s
 }

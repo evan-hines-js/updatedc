@@ -780,13 +780,13 @@ pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
 
 /// A machine reboot in the middle of a rollback, which is a different fault from an agent kill: the
 /// hook-managed workload dies with the machine, so the restored predecessor is NOT already running
-/// when the next boot's health gate observes it. Only the predecessor's own `converge` can put it
-/// back, and the resume gate must therefore owe that operation until rollback actually completes —
-/// not merely until it has run once.
+/// when the next boot's health gate observes it. Completed compensation cannot be undone by a
+/// health failure: the bounded gate settles on the exact predecessor and reports it unhealthy,
+/// without implicitly running its deployment command or inventing a permanent attention hold.
 ///
 /// The rest of the suite structurally cannot see this: the fixture's workload is designed to
 /// survive an agent crash, so every other rollback case finds the predecessor already serving.
-pub(crate) fn a_reboot_mid_rollback_holds_when_predecessor_health_is_lost(ctx: &Ctx) -> R {
+pub(crate) fn a_reboot_mid_rollback_bounds_lost_predecessor_health(ctx: &Ctx) -> R {
     let srv = "127.0.0.1:23410";
     let svc = "127.0.0.1:23460";
     let dir = ctx.work.join("rollback-reboot");
@@ -803,8 +803,7 @@ pub(crate) fn a_reboot_mid_rollback_holds_when_predecessor_health_is_lost(ctx: &
         .hold_unconfirmed()
         .faulty_upgrade(svc, "degrade-after-ready")
         .command()?;
-    // Crash the agent immediately after predecessor `converge` — the point at which a resume boot
-    // has already run that convergence once.
+    // Crash after predecessor output evidence is restored, before its bounded health gate.
     cmd.env(updated::env::CHAOS_POINT, "predecessor-converge-finished");
     let node = Service::spawn("rollback-reboot", &cmd);
     let abandon = |node: Service, server: Proc, message: String| -> R {
@@ -839,7 +838,7 @@ pub(crate) fn a_reboot_mid_rollback_holds_when_predecessor_health_is_lost(ctx: &
             "the rollback never reached predecessor converge".into(),
         );
     }
-    // The reboot: the workload predecessor `converge` had just started dies too. From the next
+    // The reboot: the workload candidate compensation had just restored dies too. From the next
     // boot's point of view the machine is unconverged, exactly as it would be after a power cycle.
     match fixture::workload_pid(&dir) {
         Some(pid) => kill_pid(pid),
@@ -852,13 +851,21 @@ pub(crate) fn a_reboot_mid_rollback_holds_when_predecessor_health_is_lost(ctx: &
         }
     }
 
-    let held = wait_until(RECOVERY_TIMEOUT, || {
-        updated::command_adapter::read_attention(&node_paths(&dir).install_root)
-            .ok()
-            .flatten()
-            .is_some()
+    let reported_unhealthy = node.wait_for_log(
+        "settling on that exact previously confirmed release and reporting it unhealthy",
+        RECOVERY_TIMEOUT,
+    );
+    let paths = node_paths(&dir);
+    let settled = wait_until(RECOVERY_TIMEOUT, || {
+        matches!(
+            updated::state::read_installed(&paths.installed),
+            updated::state::Installed::Present(ref state)
+                if state.release.version == "1.0.0" && state.rollback_guard.is_none()
+        ) && !paths.journal.exists()
     });
-    let preserved = node_paths(&dir).journal.exists();
+    let held = updated::command_adapter::read_attention(&paths.install_root)
+        .map_err(str_err)?
+        .is_some();
     let attempts = fixture::attempts(&fixture::root(&dir));
     let repeated_deploy = attempts
         .iter()
@@ -866,9 +873,9 @@ pub(crate) fn a_reboot_mid_rollback_holds_when_predecessor_health_is_lost(ctx: &
     let log = node.captured_log();
     drop(node);
     drop(server);
-    if !held || !preserved || repeated_deploy {
-        return fail(format!("lost recovery health must preserve the journal and require attention (held={held}, preserved={preserved}, repeated_deploy={repeated_deploy}):\n{log}"));
+    if !reported_unhealthy || !settled || held || repeated_deploy {
+        return fail(format!("lost recovery health must settle on the predecessor and report it unhealthy (reported_unhealthy={reported_unhealthy}, settled={settled}, held={held}, repeated_deploy={repeated_deploy}):\n{log}"));
     }
-    ok("lost predecessor health held recovery without implicitly running its deployment");
+    ok("lost predecessor health reached bounded unhealthy settlement without repeating deployment");
     Ok(())
 }

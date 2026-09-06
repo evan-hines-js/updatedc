@@ -134,12 +134,17 @@ mod tests {
                     execution.definition_sha256,
                     updated_contracts::digest::sha256_bytes(valid.as_bytes())
                 );
-                foundation::durable::atomic_write_managed(
-                    &store.location(&id).join(crate::command_adapter::CONFIG),
-                    ".tamper-",
-                    b"local corruption",
-                )
-                .unwrap();
+                let config = store.location(&id).join(crate::command_adapter::CONFIG);
+                // Model deliberate local corruption, bypassing the installed file's write
+                // protection. Windows refuses atomic replacement of a read-only destination.
+                #[cfg(windows)]
+                {
+                    let mut permissions = std::fs::metadata(&config).unwrap().permissions();
+                    permissions.set_readonly(false);
+                    std::fs::set_permissions(&config, permissions).unwrap();
+                }
+                foundation::durable::atomic_write_managed(&config, ".tamper-", b"local corruption")
+                    .unwrap();
                 assert!(matches!(
                     store.execution(&id),
                     Err(InstallError::Storage(_))
