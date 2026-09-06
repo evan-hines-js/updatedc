@@ -225,11 +225,10 @@ pub(crate) fn complete_candidate_compensation(
     Ok(result.host_action())
 }
 
-/// Verify the restored predecessor and replay its output evidence during rollback recovery.
+/// Replay the restored predecessor's output evidence during rollback recovery.
 ///
-/// The compensating attempt tells the native runtime to check actual predecessor health without
-/// rerunning its deployment command. The candidate's explicit recovery procedure owns restoration;
-/// lost health after a machine reboot requires attention rather than an implicit migration replay.
+/// The candidate's explicit recovery procedure owns restoration. The compensating attempt restores
+/// output evidence without rerunning deployment; the following bounded boot gate owns readiness.
 pub(crate) fn complete_recovery_activation(
     opts: &Options,
     store: &mut Store,
@@ -241,7 +240,7 @@ pub(crate) fn complete_recovery_activation(
     if !tx.recovery_pending(TransactionPhase::RolledBack) {
         return Ok(updated_contracts::reconciler::HostAction::None);
     }
-    // The native runtime interprets this compensating converge as predecessor verification.
+    // The native runtime restores evidence here; it never repeats the predecessor's deployment.
     let result = run_reconciler_mutation(
         tx.previous_reconciler.as_ref(),
         opts,

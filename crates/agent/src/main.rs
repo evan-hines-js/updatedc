@@ -502,9 +502,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         )
     })
     .await?;
-    // Restore the predecessor's machine state (rollback recovery): the predecessor's own `converge`,
-    // replayed under the transaction's identity — `complete_recovery_activation` resolves whether
-    // this boot still owes it.
+    // Restore predecessor output evidence after the candidate's explicit compensation. The
+    // predecessor's deployment command is never repeated; the boot gate below decides readiness.
     let recovery_action =
         recover_through_transients("predecessor activation recovery", &shutdown, || {
             complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut())

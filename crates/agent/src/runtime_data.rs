@@ -826,7 +826,9 @@ esac
         let state_dir = opts.paths.reconciler_state_dir("app");
         let error = crate::run(opts).await.unwrap_err();
         assert!(
-            error.to_string().contains("operator attention required"),
+            error
+                .to_string()
+                .contains("the rollback target failed its health gate"),
             "{error}"
         );
         for operation in ["rollback", "healthcheck"] {
@@ -837,6 +839,6 @@ esac
         }
         assert!(updated::command_adapter::read_attention(directory.path())
             .unwrap()
-            .is_some());
+            .is_none());
     }
 }

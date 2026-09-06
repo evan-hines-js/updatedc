@@ -593,28 +593,21 @@ fn run(context: &Context) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     let path = receipt_path(&context.state_dir, &id, context.operation);
-
-    // Recovery commands must restore the preceding application themselves. Do not implicitly
-    // execute an old deployment procedure: it may repeat an irreversible migration.
-    if context.operation == Operation::Converge && attempt::is_compensation(&context.attempt_id) {
-        return if observe(context, &config, &definition, &id)? {
-            replay_completion(context, read::<Receipt>(&path)?.as_ref())
-        } else {
-            attention(
-                context,
-                &path,
-                &definition,
-                "recovery did not restore predecessor health; deployment was not repeated",
-            )
-        };
-    }
-
     let prior: Option<Receipt> = read(&path)?;
     if prior.as_ref().is_some_and(|r| r.definition != definition) {
         return Err(invalid(
             "deployment receipt does not match its immutable definition",
         ));
     }
+
+    // The candidate's explicit recovery command owns restoration. Replay the predecessor's
+    // output evidence without repeating an old deployment procedure. Readiness belongs to the
+    // platform's bounded health gate: a one-shot probe here can catch a service still starting
+    // and strand an otherwise successful rollback behind a permanent attention hold.
+    if context.operation == Operation::Converge && attempt::is_compensation(&context.attempt_id) {
+        return replay_completion(context, prior.as_ref());
+    }
+
     let inputs_sha256 = inputs_digest(context)?;
     let inputs_changed = prior
         .as_ref()

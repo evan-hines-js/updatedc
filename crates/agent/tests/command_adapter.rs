@@ -213,7 +213,13 @@ fn explicit_recovery_runs_once_and_predecessor_deploy_is_never_implicit() {
     }
     assert_eq!(count(&f.state.join("recovery-count")), 1);
     let (_, result) = f.call("converge", &rollback);
-    assert_eq!(result["status"], "needs-attention"); // fixture health expects v4, recovery restores v3
+    assert_eq!(result["status"], "succeeded");
+    // Restoring execution evidence is separate from readiness. The platform's bounded health
+    // gate observes the unhealthy predecessor; no one-shot probe may create a permanent hold.
+    assert!(!f.call("healthcheck", &rollback).0); // health expects v4, recovery restores v3
+    assert!(updated::command_adapter::read_attention(f.root.path())
+        .unwrap()
+        .is_none());
     assert_eq!(count(&f.state.join("deploy-count")), 1);
 }
 #[test]

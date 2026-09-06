@@ -391,8 +391,8 @@ pub fn run() -> R {
         Some(address) if operation == Operation::Converge => {
             converge(&root, &payload, &payload_version, address, &mode)
         }
-        // Rollback compensates payload-owned durable effects above. The predecessor's own
-        // converge invocation is responsible for selecting and starting its workload.
+        // Rollback restores the saved workload itself. The platform then health-gates the
+        // predecessor without running its deployment command again.
         Some(address) if operation == Operation::Rollback => {
             let previous: Option<WorkloadRecord> =
                 serde_json::from_slice(&std::fs::read(&backup).map_err(str_err)?)
