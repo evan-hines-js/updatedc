@@ -671,6 +671,7 @@ fn probe(address: &str) -> R {
 /// process exits between the check and the signal) is inherent to pid-addressed signalling and is
 /// microseconds wide, where an unguarded signal was seconds wide and aimed at a number a sibling
 /// scenario may already own.
+#[cfg(unix)]
 fn stop_pid(pid: u32) {
     if !pid_alive(pid) {
         return;
@@ -682,32 +683,43 @@ fn stop_pid(pid: u32) {
     }
 }
 
-/// Ask `pid` to stop, forcefully when `hard`. The two platforms are structurally parallel: a
-/// graceful request first, an unconditional kill on escalation.
+// These Windows workloads deliberately have no console, so there is no graceful console event
+// to deliver. Pin the process by handle and terminate it directly: spawning taskkill twice plus
+// the grace wait could exceed the fixture's five-second recovery-command deadline.
+#[cfg(windows)]
+fn stop_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    // SAFETY: the non-inheritable handle is checked before use and closed exactly once. Waiting
+    // and termination address this process object even if its numeric PID is subsequently reused.
+    unsafe {
+        let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+        if process.is_null() {
+            return;
+        }
+        if TerminateProcess(process, 1) != 0 {
+            WaitForSingleObject(process, 2_000);
+        }
+        CloseHandle(process);
+    }
+}
+
+/// Ask a Unix workload to stop, forcefully when `hard`.
+#[cfg(unix)]
 fn signal(pid: u32, hard: bool) {
-    #[cfg(unix)]
     unsafe {
         libc::kill(
             pid as libc::pid_t,
             if hard { libc::SIGKILL } else { libc::SIGTERM },
         );
     }
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("taskkill");
-        if hard {
-            command.arg("/F");
-        }
-        let _ = command
-            .args(["/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
 }
 
 /// Wait up to two seconds for `pid` to be gone; `true` once it is. The replacement binds the same
 /// address, so this is a precondition of starting the new workload, not politeness.
+#[cfg(unix)]
 fn wait_for_exit(pid: u32) -> bool {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -900,6 +912,42 @@ mod tests {
     fn a_rollback_failure_is_unconditional() {
         let mode = Mode::parse("fail=converge,fail=rollback").unwrap();
         assert!(mode.fails(Operation::Rollback, "1.0.0"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process for detached_workload_stop_is_repeatable"]
+    fn detached_workload_stop_worker() {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_workload_stop_is_repeatable() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "fixture::tests::detached_workload_stop_worker",
+                "--ignored",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach(&mut command);
+        let mut child = command.spawn().unwrap();
+        stop_pid(child.id());
+        let stopped = child.try_wait().unwrap().is_some();
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            stopped,
+            "stopping a detached workload must observe its exit"
+        );
+        // Child retains the process handle, so the PID cannot be recycled during this assertion.
+        stop_pid(child.id());
     }
 
     #[test]

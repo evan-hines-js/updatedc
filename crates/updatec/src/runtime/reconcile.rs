@@ -301,10 +301,13 @@ fn private_object_retirement_cutoff(
     let grace =
         chrono::Duration::from_std(updated_contracts::dataflow::PRIVATE_OBJECT_RETIREMENT_GRACE)
             .map_err(|_| {
-                StorageError("private-object retirement grace is not representable".into())
+                StorageError::Operation(
+                    "private-object retirement grace is not representable".into(),
+                )
             })?;
-    now.checked_sub_signed(grace)
-        .ok_or_else(|| StorageError("private-object retirement cutoff is not representable".into()))
+    now.checked_sub_signed(grace).ok_or_else(|| {
+        StorageError::Operation("private-object retirement cutoff is not representable".into())
+    })
 }
 
 /// The irreversible half of a planned generation.
@@ -429,7 +432,7 @@ impl PublicationTransaction<'_> {
                 if !holds_publisher_lease(client, namespace, &repository.name_any(), identity)
                     .await?
                 {
-                    return Err(Box::new(StorageError(
+                    return Err(Box::new(StorageError::Operation(
                         "publisher lease lost during reconcile; skipping publish to avoid a split-brain write"
                             .into(),
                     )));
@@ -438,7 +441,7 @@ impl PublicationTransaction<'_> {
                 let marker = publication_marker(state_dir, desired_digest)
                     .await?
                     .ok_or_else(|| {
-                        StorageError(
+                        StorageError::Operation(
                             "signed repository has no root/timestamp generation after signing"
                                 .into(),
                         )
@@ -451,7 +454,7 @@ impl PublicationTransaction<'_> {
                     state: StoredDurableRolloutState::from(planned),
                 })?;
                 if pending_bytes.len() > PENDING_STATE_MAX_BYTES {
-                    return Err(Box::new(StorageError(format!(
+                    return Err(Box::new(StorageError::Operation(format!(
                         "pending publication state is {} bytes, over the {} byte durable-state limit",
                         pending_bytes.len(),
                         PENDING_STATE_MAX_BYTES
@@ -853,7 +856,7 @@ pub async fn reconcile_once(
             .await?
             .is_some()
     {
-        return Err(Box::new(StorageError(format!(
+        return Err(Box::new(StorageError::Operation(format!(
             "the durable admitted-state index {admitted_name} has no active state while a published \
              generation exists; refusing to re-admit every group ungated (restore it, or delete \
              the published generation to start over)"
@@ -887,7 +890,9 @@ pub async fn reconcile_once(
         let retention =
             chrono::Duration::from_std(updated_contracts::telemetry::FLEET_GENERATION_RETENTION)
                 .map_err(|_| {
-                    StorageError("fleet-generation retention is not representable".into())
+                    StorageError::Operation(
+                        "fleet-generation retention is not representable".into(),
+                    )
                 })?;
         let cutoff = chrono::Utc::now() - retention;
         if let Err(error) = crate::dataflow::sweep_report_projections_before(
@@ -994,35 +999,43 @@ pub async fn reconcile_once(
             resolved_nodes.iter().map(|node| node.name.clone()),
         )
         .await?;
+    let desired = crate::domain::DesiredState {
+        repository: &repository.spec,
+        groups: &groups,
+        group_labels: &group_labels,
+        sets: &set_resources.items,
+        nodes: &resolved_nodes,
+        quarantined: &quarantined_groups,
+        held: &held_groups,
+        holds: &holds,
+        cordons: &cordons,
+        blocked_deployments: &blocked_deployments,
+    };
+    let observed = crate::domain::ObservedState {
+        reports: &reports,
+        outputs: &outputs,
+        dataflow_key: &dataflow_key,
+        public_keys: &public_keys,
+        admitted: &durable.admitted,
+        vetoed: &durable.vetoed,
+        routing: &durable.routing,
+        assignments: &durable.assignments,
+        now: reconcile_now,
+    };
     let outcome = crate::domain::plan_reconcile(
-        crate::domain::DesiredState {
-            repository: &repository.spec,
-            groups: &groups,
-            group_labels: &group_labels,
-            sets: &set_resources.items,
-            nodes: &resolved_nodes,
-            quarantined: &quarantined_groups,
-            held: &held_groups,
-            holds: &holds,
-            cordons: &cordons,
-            blocked_deployments: &blocked_deployments,
-        },
-        crate::domain::ObservedState {
-            reports: &reports,
-            outputs: &outputs,
-            dataflow_key: &dataflow_key,
-            public_keys: &public_keys,
-            admitted: &durable.admitted,
-            vetoed: &durable.vetoed,
-            routing: &durable.routing,
-            assignments: &durable.assignments,
-            now: reconcile_now,
-        },
+        desired,
+        observed,
         &mut hooks.observation_log,
         &mut hooks.verified_reports,
     )?;
+    let preflight =
+        crate::preflight::routes(&desired, &observed, &outcome, &mut hooks.verified_reports)?;
+    crate::preflight::packages(&preflight, &state_dir.join("release-preflight"), &admission)
+        .await?;
     let crate::domain::ReconcilePlan {
         publication: plan,
+        desired_deployments: _,
+        blocked: _,
         input_snapshots,
         admitted: planned_admitted,
         vetoed: planned_vetoed,
@@ -1970,7 +1983,7 @@ pub(crate) mod wiring_tests {
             deployment,
             identity,
             "1.0.0",
-            "1".repeat(64),
+            updated_contracts::digest::sha256_bytes(b"fixture-payload"),
             "1".repeat(64),
             true,
         )
@@ -2040,7 +2053,180 @@ pub(crate) mod wiring_tests {
             .insert("tuf-signing-keys".into(), signing_secret(tmp).await);
         cluster.secrets.insert("s3-creds".into(), s3_credentials());
         mutate(&mut cluster);
+        // Preflight consumes real signed release metadata, even in the in-process controller test.
+        let release_dir = tmp.join("fixture-releases");
+        let keys = updated_tuf::repo::generate_keys(&tmp.join("fixture-release-keys"))
+            .await
+            .unwrap();
+        updated_tuf::repo::init(&release_dir, &keys, 365)
+            .await
+            .unwrap();
+        let payload = tmp.join("fixture-payload");
+        std::fs::write(&payload, b"fixture-payload").unwrap();
+        let product = crate::tests::managed_runtime().product;
+        let target = updated_tuf::repo::PublishTarget::application(
+            &product,
+            "stable",
+            "1.0.0",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            "app",
+            payload,
+        );
+        updated_tuf::repo::add_release(&release_dir, &keys, vec![target], 365)
+            .await
+            .unwrap();
+        let source = updated_tuf::testing::offline_source(&release_dir);
+        let root_json = std::fs::read_to_string(&source.root).unwrap();
+        let package = updated_contracts::artifact::TargetReference {
+            path: format!(
+                "products/{product}/stable/1.0.0/{}-{}/app",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+            sha256: updated_contracts::digest::sha256_bytes(b"fixture-payload"),
+        };
+        for deployment in cluster
+            .groups
+            .iter_mut()
+            .map(|group| &mut group.spec.deployment)
+            .chain(
+                cluster
+                    .repository
+                    .iter_mut()
+                    .map(|repository| &mut repository.spec.default_deployment),
+            )
+        {
+            deployment.application =
+                updated_contracts::releases::testing::install("1.0.0", package.clone());
+            deployment.release_repository = crate::ReleaseRepositorySpec {
+                metadata_url: source.metadata_url.clone(),
+                targets_url: source.targets_url.clone(),
+                root_json: root_json.clone(),
+            };
+        }
         Arc::new(StdMutex::new(cluster))
+    }
+
+    #[tokio::test]
+    async fn a_stranded_node_blocks_the_whole_rollout_but_health_projection_keeps_updating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            enroll_test_agent(&mut cluster.agents[0]);
+            let mut second = agent("n2", crate::AgentIdentityKind::Reserved, false);
+            enroll_test_agent(&mut second);
+            cluster.agents.push(second);
+        })
+        .await;
+        let state = tmp.path().join("state");
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+        reconcile_pass(client.clone(), &state, &mut hooks)
+            .await
+            .unwrap();
+        let timestamp_key = format!("{TEST_MANAGED_PREFIX}/metadata/timestamp.json");
+        let projection_key = crate::object_key(
+            TEST_MANAGED_PREFIX,
+            updated_contracts::telemetry::FLEET_INDEX_OBJECT_KEY,
+        )
+        .to_string();
+        let before_timestamp = objects.lock().unwrap()[&timestamp_key].clone();
+        let before_projection = objects.lock().unwrap()[&projection_key].clone();
+        let identity = crate::deployment_identity(
+            &crate::DesiredDeployment::try_from(
+                cluster.lock().unwrap().groups[0].spec.deployment.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        publish_report(&objects, "n1", "edge-v1", &identity, |_| {});
+        publish_report(&objects, "n2", "edge-v1", &identity, |report| {
+            report.version = "2.0.0".into();
+            report.archive_sha256 = "2".repeat(64);
+        });
+        {
+            let mut cluster = cluster.lock().unwrap();
+            let graph = &mut cluster.groups[0].spec.deployment.application;
+            for (version, from) in [
+                ("2.0.0", vec![]),
+                ("3.0.0", vec!["1.0.0"]),
+                ("4.0.0", vec!["2.0.0"]),
+                ("6.0.0", vec!["3.0.0"]),
+            ] {
+                graph.releases.insert(
+                    version.into(),
+                    updated_contracts::releases::Release {
+                        package: updated_contracts::artifact::TargetReference {
+                            path: format!("app/{version}"),
+                            sha256: version[..1].repeat(64),
+                        },
+                        installable: false,
+                        rollback_from: Default::default(),
+                        upgrade_from: from.into_iter().map(str::to_string).collect(),
+                    },
+                );
+            }
+            graph.target = "6.0.0".into();
+        }
+        let error = reconcile_pass(client, &state, &mut hooks)
+            .await
+            .unwrap_err();
+        let status = super::super::generic_failure_status(error.as_ref());
+        assert!(
+            status.contains("n2") && status.contains("2.0.0") && status.contains("6.0.0"),
+            "{status}"
+        );
+        let after = objects.lock().unwrap();
+        assert_eq!(
+            after[&timestamp_key], before_timestamp,
+            "no node gets the new assignment"
+        );
+        assert_ne!(
+            after[&projection_key], before_projection,
+            "healthproxy still receives fresh signed reports while rollout is blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_only_rollout_still_preflights_target_availability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            enroll_test_agent(&mut cluster.agents[0]);
+        })
+        .await;
+        let state = tmp.path().join("state");
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+        reconcile_pass(client.clone(), &state, &mut hooks)
+            .await
+            .unwrap();
+        let identity = crate::deployment_identity(
+            &crate::DesiredDeployment::try_from(
+                cluster.lock().unwrap().groups[0].spec.deployment.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        publish_report(&objects, "n1", "edge-v1", &identity, |_| {});
+        cluster.lock().unwrap().groups[0].spec.deployment.name = "changed-config".into();
+        let timestamp_key = format!("{TEST_MANAGED_PREFIX}/metadata/timestamp.json");
+        let before = objects.lock().unwrap()[&timestamp_key].clone();
+        let targets = tmp.path().join("fixture-releases/targets");
+        let offline = tmp.path().join("offline-targets");
+        std::fs::rename(&targets, &offline).unwrap();
+        reconcile_pass(client.clone(), &state, &mut hooks)
+            .await
+            .expect_err("an installed target still needs to be available for a new assignment");
+        assert_eq!(objects.lock().unwrap()[&timestamp_key], before);
+        std::fs::rename(&offline, &targets).unwrap();
+        reconcile_pass(client, &state, &mut hooks)
+            .await
+            .expect("restoring the object unblocks the same configuration change");
+        assert_ne!(objects.lock().unwrap()[&timestamp_key], before);
     }
 
     #[tokio::test]
@@ -2302,7 +2488,10 @@ pub(crate) mod wiring_tests {
         // observes an enrolled node settled on it. Both are genuine changes and both must be
         // written. Seed the authentic report only after its assignment exists, as a real node does.
         let edge = crate::deployment_identity(
-            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
+            &crate::DesiredDeployment::try_from(
+                cluster.lock().unwrap().groups[0].spec.deployment.clone(),
+            )
+            .unwrap(),
         )
         .unwrap();
         for pass in 1..=2 {
@@ -2526,7 +2715,10 @@ pub(crate) mod wiring_tests {
         // executing what it had before. This is the whole evidence — no sequence to catch, and
         // nothing the control plane has to have been watching for.
         let v1 = crate::deployment_identity(
-            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
+            &crate::DesiredDeployment::try_from(
+                cluster.lock().unwrap().groups[0].spec.deployment.clone(),
+            )
+            .unwrap(),
         )
         .unwrap();
         publish_report(&objects, "n1", "edge-v1", &v1, |report| {
@@ -2642,7 +2834,18 @@ pub(crate) mod wiring_tests {
         .expect("the first pass publishes the default deployment to the unmatched machine");
 
         let default = crate::deployment_identity(
-            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("default")).unwrap(),
+            &crate::DesiredDeployment::try_from(
+                cluster
+                    .lock()
+                    .unwrap()
+                    .repository
+                    .as_ref()
+                    .unwrap()
+                    .spec
+                    .default_deployment
+                    .clone(),
+            )
+            .unwrap(),
         )
         .unwrap();
         publish_report(&objects, "n1", "default", &default, |report| {

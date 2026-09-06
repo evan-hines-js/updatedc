@@ -1693,7 +1693,7 @@ pub(crate) mod lease_tests {
         );
         let error = enrollment_anchor(3, None).unwrap_err();
         assert!(
-            error.0.contains("routingRootSha256"),
+            error.to_string().contains("routingRootSha256"),
             "the operator must be told exactly what is missing: {error}"
         );
     }

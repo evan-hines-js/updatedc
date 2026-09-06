@@ -162,16 +162,12 @@ pub(crate) struct HaproxyRelease {
 /// process and the agent starts none of its own. The two releases differ only in the version their
 /// config reports, so applying 2.0.0 is a pure SIGUSR2 config re-exec of the same master.
 pub(crate) fn publish_haproxy_bundles(
-    seed_deployment: &serde_json::Value,
     platform: &str,
 ) -> Result<HaproxyRelease, Box<dyn std::error::Error>> {
-    // 2. The two app releases, published to a throwaway seed group (unmatched selector, so no node
-    //    adopts it) purely to read back each content-addressed path+sha. `updatectl deploy`
-    //    publishes AND patches, so a seed group is how we publish without assigning a live cohort —
-    //    the same pattern the sample-app baseline uses.
+    // Publish both versions without assigning either one to a group.
     let servers = backend_servers();
-    let (v1_path, v1_sha) = publish_haproxy_app(seed_deployment, platform, HAPROXY_V1, &servers)?;
-    let (v2_path, v2_sha) = publish_haproxy_app(seed_deployment, platform, HAPROXY_V2, &servers)?;
+    let (v1_path, v1_sha) = publish_haproxy_app(platform, HAPROXY_V1, &servers)?;
+    let (v2_path, v2_sha) = publish_haproxy_app(platform, HAPROXY_V2, &servers)?;
     Ok(HaproxyRelease {
         v1_path,
         v1_sha,
@@ -182,7 +178,6 @@ pub(crate) fn publish_haproxy_bundles(
 
 /// Publish one version-stamped HAProxy app bundle and return its `(path, sha256)`.
 fn publish_haproxy_app(
-    seed_deployment: &serde_json::Value,
     platform: &str,
     version: &str,
     servers: &[BackendServer],
@@ -190,18 +185,6 @@ fn publish_haproxy_app(
     let repository = release_repository_flags();
     let timeout = HAPROXY_PROVIDER_TIMEOUT_MS.div_ceil(1000);
     let cfg = haproxy_cfg(version, servers);
-    let seed = format!("haproxy-seed-{version}");
-    apply_json(&serde_json::json!({
-        "apiVersion": "updated.dev/v1alpha1",
-        "kind": "UpdateGroup",
-        "metadata": {"name": seed, "namespace": NAMESPACE},
-        "spec": {
-            "repositoryRef": {"name": fixture::REPOSITORY_NAME},
-            "selector": {"matchLabels": {COHORT_LABEL: "__haproxy-seed-unmatched__"}},
-            // A full clone of edge's deployment (CRD-valid); `updatectl deploy` overwrites application.
-            "deployment": seed_deployment
-        }
-    }))?;
     // Stage the bundle tree: the real distro haproxy binary + the launch entrypoint.
     run(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
@@ -217,32 +200,18 @@ fn publish_haproxy_app(
     ]))?;
     // Pipe the generated config in over stdin — no shell escaping of its quotes/braces/newlines.
     pipe_into_release_server("cat > /tmp/hap-app/config/haproxy.cfg", &cfg)?;
-    run(kubectl().args(RELEASE_SERVER_EXEC).args([
+    let published = output(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
         "-c",
         &format!(
             "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
-             updatectl deploy --keys-dir /data/release-keys {repository} \
-             --namespace {NAMESPACE} --group {seed} --product haproxy --channel stable --version {version} \
+             updatectl publish --keys-dir /data/release-keys {repository} \
+             --output json --product haproxy --channel stable --version {version} \
              --platform {platform} --source /tmp/hap-app --entrypoint bin/lifecycle --healthcheck bin/lifecycle --inspect bin/lifecycle --recover bin/lifecycle --replay safe --recovery-replay safe --timeout-seconds {timeout}"
         ),
     ]))?;
-    let path = kubectl_value("updategroup", &seed, "{.spec.deployment.application.path}")?;
-    let sha = kubectl_value(
-        "updategroup",
-        &seed,
-        "{.spec.deployment.application.sha256}",
-    )?;
-    run(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "delete",
-        "updategroup",
-        &seed,
-        "--ignore-not-found",
-    ]))?;
-    Ok((path.trim().to_owned(), sha.trim().to_owned()))
+    published_reference(&published)
 }
 
 /// Run `sh -c "<command>"` in the release-server pod with `stdin` piped to it — the escaping-free
@@ -286,10 +255,16 @@ fn haproxy_group_deployment(
     let mut deployment = edge["spec"]["deployment"].clone();
     deployment["name"] = versioned_deployment_name(HAPROXY_GROUP, HAPROXY_V1).into();
     deployment["application"] =
-        serde_json::json!({"path": release.v1_path, "sha256": release.v1_sha});
+        serde_json::to_value(updated_contracts::releases::testing::install(
+            HAPROXY_V1,
+            updated_contracts::artifact::TargetReference {
+                path: release.v1_path.clone(),
+                sha256: release.v1_sha.clone(),
+            },
+        ))
+        .expect("the typed release graph is serializable");
 
     deployment["releaseRepository"] = minio_release_repository(release_root);
-    deployment["coldInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
     // No install-root override: a node's install root is pinned at enrollment and the agent fails
     // closed on an assignment that would move it. Each node runs exactly one product, so the
@@ -328,7 +303,7 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
         "cat",
         "/data/release-keys/root.json",
     ]))?;
-    let release = publish_haproxy_bundles(&seed_deployment(&edge, &release_root), platform)?;
+    let release = publish_haproxy_bundles(platform)?;
     let base = haproxy_group_deployment(&edge, &release_root, &release);
     // One self-protecting group owns both HAProxy nodes. `maxUnavailable: 1` makes the control
     // plane publish the new assignment to one node at a time; no synthetic set/group split is
@@ -553,7 +528,14 @@ async fn drive_haproxy_upgrade() -> Result<(), Box<dyn std::error::Error>> {
         "-p",
         &serde_json::to_string(&serde_json::json!({"spec": {"deployment": {
             "name": versioned_deployment_name(HAPROXY_GROUP, HAPROXY_V2),
-            "application": {"path": next_path, "sha256": next_sha}
+            "application": {"target": HAPROXY_V2, "releases": {HAPROXY_V2: updated_contracts::releases::Release {
+                package: updated_contracts::artifact::TargetReference {
+                    path: next_path.into(), sha256: next_sha.into(),
+                },
+                upgrade_from: std::collections::BTreeSet::from([HAPROXY_V1.into()]),
+                rollback_from: std::collections::BTreeSet::new(),
+                installable: true,
+            }}}
         }}}))?,
     ]))?;
 
@@ -699,11 +681,14 @@ mod tests {
                 targets_url: "https://release/targets/".into(),
                 root_json: "{}".into(),
             },
-            application: updatec::TargetSpec {
-                path: "app-1.0.0.tar.zst".into(),
-                sha256: "a".repeat(64),
-            },
-            cold_install_fallback: true,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "app-1.0.0.tar.zst".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+
             runtime: updatec::RuntimeSpec {
                 product: "sampleapp".into(),
                 channel: "stable".into(),

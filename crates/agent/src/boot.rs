@@ -66,7 +66,7 @@ pub(crate) enum GateFailure {
     /// An update still has rollback authority: restore its predecessor and reject the candidate.
     Revert,
     /// A provisional head that has never proven healthy: reject its bytes so the next boot's cold
-    /// install descends via cold-install fallback past it.
+    /// installation is held for explicit recovery.
     RejectProvisional,
     /// A confirmed release: report it unhealthy and keep running. Never reverted locally.
     Report,
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn a_provisional_head_that_never_gets_healthy_is_rejected_so_the_next_boot_descends() {
         // A cold-installed head has never proven anything, and there is no predecessor to revert
-        // to: rejecting its bytes is what lets the next boot's cold-install fallback descend past it
+        // to: rejecting its bytes prevents the next boot from relaunching it
         // instead of relaunching a release that cannot serve.
         let provisional = InstalledState::provisional(
             lineage(),

@@ -1531,7 +1531,7 @@ mod tests {
     /// on every node and every retry — so it must be an `Archive` verdict the agent can
     /// reject and descend past. Classified as `Storage` (which is what a bare `?` on
     /// `create_new`/`create_dir_all` yields) the same bad version is retried on every boot forever
-    /// and the cold-install fallback never runs.
+    /// and no alternative valid installation route can be selected.
     /// Rebuild `source`'s archive with one extra entry whose name is planted straight into the tar
     /// header.
     ///

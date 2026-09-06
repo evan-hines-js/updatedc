@@ -143,11 +143,14 @@ mod fixture {
             deployment: deployment.into(),
             metadata_url: "https://cdn/metadata/".into(),
             targets_url: "https://cdn/targets/".into(),
-            application: updated_contracts::artifact::TargetReference {
-                path: "app".into(),
-                sha256: "a".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "app".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+
             release_root: serde_json::json!({}),
             runtime: runtime(),
         }
@@ -290,15 +293,24 @@ mod error_tests {
         let mut first = RepositoryAssignment {
             metadata_url: "https://cdn/group/metadata/".into(),
             targets_url: "https://cdn/group/targets/".into(),
-            application: updated_contracts::artifact::TargetReference {
-                path: "products/app/stable/1/linux-x86_64/app".into(),
-                sha256: "a".repeat(64),
-            },
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "products/app/stable/1/linux-x86_64/app".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
             ..assignment("deploy-1")
         };
         let datastore = lineage(&first);
         first.deployment = "deploy-2".into();
-        first.application.sha256 = "c".repeat(64);
+        first
+            .application
+            .releases
+            .get_mut(&first.application.target)
+            .unwrap()
+            .package
+            .sha256 = "c".repeat(64);
         assert_eq!(datastore, lineage(&first));
     }
 
@@ -419,11 +431,14 @@ mod error_tests {
             deployment: "deployment".into(),
             metadata_url: "https://cdn/metadata/".into(),
             targets_url: "https://cdn/targets/".into(),
-            application: updated_contracts::artifact::TargetReference {
-                path: "products/app/stable/1.0.0/linux-x86_64/app".into(),
-                sha256: "a".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "products/app/stable/1.0.0/linux-x86_64/app".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+
             release_root: serde_json::json!({}),
             runtime,
         };
@@ -972,7 +987,7 @@ fn routing_source(
         target_limit: ROUTING_TARGET_LIMIT,
         transport_timeout: routing_config.transport_timeout,
         access: updated::config::RepositoryAccess::GatewayCapability,
-        mtls: routing_config.mtls.clone(),
+        mtls: Some(routing_config.mtls.clone()),
     })
 }
 
@@ -1077,47 +1092,19 @@ impl TrustedRepository {
         paths: &updated::config::Paths,
     ) -> Result<Self, Error> {
         let resolved = Self::resolve_assignment(routing_config, paths).await?;
-        let ResolvedAssignment {
-            assignment,
-            sha256: assignment_sha256,
-        } = resolved;
-        let limits = &assignment.runtime.repository;
-        // The TUF rollback floor, installed-version ordering, and rejection policy are one
-        // repository-lineage fact. They all key exclusively on the authenticated metadata origin;
-        // moving the target-object mirror must not manufacture a blank rollback history.
+        let ResolvedAssignment { assignment, sha256 } = resolved;
+        let mut repository = Self::load_release_repository(
+            &assignment,
+            &paths.datastore,
+            Some(routing_config.mtls.clone()),
+        )
+        .await?;
         let repository_lineage =
             updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url)
-                .map_err(|error| {
-                    Error::Trust(format!("assignment metadataUrl is invalid: {error}"))
-                })?;
-        let assignment_store = paths.datastore.join(repository_lineage.as_str());
-        std::fs::create_dir_all(&assignment_store).map_err(|error| {
-            Error::Local(format!("creating assigned repository state: {error}"))
-        })?;
-        let release_root = assignment_store.join("release-root.json");
-        write_if_changed(
-            &release_root,
-            ".release-root-",
-            &serde_json::to_vec(&assignment.release_root)
-                .map_err(|error| Error::Trust(format!("encoding signed release root: {error}")))?,
-        )
-        .map_err(|error| Error::Local(format!("materializing signed release root: {error}")))?;
-        let source = updated::config::RepositorySource {
-            root: release_root,
-            metadata_url: assignment.metadata_url.clone(),
-            targets_url: assignment.targets_url.clone(),
-            metadata_limit: limits.metadata_limit,
-            target_limit: limits.target_limit,
-            transport_timeout: Duration::from_secs(limits.transport_timeout_seconds),
-            // A release repository is signed desired state, not the routing capability origin.
-            // It is fetched without presenting the node's control-plane identity.
-            access: updated::config::RepositoryAccess::Direct,
-            mtls: routing_config.mtls.clone(),
-        };
-        let mut repository = Self::load(&source, &assignment_store).await?;
+                .map_err(|error| Error::Trust(error.to_string()))?;
         repository.assignment = Some(AssignmentContext {
             document: assignment,
-            sha256: assignment_sha256,
+            sha256,
             repository_lineage: repository_lineage.clone(),
         });
         // The active assignment's datastore holds tough's version-monotonicity floor
@@ -1145,6 +1132,42 @@ impl TrustedRepository {
         }
         Ok(repository)
     }
+    /// Authenticate release metadata for a validated deployment. Both rollout preflight and
+    /// agents use this path; direct release access never presents a client identity.
+    pub async fn load_release_repository(
+        assignment: &updated_contracts::assignment::RepositoryAssignment,
+        datastore: &Path,
+        mtls: Option<updated::tls::Identity>,
+    ) -> Result<Self, Error> {
+        assignment.validate().map_err(Error::Trust)?;
+        let repository_lineage =
+            updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url)
+                .map_err(|error| Error::Trust(error.to_string()))?;
+        let assignment_store = datastore.join(repository_lineage.as_str());
+        std::fs::create_dir_all(&assignment_store)
+            .map_err(|error| Error::Local(error.to_string()))?;
+        let root = assignment_store.join("release-root.json");
+        write_if_changed(
+            &root,
+            ".release-root-",
+            &serde_json::to_vec(&assignment.release_root)
+                .map_err(|error| Error::Trust(error.to_string()))?,
+        )
+        .map_err(|error| Error::Local(error.to_string()))?;
+        let limits = &assignment.runtime.repository;
+        let source = updated::config::RepositorySource {
+            root,
+            metadata_url: assignment.metadata_url.clone(),
+            targets_url: assignment.targets_url.clone(),
+            metadata_limit: limits.metadata_limit,
+            target_limit: limits.target_limit,
+            transport_timeout: Duration::from_secs(limits.transport_timeout_seconds),
+            access: updated::config::RepositoryAccess::Direct,
+            mtls,
+        };
+        Self::load(&source, &assignment_store).await
+    }
+
     /// Load the pinned root and refresh the full metadata chain.
     pub async fn load(
         config: &updated::config::RepositorySource,
@@ -1176,7 +1199,7 @@ impl TrustedRepository {
             .await
             .map_err(|e| Error::Local(format!("creating datastore: {e}")))?;
         let load = RepositoryLoader::new(&root, metadata_url, targets_url)
-            .transport(transport::transport(&config.mtls, config.access))
+            .transport(transport::transport(config.mtls.as_ref(), config.access))
             .datastore(datastore.to_owned())
             .limits(Limits {
                 max_root_size: config.metadata_limit,
@@ -1254,6 +1277,38 @@ impl TrustedRepository {
             )));
         }
         Ok(target)
+    }
+
+    /// Check that a target in authenticated metadata can be opened, without reading its body.
+    pub async fn check_target_available(&self, target: &VerifiedTarget) -> Result<(), Error> {
+        if target.length > self.config.target_limit {
+            return Err(Error::Trust(format!(
+                "target {} exceeds the signed target size limit",
+                target.path
+            )));
+        }
+        let name = TargetName::new(target.path.as_str())
+            .map_err(|error| Error::Trust(error.to_string()))?;
+        // Opening the stream performs the authenticated repository's object request. Dropping it
+        // immediately closes the body: no archive is buffered or written. This checks availability,
+        // not the body digest, which download_target verifies before execution.
+        let stream = timeout(self.config.transport_timeout, self.repo.read_target(&name))
+            .await
+            .map_err(|_| {
+                transport_timeout(
+                    self.config.transport_timeout,
+                    "checking target availability",
+                )
+            })?
+            .map_err(classify)?
+            .ok_or_else(|| {
+                Error::Trust(format!(
+                    "target {} is absent from verified metadata",
+                    target.path
+                ))
+            })?;
+        drop(stream);
+        Ok(())
     }
 
     /// Stream a verified target to `destination`. `tough` verifies length and

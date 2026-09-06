@@ -17,7 +17,7 @@ pub(crate) struct ApplicationRequest<'a> {
     pub(crate) application: &'a Application,
     pub(crate) paths: &'a Paths,
     /// What this node already has, in the selector's own vocabulary. Not an `Option<&str>`: the
-    /// floor and the "already have it" short-circuit are separate facts, and a repair needs to
+    /// starting version and the "already have it" short-circuit are separate facts, and a repair needs to
     /// lift the second without lifting the first (see [`Stance`]).
     pub(crate) stance: Stance<'a>,
 }
@@ -119,33 +119,51 @@ impl std::error::Error for PrepareError {
 
 /// Decide which application this node should be running, against the verified control plane.
 ///
-/// `Ok(None)` means the current version is already desired or the candidate's artifact/deployment
-/// identity was previously rejected. Activation and rejection persistence remain front-end policy.
+/// `Ok(None)` means the installed package is already the target (or exact repair bytes are
+/// unavailable). A missing installation/upgrade route is an error.
 ///
 /// Selection is side-effect free. Execution is derived from that exact package after verification.
 pub(crate) fn select_assigned_application(
     request: &ApplicationRequest<'_>,
     mut is_rejected: impl FnMut(&str) -> bool,
-) -> Result<Option<SelectedRelease>, PrepareError> {
+) -> Result<Option<Vec<SelectedRelease>>, PrepareError> {
     let policy = DefaultPolicy::current(&request.application.product, &request.application.channel);
-    // Rejection filtering now happens inside selection: exact-pin returns None when
-    // the assigned bytes are rejected (hold predecessor), and cold-install fallback skips
-    // rejected targets as it descends. Diagnostics are dropped here; the agent's
-    // own selection path logs skips.
+    // Exclude rejected bytes before finding a complete route; a rejected intermediate may
+    // have an alternate supported path, but a rejected final target cannot be substituted.
     request
         .repository
-        .assigned_application(
-            &policy,
-            request.stance,
-            |_message| {},
-            |target, _version| is_rejected(&target_sha(target)),
-        )
+        .assigned_application(&policy, request.stance, |target, _version| {
+            is_rejected(&target_sha(target))
+        })
+        .map(|route| (!route.is_empty()).then_some(route))
         .map_err(PrepareError::Repository)
 }
 
 /// Download and stage the application [`select_assigned_application`] chose: everything before
 /// activation, and nothing that decides anything.
 pub(crate) async fn prepare_assigned_application(
+    request: &ApplicationRequest<'_>,
+    route: Vec<SelectedRelease>,
+) -> Result<PreparedApplication, PrepareError> {
+    // Check every required object before activating anything, without downloading future hops.
+    // TUF owns target URL resolution (including consistent snapshots) and authentication.
+    for selected in &route {
+        request
+            .repository
+            .check_target_available(&selected.target)
+            .await
+            .map_err(PrepareError::Repository)?;
+    }
+    let first = route.into_iter().next().ok_or_else(|| {
+        PrepareError::Storage(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty upgrade route",
+        ))
+    })?;
+    prepare_application(request, first).await
+}
+
+async fn prepare_application(
     request: &ApplicationRequest<'_>,
     selected: SelectedRelease,
 ) -> Result<PreparedApplication, PrepareError> {
@@ -224,6 +242,109 @@ pub(crate) async fn acquire_verified_bundle(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn future_hops_are_probed_but_only_the_next_bundle_is_downloaded_and_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join(updated::command_adapter::CONFIG),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": updated::command_adapter::API,
+                "deploy": {"argv": ["never-execute-during-preparation"], "timeoutSeconds": 1},
+                "replay": {"policy": "manual"}, "recovery": {"policy": "manual"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let archive = tmp.path().join("next.tar.zst");
+        updated::bundle::create_bundle(
+            &source,
+            &archive,
+            "app",
+            "2.0.0",
+            &foundation::platform::platform_key(),
+        )
+        .unwrap();
+        let future = tmp.path().join("future.tar.zst");
+        std::fs::write(&future, b"signed but deliberately not a valid bundle").unwrap();
+        let directory = tmp.path().join("repo");
+        let keys = updated_tuf::repo::generate_keys(&tmp.path().join("keys"))
+            .await
+            .unwrap();
+        updated_tuf::repo::init(&directory, &keys, 365)
+            .await
+            .unwrap();
+        updated_tuf::repo::add_release(
+            &directory,
+            &keys,
+            vec![
+                updated_tuf::repo::PublishTarget::application(
+                    "app",
+                    "stable",
+                    "2.0.0",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    "app",
+                    archive,
+                ),
+                updated_tuf::repo::PublishTarget::application(
+                    "app",
+                    "stable",
+                    "3.0.0",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    "app",
+                    future,
+                ),
+            ],
+            365,
+        )
+        .await
+        .unwrap();
+        let repository = TrustedRepository::load(
+            &updated_tuf::testing::offline_source(&directory),
+            &tmp.path().join("metadata"),
+        )
+        .await
+        .unwrap();
+        let mut targets = repository.all_targets();
+        targets.sort_by(|a, b| a.path.cmp(&b.path));
+        let route = targets
+            .into_iter()
+            .zip(["2.0.0", "3.0.0"])
+            .map(|(target, version)| SelectedRelease {
+                sha256: target_sha(&target),
+                target,
+                version: version.into(),
+            })
+            .collect();
+        let paths = Paths::resolve(
+            &tmp.path().join("installation"),
+            &tmp.path().join("enrollment"),
+        );
+        let application =
+            Application::from_runtime(&updated_contracts::assignment::testing::minimal_runtime());
+        let request = ApplicationRequest {
+            repository: &repository,
+            application: &application,
+            paths: &paths,
+            stance: Stance::Nothing,
+        };
+        std::fs::create_dir_all(&paths.staging).unwrap();
+        let prepared = prepare_assigned_application(&request, route).await.unwrap();
+        assert_eq!(prepared.version, "2.0.0");
+        assert_eq!(
+            std::fs::read_dir(&paths.versions).unwrap().count(),
+            1,
+            "only the next hop consumes release storage"
+        );
+        assert!(
+            !paths.installed.exists(),
+            "preparation never commits or runs an entrypoint"
+        );
+    }
 
     /// The whole point of the split: a rejection is durable and never expires, so nothing but
     /// evidence about the archive itself may reach `rejected_archive`. A staging failure that

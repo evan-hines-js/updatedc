@@ -1,3 +1,11 @@
+## Primary design rule
+
+Never reimplement what kubectl implements. Operators manage Kubernetes resources through
+kubectl or GitOps; do not add competing resource CRUD, diff, status, watch, wait, logs, or
+rollout commands to updatedc tooling. `updatectl` is limited to CI package validation and
+publication. Expose fleet intent and observed state through Kubernetes resources and status.
+Controllers still reconcile those resources; agents own authenticated package execution.
+
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph
 

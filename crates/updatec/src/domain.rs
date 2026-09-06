@@ -15,6 +15,7 @@ use crate::{
     ResolvedGroup, ResolvedNode, UpdateGroupSet, UpdateRepositorySpec,
 };
 
+#[derive(Clone, Copy)]
 pub struct DesiredState<'a> {
     pub repository: &'a UpdateRepositorySpec,
     pub groups: &'a BTreeMap<String, ResolvedGroup>,
@@ -55,6 +56,27 @@ pub struct DesiredState<'a> {
     pub held: &'a BTreeMap<String, AdmittedDeployment>,
 }
 
+impl<'a> DesiredState<'a> {
+    /// Quarantine only captures otherwise-unmatched nodes with a usable selector. A valid group
+    /// owns its matches, and an invalid empty selector conveys no membership information.
+    pub(crate) fn quarantined_group(
+        &self,
+        node: &ResolvedNode,
+        selected_group: &str,
+    ) -> Option<&'a String> {
+        if selected_group != crate::DEFAULT_GROUP {
+            return None;
+        }
+        self.quarantined
+            .iter()
+            .find(|(_, selector)| {
+                !selector.is_empty() && crate::selector_matches(selector, &node.labels)
+            })
+            .map(|(name, _)| name)
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct ObservedState<'a> {
     pub reports: &'a HashMap<String, Envelope>,
     /// Sensitive node output publications loaded from their private S3 objects. They are joined
@@ -82,6 +104,11 @@ pub struct ObservedState<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconcilePlan {
     pub publication: PublicationPlan,
+    /// Desired group bodies after input resolution, including cohorts still waiting for admission.
+    /// Preflight must judge these exact configurations, not independently reinterpret raw intent.
+    pub desired_deployments: BTreeMap<String, DesiredDeployment>,
+    /// The planner's one movement verdict, shared with preflight when choosing a return target.
+    pub blocked: BTreeSet<String>,
     /// Opaque generation → sensitive bytes the adapter must durably create before publishing the
     /// assignment that names the generation.
     pub input_snapshots: BTreeMap<String, updated_contracts::dataflow::FileSnapshot>,
@@ -211,19 +238,10 @@ pub fn plan_reconcile(
     let quarantined: BTreeMap<&String, &String> = desired
         .nodes
         .iter()
-        .filter(|node| {
-            node_groups
-                .get(&node.name)
-                .is_some_and(|selected| selected == crate::DEFAULT_GROUP)
-        })
         .filter_map(|node| {
             desired
-                .quarantined
-                .iter()
-                .find(|(_, selector)| {
-                    !selector.is_empty() && crate::selector_matches(selector, &node.labels)
-                })
-                .map(|(name, _)| (&node.name, name))
+                .quarantined_group(node, &node_groups[&node.name])
+                .map(|name| (&node.name, name))
         })
         .collect();
     for (node, selected) in &node_groups {
@@ -434,6 +452,11 @@ pub fn plan_reconcile(
     let assignments = publication.node_assignments.clone();
     Ok(ReconcilePlan {
         publication,
+        desired_deployments: groups
+            .into_iter()
+            .map(|(name, group)| (name, group.deployment))
+            .collect(),
+        blocked: rollout.blocked,
         input_snapshots,
         admitted,
         vetoed,
@@ -604,7 +627,15 @@ fn resolve_one(
             // release's endpoints under the new deployment, with the control plane believing the
             // producer moved.
             if !identity.as_deref().is_some_and(|identity| {
-                report.is_converged_to(identity, &producer.deployment.application.sha256)
+                report.is_converged_to(
+                    identity,
+                    &producer
+                        .deployment
+                        .application
+                        .target_reference()
+                        .expect("validated release graph")
+                        .sha256,
+                )
             }) {
                 return false;
             }
@@ -662,7 +693,6 @@ fn resolve_one(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use updated_contracts::artifact::TargetReference;
     use updated_contracts::dataflow::{FileSnapshot, FileValue, OutputPublication};
     use updated_contracts::telemetry::NodeReport;
 
@@ -705,11 +735,14 @@ mod tests {
             deployment: name.into(),
             metadata_url: "https://cdn/metadata/".into(),
             targets_url: "https://cdn/targets/".into(),
-            application: TargetReference {
-                path: "app".into(),
-                sha256: DIGEST.into(),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "app".into(),
+                    sha256: DIGEST.into(),
+                },
+            ),
+
             release_root: serde_json::json!({}),
             runtime: crate::tests::managed_runtime(),
         }
@@ -993,7 +1026,7 @@ mod tests {
             ("producer".into(), "initialize".into()),
             ("consumer".into(), "join".into()),
         ]);
-        let mut groups = BTreeMap::from([
+        let mut groups: BTreeMap<String, ResolvedGroup> = BTreeMap::from([
             (
                 "initialize".into(),
                 ResolvedGroup {
@@ -1028,6 +1061,10 @@ mod tests {
             ),
         ]);
 
+        for (name, group) in &mut groups {
+            group.match_labels = BTreeMap::from([("role".into(), name.clone())]);
+        }
+        let raw_groups = groups.clone();
         let mut verified = crate::evidence::VerifiedReports::default();
         verified.verify_fleet(&reports, &keys);
         resolve_group_inputs(
@@ -1048,6 +1085,49 @@ mod tests {
             groups["join"].input_snapshot.as_ref().unwrap().files["leader"],
             file("https://vault-0:8200")
         );
+
+        // Preflight consumes the same resolved bodies the planner publishes. The raw YAML has
+        // no input commitment and therefore names a different assignment and rollback baseline.
+        let inventory: Vec<_> = nodes
+            .iter()
+            .map(|(node, group)| ResolvedNode {
+                name: node.clone(),
+                labels: BTreeMap::from([("role".into(), group.clone())]),
+            })
+            .collect();
+        let repository = repository();
+        let desired = DesiredState {
+            repository: &repository,
+            groups: &raw_groups,
+            group_labels: &BTreeMap::new(),
+            sets: &[],
+            nodes: &inventory,
+            quarantined: &BTreeMap::new(),
+            held: &BTreeMap::new(),
+            holds: &BTreeSet::new(),
+            cordons: &BTreeSet::new(),
+            blocked_deployments: &BTreeSet::new(),
+        };
+        let observed = ObservedState {
+            reports: &reports,
+            outputs: &outputs,
+            dataflow_key: DATAFLOW_KEY,
+            public_keys: &keys,
+            admitted: &BTreeMap::new(),
+            vetoed: &BTreeMap::new(),
+            routing: &BTreeMap::new(),
+            assignments: &BTreeMap::new(),
+            now: chrono::Utc::now(),
+        };
+        let plan =
+            plan_reconcile(desired, observed, &mut Default::default(), &mut verified).unwrap();
+        let prepared = crate::preflight::routes(&desired, &observed, &plan, &mut verified).unwrap();
+        let consumer = &plan.desired_deployments["join"];
+        assert!(!consumer.runtime.inputs.is_empty());
+        assert!(prepared.iter().any(|entry| entry.deployment == *consumer));
+        assert!(prepared
+            .iter()
+            .all(|entry| entry.deployment != raw_groups["join"].deployment));
 
         // Storage is transport, not authority. Even a fully valid publication carrying the same
         // node, deployment, assignment, and archive must resolve nothing when S3 substituted its
@@ -1144,10 +1224,13 @@ mod tests {
                     targets_url: "https://cdn/targets/".into(),
                     root_json: "{}".into(),
                 },
-                application: crate::TargetSpec {
-                    path: "app".into(),
-                    sha256: DIGEST.into(),
-                },
+                application: updated_contracts::releases::testing::install(
+                    "1.0.0",
+                    updated_contracts::artifact::TargetReference {
+                        path: "app".into(),
+                        sha256: DIGEST.into(),
+                    },
+                ),
                 ..crate::tests::deployment_spec("default")
             },
             s3: crate::tests::repository_storage(),
@@ -1241,6 +1324,91 @@ mod tests {
                 resolved("prerequisite", "prerequisite", vec![]),
             ),
         ])
+    }
+
+    #[test]
+    fn quarantine_cannot_bypass_preflight_for_a_valid_or_unmatched_cohort() {
+        // An empty publication models a cohort still queued behind rollout gates. Preflight
+        // must reject its unsupported installation route before any sibling cohort can advance.
+        for (has_group, selector, held, withheld) in [
+            (true, BTreeMap::new(), false, false),
+            (false, BTreeMap::new(), false, false),
+            (true, BTreeMap::new(), true, true),
+            (false, BTreeMap::new(), true, true),
+            (
+                true,
+                BTreeMap::from([("role".into(), "edge".into())]),
+                false,
+                false,
+            ),
+            (
+                false,
+                BTreeMap::from([("role".into(), "edge".into())]),
+                false,
+                true,
+            ),
+        ] {
+            let mut repository = repository();
+            for release in repository
+                .default_deployment
+                .application
+                .releases
+                .values_mut()
+            {
+                release.installable = false;
+            }
+            let mut group = resolved("edge", "edge", vec![]);
+            for release in group.deployment.application.releases.values_mut() {
+                release.installable = false;
+            }
+            let groups = if has_group {
+                BTreeMap::from([("edge".into(), group)])
+            } else {
+                BTreeMap::new()
+            };
+            let holds = if held {
+                BTreeSet::from(["n1".into()])
+            } else {
+                BTreeSet::new()
+            };
+            let desired = DesiredState {
+                repository: &repository,
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &edge_node(),
+                quarantined: &BTreeMap::from([("broken".into(), selector)]),
+                held: &BTreeMap::new(),
+                holds: &holds,
+                cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
+            };
+            let observed = ObservedState {
+                reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
+                public_keys: &HashMap::new(),
+                admitted: &BTreeMap::new(),
+                vetoed: &BTreeMap::new(),
+                routing: &BTreeMap::new(),
+                assignments: &BTreeMap::new(),
+                now: chrono::Utc::now(),
+            };
+            let plan = plan_reconcile(
+                desired,
+                observed,
+                &mut Default::default(),
+                &mut Default::default(),
+            )
+            .unwrap();
+            let result =
+                crate::preflight::routes(&desired, &observed, &plan, &mut Default::default());
+            assert_eq!(
+                result.is_ok(),
+                withheld,
+                "has_group={has_group}, withheld={withheld}"
+            );
+        }
     }
 
     #[test]
@@ -2149,7 +2317,14 @@ mod tests {
         let old_identity = first.assignments["n1"].clone();
 
         let mut repository_v2 = repository();
-        repository_v2.default_deployment.application.sha256 = "3".repeat(64);
+        repository_v2
+            .default_deployment
+            .application
+            .releases
+            .get_mut(&repository_v2.default_deployment.application.target)
+            .unwrap()
+            .package
+            .sha256 = "3".repeat(64);
         let new_default =
             DesiredDeployment::try_from(repository_v2.default_deployment.clone()).unwrap();
         let blocked = BTreeSet::from([crate::deployment_identity(&new_default).unwrap()]);
@@ -2243,7 +2418,14 @@ mod tests {
         // Pass 2: the operator edits the default AND holds the node. The recorded body resolves
         // through the lineage and is republished verbatim.
         let mut repository_v2 = repository();
-        repository_v2.default_deployment.application.sha256 = "3".repeat(64);
+        repository_v2
+            .default_deployment
+            .application
+            .releases
+            .get_mut(&repository_v2.default_deployment.application.target)
+            .unwrap()
+            .package
+            .sha256 = "3".repeat(64);
         let holds = BTreeSet::from(["n1".to_string()]);
         let second = plan_reconcile(
             DesiredState {
@@ -2328,7 +2510,14 @@ mod tests {
         let nodes = edge_node();
         let repository_v1 = repository();
         let mut repository_v2 = repository();
-        repository_v2.default_deployment.application.sha256 = "3".repeat(64);
+        repository_v2
+            .default_deployment
+            .application
+            .releases
+            .get_mut(&repository_v2.default_deployment.application.target)
+            .unwrap()
+            .package
+            .sha256 = "3".repeat(64);
         let plan = |repository: &crate::UpdateRepositorySpec,
                     held: &BTreeMap<String, crate::rollout::AdmittedDeployment>,
                     quarantined: &BTreeMap<String, BTreeMap<String, String>>,

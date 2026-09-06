@@ -299,7 +299,7 @@ pub struct NodeReport {
     /// first assignment.
     pub assignment_sha256: String,
     /// The semantic version the node is *actually running* right now, independent of what it
-    /// was assigned — after a rollback or cold-install-fallback descent this is the version that
+    /// was assigned — after a rollback or an intermediate upgrade hop this is the version that
     /// really answered, not the desired one. It is the control plane's authoritative source
     /// of a node's running version, so no consumer ever has to probe the managed app (which
     /// may speak any protocol, or none). Empty only before the first install completes.
@@ -311,7 +311,7 @@ pub struct NodeReport {
     /// bytes are executing, so a reader can join a running node straight to whatever it knows
     /// about that digest (provenance, an attestation, a policy decision) without trusting a
     /// version string or re-deriving the assignment the node was given. It is the running
-    /// digest, not the assigned one: after a rollback or a cold-install-fallback descent it names
+    /// digest, not the assigned one: after a rollback or an intermediate upgrade hop it names
     /// the predecessor that really answered.
     ///
     /// Empty only before the first install completes, matching [`NodeReport::version`]. Any
@@ -346,9 +346,11 @@ pub struct NodeReport {
     /// of `healthy == false` that says a transaction genuinely ran, which `is_wellformed` enforces
     /// (never true together with `healthy`).
     pub updating: bool,
-    /// Whether this node has DURABLY REJECTED the release its assignment names: the archive
-    /// [`NodeReport::assignment_sha256`] resolves to is in the node's rejection record, written by
-    /// content hash when a candidate failed and kept for good.
+    /// Whether durable package rejections prevent this node from reaching the assigned target.
+    /// A rejected provisional installation is not a usable starting state, even at that version.
+    /// This verdict is bound to the graph in [`NodeReport::assignment_sha256`]: a rejected
+    /// intermediate is blocking only when no supported alternative survives. Invalid graphs
+    /// and transient transport failures are not rejections of release bytes.
     ///
     /// This is the node stating a TERMINAL fact about itself, and it is the only honest source for
     /// it. The control plane cannot infer it: a rejection is recorded for a candidate that failed
@@ -361,9 +363,8 @@ pub struct NodeReport {
     /// containing it stayed "rolling" — holding its set's concurrency slot against every sibling —
     /// with no exit but an operator retargeting it by hand.
     ///
-    /// It is a fact about BYTES, so it is stable across reboots and reports: the record never
-    /// expires, and corrected bytes have a new digest, which is the same rule the fleet-wide halt
-    /// enforces.
+    /// The underlying records are facts about BYTES and survive reboots. Corrected bytes have
+    /// a new digest, and a changed graph may provide a route around rejected intermediate bytes.
     ///
     pub rejected: bool,
     /// Milliseconds since the Unix epoch when the node wrote this report (see [`now_ms`]). A

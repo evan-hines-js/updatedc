@@ -35,9 +35,6 @@ pub struct Node {
     /// scenario selects its own mode exactly once (see [`Node::mode`]).
     lifecycle_mode: String,
     seed_application: bool,
-    /// Sign `cold_install_fallback` into the assignment: a cold node whose exact assigned
-    /// bytes prove unusable may descend to the newest healthy target at or below it.
-    cold_install_fallback: bool,
 }
 
 /// The mode the reconciler starts in: record the invocation and succeed. There is one reconciler
@@ -83,13 +80,7 @@ impl Node {
             confirmation_window: None,
             lifecycle_mode: INERT.into(),
             seed_application: true,
-            cold_install_fallback: false,
         }
-    }
-    /// Sign cold-install fallback into the assignment (see the struct field).
-    pub fn cold_install_fallback(mut self) -> Self {
-        self.cold_install_fallback = true;
-        self
     }
     /// The reconciler manages the sample application at `address`: `converge` makes the workload
     /// match the supplied payload, `rollback` compensates failed-payload effects, and
@@ -211,11 +202,6 @@ impl Node {
             serde_json::to_vec(&runtime).map_err(|error| error.to_string())?,
         )
         .map_err(str_err)?;
-        // A marker file (like `desired-app`) carries the fallback opt-in to the assignment
-        // publisher, which signs it into every republished assignment doc.
-        if self.cold_install_fallback {
-            std::fs::write(self.dir.join("cold-install-fallback"), []).map_err(str_err)?;
-        }
         republish_assignment(self, "configured")?;
         let state_dir = self.state_dir();
         std::fs::create_dir_all(&state_dir).map_err(str_err)?;
@@ -315,6 +301,44 @@ impl Node {
             crate::harness::sha256_hex(&paths.download)?,
             Box::new(execution),
         );
+        let graph_path = self.dir.join("application.json");
+        let mut graph: updated_contracts::releases::ReleaseGraph =
+            serde_json::from_slice(&std::fs::read(&graph_path).map_err(str_err)?)
+                .map_err(str_err)?;
+        let package = updated_contracts::artifact::TargetReference {
+            path: crate::harness::release_target(
+                &self.product,
+                "stable",
+                "1.0.0",
+                &foundation::platform::platform_key(),
+                &self.product,
+            ),
+            sha256: installed.archive_sha256.clone(),
+        };
+        if let Some(published) = graph.releases.get("1.0.0") {
+            if published.package != package {
+                return fail("seeded 1.0.0 differs from the published immutable release");
+            }
+        } else {
+            graph.releases.insert(
+                "1.0.0".into(),
+                updated_contracts::releases::Release {
+                    package,
+                    installable: false,
+                    rollback_from: Default::default(),
+                    upgrade_from: Default::default(),
+                },
+            );
+        }
+        for (version, release) in &mut graph.releases {
+            if updated_contracts::identity::parse_release_version(version)
+                > updated_contracts::identity::parse_release_version("1.0.0")
+            {
+                release.upgrade_from.insert("1.0.0".into());
+            }
+        }
+        std::fs::write(graph_path, serde_json::to_vec(&graph).map_err(str_err)?)
+            .map_err(str_err)?;
         updated::state::write_installed(&paths.installed, &installed).map_err(str_err)
     }
 
@@ -370,14 +394,6 @@ pub fn publish_assignment(
     targets_url: &str,
     deployment: &str,
 ) -> R {
-    let desired = std::fs::read_to_string(dir.join("desired-app")).map_err(str_err)?;
-    let mut desired = desired.lines();
-    let app_path = desired
-        .next()
-        .ok_or("desired application path is missing")?;
-    let app_sha = desired
-        .next()
-        .ok_or("desired application hash is missing")?;
     let runtime = dir.join("assignment-runtime.json");
     let mut command = Command::new(server);
     command
@@ -392,16 +408,10 @@ pub fn publish_assignment(
         .args(["--metadata-url", metadata_url])
         .args(["--targets-url", targets_url])
         .args(["--deployment", deployment])
-        .args(["--application-path", app_path])
-        .args(["--application-sha256", app_sha])
+        .arg("--application")
+        .arg(dir.join("application.json"))
         .arg("--runtime")
         .arg(runtime);
-    // The Node builder drops this marker when cold-install fallback is opted into; it must
-    // ride the *initial* assignment (this is the doc a cold node resolves), not only later
-    // republishes, or the first install pins the assigned head exactly and cannot descend.
-    if dir.join("cold-install-fallback").exists() {
-        command.arg("--cold-install-fallback");
-    }
     crate::harness::run(command)
 }
 

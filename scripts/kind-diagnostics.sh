@@ -7,7 +7,7 @@ CLUSTER=${UPDATEC_KIND_CLUSTER:-updatec-e2e}
 NAMESPACE=${UPDATEC_NAMESPACE:-updated-system}
 KUBE_CONTEXT="kind-$CLUSTER"
 
-cluster() { command kubectl --context "$KUBE_CONTEXT" "$@"; }
+cluster() { command kubectl --context "$KUBE_CONTEXT" --request-timeout=15s "$@"; }
 kube() { cluster -n "$NAMESPACE" "$@"; }
 infra() { cluster -n ingress-nginx "$@"; }
 

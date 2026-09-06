@@ -73,23 +73,51 @@ fn installed_release_identity(store: &Store) -> io::Result<InstalledReleaseIdent
             definition_sha256: state.reconciler.definition_sha256.clone(),
             manifest_sha256: state.release.manifest_sha256,
         },
-        updated::state::Installed::Missing | updated::state::Installed::Invalid => {
-            InstalledReleaseIdentity::default()
+        updated::state::Installed::Missing => InstalledReleaseIdentity::default(),
+        updated::state::Installed::Invalid => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed state is corrupt; it cannot be reported as a fresh installation",
+            ))
         }
     })
 }
 
-/// Whether this node has durably rejected the release `assignment` names — either invalid
-/// artifact or this exact application/provider pair. A node that has is finished with that unit
-/// for good: it never retries it, so no
-/// later report of it will ever name that release as running, and the control plane has to be told
-/// or it waits for a convergence that cannot happen.
+/// Whether durable artifact or deployment rejections block every route in this assignment.
+/// The control plane needs this explicit verdict to avoid waiting for unreachable convergence.
 pub(super) fn rejects_release(
     store: &Store,
     lineage: &updated::state::RepositoryLineage,
     assignment: &updated_contracts::assignment::RepositoryAssignment,
 ) -> bool {
-    store.rejects_deployment(lineage, &assignment.application.sha256)
+    let graph = &assignment.application;
+    let (installed, provisional_rejected) = match store.installed() {
+        Ok(updated::state::Installed::Present(state)) => {
+            // A version string alone cannot anchor a route or attribute its failures.
+            if graph
+                .check_source(&state.release.version, &state.archive_sha256)
+                .is_err()
+            {
+                return false;
+            }
+            // A provisional first install has not established a usable starting state. An
+            // empty route to that same version must not hide its durable boot rejection.
+            let rejected = !state.is_proven()
+                && store.rejects_deployment(&state.repository_lineage, &state.archive_sha256);
+            (Some(state.release.version), rejected)
+        }
+        Ok(updated::state::Installed::Missing) => (None, false),
+        _ => return false,
+    };
+    // A rejected intermediate blocks the assignment only when no alternative route survives.
+    // Configuration mistakes are not durable rejections of release bytes.
+    graph.route(installed.as_deref(), |_, _| true).is_ok()
+        && (provisional_rejected
+            || graph
+                .route(installed.as_deref(), |_, release| {
+                    !store.rejects_deployment(lineage, &release.package.sha256)
+                })
+                .is_err())
 }
 
 pub(crate) fn rejects_assigned_release(

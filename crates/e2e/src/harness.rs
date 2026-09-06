@@ -193,10 +193,9 @@ impl Ctx {
         }
         std::fs::create_dir_all(work.join("build")).map_err(str_err)?;
         let exe = if cfg!(windows) { ".exe" } else { "" };
-        let bin = |name: &str| target.join(format!("release/{name}{exe}"));
         Ok(Ctx {
             _run_lock: run_lock,
-            server: bin("server"),
+            server: target.join(format!("debug/server{exe}")),
             // The canonical chaos-enabled agent is copied here by `build()`.
             agent: work.join(format!("build/agent-chaos{exe}")),
             platkey: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -208,7 +207,7 @@ impl Ctx {
         })
     }
 
-    /// Build the release binaries the harness drives. The agent is built with its
+    /// Build the binaries the harness drives. The agent is built in release mode with its
     /// `chaos` feature — the crash-injection points the chaos-recovery scenarios need,
     /// which are compiled out of every ordinary build.
     pub fn build(&self) -> R {
@@ -222,12 +221,17 @@ impl Ctx {
         } else {
             &[]
         };
-        let crypto_cdn = [
-            ["build", "--release", "-p", "server"].as_slice(),
-            fips_feature,
-        ]
-        .concat();
-        cargo(&self.root, &crypto_cdn)?;
+        // The repository server is a fixture, not a shipped workload. Optimizing its entire
+        // controller dependency with release LTO twice in parallel exhausted Intel CI's build
+        // deadline. Keep production agent builds unchanged and compile this fixture without
+        // optimization or debug symbols.
+        let mut server = Command::new(env!("CARGO"));
+        server
+            .current_dir(&self.root)
+            .args(["build", "-p", "server"])
+            .args(fips_feature)
+            .env("CARGO_PROFILE_DEV_DEBUG", "0");
+        run(server)?;
         // Same package, env and features as every versioned agent fixture; only the
         // staged name differs.
         self.build_and_stage(
@@ -414,7 +418,41 @@ impl Ctx {
         run(command)?;
         let target = release_target(product, "stable", version, &self.platkey, product);
         let sha = self.target_sha256(dir, &target)?;
-        std::fs::write(dir.join("desired-app"), format!("{target}\n{sha}\n")).map_err(str_err)?;
+        // The sample fixture supports direct forward upgrades from each earlier sample release.
+        let graph_path = dir.join("application.json");
+        let mut graph: updated_contracts::releases::ReleaseGraph = if graph_path.exists() {
+            serde_json::from_slice(&std::fs::read(&graph_path).map_err(str_err)?)
+                .map_err(str_err)?
+        } else {
+            updated_contracts::releases::ReleaseGraph {
+                target: version.into(),
+                releases: Default::default(),
+            }
+        };
+        let predecessors = graph
+            .releases
+            .keys()
+            .filter(|from| {
+                updated_contracts::identity::parse_release_version(from)
+                    < updated_contracts::identity::parse_release_version(version)
+            })
+            .cloned()
+            .collect();
+        graph.releases.insert(
+            version.into(),
+            updated_contracts::releases::Release {
+                package: updated_contracts::artifact::TargetReference {
+                    path: target,
+                    sha256: sha,
+                },
+                installable: true,
+                rollback_from: Default::default(),
+                upgrade_from: predecessors,
+            },
+        );
+        graph.target = version.into();
+        std::fs::write(graph_path, serde_json::to_vec(&graph).map_err(str_err)?)
+            .map_err(str_err)?;
         if let Ok(addr) = std::fs::read_to_string(dir.join("assignment-addr")) {
             self.publish_current_assignment(dir, addr.trim(), version)?;
         }
@@ -832,12 +870,6 @@ fn spawn_grouped(mut cmd: Command) -> R<foundation::process::ContainedChild> {
 
 // -------------------------------- subprocess --------------------------------
 
-fn cargo(root: &Path, args: &[&str]) -> R {
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.current_dir(root).args(args);
-    run(cmd)
-}
-
 /// Run a command to completion, failing on a non-zero exit.
 pub fn run(cmd: Command) -> R {
     run_before(cmd, Instant::now() + Duration::from_secs(EVENT_TIMEOUT))
@@ -923,7 +955,7 @@ pub fn dump_install_state(work: &Path) -> String {
             })
             .unwrap_or_else(|| "none".into());
         // `maturity=provisional` marks a cold-install head still awaiting its first passing health
-        // gate — the state that drives the cold-install-fallback descent.
+        // gate — the state that requires explicit recovery after rejection.
         let maturity = installed_doc
             .as_ref()
             .and_then(|doc| doc.get("maturity")?.as_str())

@@ -40,10 +40,10 @@ pub fn offline_source(repo_dir: &Path) -> RepositorySource {
         target_limit: 100 * 1024 * 1024,
         transport_timeout: Duration::from_secs(5),
         access: RepositoryAccess::Direct,
-        mtls: updated::tls::Identity::new(
+        mtls: Some(updated::tls::Identity::new(
             repo_dir.join("client.crt"),
             repo_dir.join("client.key"),
             repo_dir.join("ca.crt"),
-        ),
+        )),
     }
 }

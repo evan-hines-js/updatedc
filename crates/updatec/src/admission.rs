@@ -51,7 +51,12 @@ pub struct AdmissionSubject {
 }
 
 impl AdmissionSubject {
-    pub(crate) fn for_deployment(deployment: &DesiredDeployment) -> Self {
+    #[cfg(test)]
+    fn for_deployment(deployment: &DesiredDeployment) -> Self {
+        Self::for_package(&deployment.application.target_reference().unwrap().sha256)
+    }
+
+    fn for_package(sha256: &str) -> Self {
         // WIRE CONTRACT — these exact bytes are reproduced by the other side.
         //
         // Draupnir recomputes this digest on ingest and refuses any request whose subject id does
@@ -76,12 +81,12 @@ impl AdmissionSubject {
 
         let facts = Facts {
             schema: ADMISSION_SCHEMA,
-            application_sha256: &deployment.application.sha256,
+            application_sha256: sha256,
         };
         let encoded = serde_json::to_vec(&facts).expect("admission facts contain only strings");
         Self {
             id: updated_contracts::digest::sha256_bytes(&encoded),
-            application_sha256: deployment.application.sha256.clone(),
+            application_sha256: sha256.to_owned(),
         }
     }
 }
@@ -339,8 +344,21 @@ impl AdmissionEvaluation {
     /// the rest of this same value; there is no second boolean decision path that can drift from
     /// what operators see.
     pub(crate) fn status(&self, deployment: &DesiredDeployment) -> Option<AdmissionStatus> {
+        self.package_status(
+            &deployment
+                .application
+                .target_reference()
+                .expect("validated deployment")
+                .sha256,
+        )
+    }
+
+    pub(crate) fn package_status(&self, sha256: &str) -> Option<AdmissionStatus> {
+        self.subject_status(&AdmissionSubject::for_package(sha256))
+    }
+
+    fn subject_status(&self, subject: &AdmissionSubject) -> Option<AdmissionStatus> {
         let policy = self.policy_name.as_deref()?;
-        let subject = AdmissionSubject::for_deployment(deployment);
         let revision = self.revision.as_deref().unwrap_or("unavailable");
         let Some(actions) = self.actions else {
             return Some(AdmissionStatus {
@@ -485,7 +503,13 @@ pub(crate) async fn evaluate(
         return AdmissionEvaluation::disabled();
     };
     let subjects: BTreeMap<String, AdmissionSubject> = deployments
-        .map(AdmissionSubject::for_deployment)
+        .flat_map(|deployment| {
+            deployment
+                .application
+                .releases
+                .values()
+                .map(|release| AdmissionSubject::for_package(&release.package.sha256))
+        })
         .map(|subject| (subject.id.clone(), subject))
         .collect();
     let policy = match policies.get(policy_name).await {
@@ -839,6 +863,56 @@ mod tests {
     }
 
     #[test]
+    fn route_packages_use_the_same_policy_verdict_without_blocking_escape_from_an_old_release() {
+        let mut deployment: DesiredDeployment =
+            crate::tests::deployment_spec("v2").try_into().unwrap();
+        let source = deployment.application.releases.remove("1.0.0").unwrap();
+        let mut target = source.clone();
+        target.package.sha256 = "2".repeat(64);
+        target.upgrade_from.insert("1.0.0".into());
+        deployment
+            .application
+            .releases
+            .insert("1.0.0".into(), source.clone());
+        deployment
+            .application
+            .releases
+            .insert("2.0.0".into(), target.clone());
+        deployment.application.target = "2.0.0".into();
+        let mut evaluation = evaluation(
+            &deployment,
+            AdmissionVerdict::Compliant,
+            actions(AdmissionAction::Block, AdmissionAction::Block),
+        );
+        let old = AdmissionSubject::for_package(&source.package.sha256);
+        evaluation.decisions.insert(
+            old.id.clone(),
+            SubjectDecision {
+                subject_id: old.id,
+                verdict: AdmissionVerdict::NonCompliant,
+                reason: None,
+            },
+        );
+        assert!(
+            evaluation.status(&deployment).unwrap().allowed,
+            "the destination permits upgrading away from a noncompliant source"
+        );
+        assert!(
+            !evaluation
+                .package_status(&source.package.sha256)
+                .unwrap()
+                .allowed,
+            "fresh installation through that source is refused"
+        );
+        assert!(
+            evaluation
+                .package_status(&target.package.sha256)
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
     fn noncompliant_and_no_information_actions_are_independent() {
         let deployment = crate::tests::deployment_spec("v1").try_into().unwrap();
         let policy = actions(AdmissionAction::Block, AdmissionAction::Allow);
@@ -1069,7 +1143,13 @@ mod tests {
             "a fresh complete set is reused"
         );
 
-        first.application.sha256 = "3".repeat(64);
+        first
+            .application
+            .releases
+            .get_mut(&first.application.target)
+            .unwrap()
+            .package
+            .sha256 = "3".repeat(64);
         query
             .subjects
             .push(AdmissionSubject::for_deployment(&first));
@@ -1152,7 +1232,13 @@ mod tests {
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        deployment.application.sha256 = "4".repeat(64);
+        deployment
+            .application
+            .releases
+            .get_mut(&deployment.application.target)
+            .unwrap()
+            .package
+            .sha256 = "4".repeat(64);
         query
             .subjects
             .push(AdmissionSubject::for_deployment(&deployment));

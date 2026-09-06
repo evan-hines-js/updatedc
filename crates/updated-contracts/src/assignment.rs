@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::TargetReference;
+use crate::releases::ReleaseGraph;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -23,8 +23,7 @@ pub struct RepositoryAssignment {
     pub deployment: String,
     pub metadata_url: String,
     pub targets_url: String,
-    pub application: TargetReference,
-    pub cold_install_fallback: bool,
+    pub application: ReleaseGraph,
     pub release_root: serde_json::Value,
     pub runtime: ManagedRuntime,
 }
@@ -75,9 +74,25 @@ pub struct ManagedTimeouts {
 }
 
 impl RepositoryAssignment {
+    /// Restore an earlier deployment's configuration using the current catalog's explicit
+    /// return edges. Historical snapshots cannot know about releases published after them.
+    pub fn rollback_to(&self, previous: &Self) -> Result<Self, String> {
+        let version = &previous.application.target;
+        self.application
+            .check_source(version, &previous.application.target_reference()?.sha256)?;
+        let mut restored = previous.clone();
+        restored.application = self.application.clone();
+        restored.application.target = version.clone();
+        restored.validate()?;
+        restored
+            .application
+            .route(Some(&self.application.target), |_, _| true)?;
+        Ok(restored)
+    }
+
     /// The one assignment shape this build reads and writes. Every nested struct denies unknown
     /// fields, and validation requires exact schema equality; no compatibility or alias path exists.
-    pub const SCHEMA: u32 = 5;
+    pub const SCHEMA: u32 = 6;
     /// Whole signed configuration ceiling. The bounded input selection is at most one dataflow
     /// document; the additional MiB covers the pinned TUF root and fixed runtime fields.
     pub const MAX_DOCUMENT_BYTES: usize = crate::dataflow::MAX_DATAFLOW_BODY_BYTES + 1024 * 1024;
@@ -100,9 +115,7 @@ impl RepositoryAssignment {
             canonical_repository_base(location)
                 .map_err(|error| format!("repository assignment {name} is invalid: {error}"))?;
         }
-        if !self.application.is_valid() {
-            return Err("repository assignment application reference is invalid".into());
-        }
+        self.application.validate()?;
         if !self.release_root.is_object() {
             return Err("repository assignment releaseRoot must be a JSON object".into());
         }
@@ -431,7 +444,6 @@ pub mod testing {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::artifact::TargetReference;
 
     use testing::runtime;
 
@@ -450,11 +462,14 @@ mod tests {
             deployment: "d1".into(),
             metadata_url: "https://cdn/m/".into(),
             targets_url: "https://cdn/t/".into(),
-            application: TargetReference {
-                path: "app".into(),
-                sha256: "a".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: crate::releases::testing::install(
+                "1.0.0",
+                crate::artifact::TargetReference {
+                    path: "app".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: runtime(),
         }
@@ -463,6 +478,78 @@ mod tests {
     #[test]
     fn shared_runtime_fixture_is_valid_on_the_host_platform() {
         runtime().validate().expect("shared runtime fixture");
+    }
+
+    #[test]
+    fn rollback_restores_prior_configuration_with_newly_published_return_hops() {
+        let previous = assignment();
+        let mut current = previous.clone();
+        current.deployment = "new-deployment".into();
+        current.runtime.timeouts.check_interval_seconds += 1;
+        for (from, to, digest) in [("1.0.0", "2.0.0", "b"), ("2.0.0", "3.0.0", "c")] {
+            current
+                .application
+                .releases
+                .get_mut(from)
+                .unwrap()
+                .rollback_from
+                .insert(to.into());
+            current.application.releases.insert(
+                to.into(),
+                crate::releases::Release {
+                    package: crate::artifact::TargetReference {
+                        path: format!("app-{to}"),
+                        sha256: digest.repeat(64),
+                    },
+                    upgrade_from: std::collections::BTreeSet::from([from.into()]),
+                    rollback_from: Default::default(),
+                    installable: false,
+                },
+            );
+        }
+        current.application.target = "3.0.0".into();
+        let restored = current.rollback_to(&previous).unwrap();
+        assert_eq!(restored.deployment, previous.deployment);
+        assert_eq!(restored.runtime, previous.runtime);
+        assert_eq!(
+            restored
+                .application
+                .route(Some("3.0.0"), |_, _| true)
+                .unwrap(),
+            ["2.0.0", "1.0.0"]
+        );
+        assert_eq!(previous.application.releases.len(), 1);
+
+        let return_edges = std::mem::take(
+            &mut current
+                .application
+                .releases
+                .get_mut("2.0.0")
+                .unwrap()
+                .rollback_from,
+        );
+        assert!(
+            current.rollback_to(&previous).is_err(),
+            "matching historical bytes do not establish a supported return route"
+        );
+        current
+            .application
+            .releases
+            .get_mut("2.0.0")
+            .unwrap()
+            .rollback_from = return_edges;
+
+        current
+            .application
+            .releases
+            .get_mut("1.0.0")
+            .unwrap()
+            .package
+            .sha256 = "d".repeat(64);
+        assert!(
+            current.rollback_to(&previous).is_err(),
+            "a return must retain the exact baseline package identity"
+        );
     }
 
     #[test]
@@ -838,7 +925,19 @@ mod tests {
             );
             assert_eq!(
                 schema["properties"]["application"]["$ref"],
-                Value::from("https://updated.dev/schemas/target-reference.schema.json"),
+                Value::from("#/$defs/releaseGraph"),
+            );
+            let graph = &schema["$defs"]["releaseGraph"];
+            assert_object(graph, &value.application, &[], "release graph");
+            assert_eq!(
+                graph["properties"]["releases"]["maxProperties"],
+                crate::releases::MAX_RELEASES
+            );
+            assert_object(
+                &graph["properties"]["releases"]["additionalProperties"],
+                value.application.releases.values().next().unwrap(),
+                &["installable", "upgradeFrom", "rollbackFrom"],
+                "release",
             );
             // `validate` demands a JSON object here, so the schema must not admit a bare string.
             assert_eq!(schema["properties"]["releaseRoot"]["type"], "object");

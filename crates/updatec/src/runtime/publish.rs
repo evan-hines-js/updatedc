@@ -19,13 +19,12 @@ pub async fn publish_repository(
     // such content-addressed object is already at this exact destination before writing anything;
     // otherwise the new metadata would commit a target no client can download.
     for target in &plan.retained_targets {
-        let relative = target
-            .path
-            .strip_prefix(repository_dir)
-            .map_err(|e| StorageError(format!("invalid retained repository path: {e}")))?;
+        let relative = target.path.strip_prefix(repository_dir).map_err(|e| {
+            StorageError::Operation(format!("invalid retained repository path: {e}"))
+        })?;
         let key = repository_object_key(&destination.prefix, relative)?;
         let digest = content_addressed_target_digest(relative)?.ok_or_else(|| {
-            StorageError(format!(
+            StorageError::Operation(format!(
                 "retained repository object {} is not below targets/",
                 relative.display()
             ))
@@ -33,21 +32,20 @@ pub async fn publish_repository(
         verify_remote_target(store, &key, relative, &digest, target.length)
             .await
             .map_err(|error| {
-                StorageError(format!(
+                StorageError::Operation(format!(
                     "retained target {} failed its signed length and digest check: {error}",
                     relative.display()
                 ))
             })?;
     }
-    let (timestamp, uploads) = plan
-        .uploads
-        .split_last()
-        .ok_or_else(|| StorageError("publication plan has no timestamp commit".into()))?;
+    let (timestamp, uploads) = plan.uploads.split_last().ok_or_else(|| {
+        StorageError::Operation("publication plan has no timestamp commit".into())
+    })?;
     let timestamp_relative = timestamp
         .strip_prefix(repository_dir)
-        .map_err(|error| StorageError(format!("invalid timestamp path: {error}")))?;
+        .map_err(|error| StorageError::Operation(format!("invalid timestamp path: {error}")))?;
     if timestamp_relative != Path::new("metadata/timestamp.json") {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "publication plan's final object is {}, not metadata/timestamp.json",
             timestamp_relative.display()
         )));
@@ -59,10 +57,10 @@ pub async fn publish_repository(
     for file in uploads {
         let relative = file
             .strip_prefix(repository_dir)
-            .map_err(|e| StorageError(format!("invalid repository path: {e}")))?;
+            .map_err(|e| StorageError::Operation(format!("invalid repository path: {e}")))?;
         if relative == Path::new("metadata/root.json") {
             if root_file.replace(file.as_path()).is_some() {
-                return Err(StorageError(
+                return Err(StorageError::Operation(
                     "publication plan contains more than one metadata/root.json".into(),
                 ));
             }
@@ -71,21 +69,22 @@ pub async fn publish_repository(
         if let Some(expected) = content_addressed_target_digest(relative)? {
             let (actual, length) = sha256_local_regular(file).await?;
             if actual != expected {
-                return Err(StorageError(format!(
+                return Err(StorageError::Operation(format!(
                     "publication target {} hashes to {actual}, not the {expected} encoded in its object name",
                     relative.display()
                 )));
             }
             validated_targets.insert(relative.to_path_buf(), length);
         } else if !relative.starts_with("metadata") {
-            return Err(StorageError(format!(
+            return Err(StorageError::Operation(format!(
                 "publication object {} is outside metadata/ and targets/",
                 relative.display()
             )));
         }
     }
-    let root_file = root_file
-        .ok_or_else(|| StorageError("publication plan has no metadata/root.json".into()))?;
+    let root_file = root_file.ok_or_else(|| {
+        StorageError::Operation("publication plan has no metadata/root.json".into())
+    })?;
     let root_key = crate::object_key(&destination.prefix, "metadata/root.json");
 
     // Capture BOTH mutable-object versions before the first write. Versioned metadata is
@@ -101,14 +100,14 @@ pub async fn publish_repository(
     for file in uploads {
         let relative = file
             .strip_prefix(repository_dir)
-            .map_err(|e| StorageError(format!("invalid repository path: {e}")))?;
+            .map_err(|e| StorageError::Operation(format!("invalid repository path: {e}")))?;
         if relative == Path::new("metadata/root.json") {
             continue;
         }
         let key = repository_object_key(&destination.prefix, relative)?;
         if let Some(length) = validated_targets.get(relative) {
             let expected = content_addressed_target_digest(relative)?.ok_or_else(|| {
-                StorageError(format!(
+                StorageError::Operation(format!(
                     "validated target {} lost its content-addressed identity",
                     relative.display()
                 ))
@@ -140,13 +139,13 @@ fn repository_object_key(
     let mut parts = Vec::new();
     for component in relative.components() {
         let std::path::Component::Normal(part) = component else {
-            return Err(StorageError(format!(
+            return Err(StorageError::Operation(format!(
                 "repository object path is not relative and normalized: {}",
                 relative.display()
             )));
         };
         let part = part.to_str().ok_or_else(|| {
-            StorageError(format!(
+            StorageError::Operation(format!(
                 "repository object path is not UTF-8: {}",
                 relative.display()
             ))
@@ -154,7 +153,9 @@ fn repository_object_key(
         parts.push(part);
     }
     if parts.is_empty() {
-        return Err(StorageError("repository object path is empty".into()));
+        return Err(StorageError::Operation(
+            "repository object path is empty".into(),
+        ));
     }
     Ok(crate::object_key(prefix, &parts.join("/")))
 }
@@ -175,14 +176,16 @@ pub(crate) async fn prepare_conditional_publication_file(
 ) -> Result<ConditionalPublicationFile, StorageError> {
     let bytes = read_local_bounded(file, LOCAL_TUF_METADATA_MAX_BYTES)
         .await
-        .map_err(|error| StorageError(format!("reading {}: {error}", file.display())))?;
+        .map_err(|error| StorageError::Operation(format!("reading {}: {error}", file.display())))?;
     match store.get(key).await {
         Ok(current) => {
             let (metadata, previous) =
                 crate::collect_object_bounded(current, key, LOCAL_TUF_METADATA_MAX_BYTES as u64)
                     .await
                     .map_err(|error| {
-                        StorageError(format!("reading current publication object {key}: {error}"))
+                        StorageError::Operation(format!(
+                            "reading current publication object {key}: {error}"
+                        ))
                     })?;
             Ok(ConditionalPublicationFile {
                 file: file.to_path_buf(),
@@ -200,7 +203,7 @@ pub(crate) async fn prepare_conditional_publication_file(
             previous: None,
             mode: PutMode::Create,
         }),
-        Err(error) => Err(StorageError(format!(
+        Err(error) => Err(StorageError::Operation(format!(
             "reading current publication object {key}: {error}"
         ))),
     }
@@ -211,7 +214,7 @@ pub(crate) fn validate_timestamp_transition(
     write: &ConditionalPublicationFile,
 ) -> Result<(), StorageError> {
     let local_version = signed_version(&write.bytes).ok_or_else(|| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "local publication timestamp {} has no signed.version",
             write.file.display()
         ))
@@ -220,17 +223,17 @@ pub(crate) fn validate_timestamp_transition(
         return Ok(());
     };
     let remote_version = signed_version(previous).ok_or_else(|| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "current publication timestamp {key} has no signed.version"
         ))
     })?;
     if remote_version > local_version {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "refusing to replace publication generation {remote_version} with older local generation {local_version}"
         )));
     }
     if remote_version == local_version && previous != write.bytes {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "publication generation {local_version} already exists with different signed bytes"
         )));
     }
@@ -263,10 +266,10 @@ pub(crate) async fn commit_conditional_publication_file(
         Err(
             error @ (object_store::Error::AlreadyExists { .. }
             | object_store::Error::Precondition { .. }),
-        ) => Err(StorageError(format!(
+        ) => Err(StorageError::Operation(format!(
             "publication {role} {key} changed while this generation was uploading; another writer won the fence: {error}"
         ))),
-        Err(error) => Err(StorageError(format!(
+        Err(error) => Err(StorageError::Operation(format!(
             "committing publication {role} {}: {error}",
             write.file.display()
         ))),
@@ -284,7 +287,7 @@ pub(crate) async fn publish_immutable_metadata(
 ) -> Result<(), StorageError> {
     let bytes = read_local_bounded(file, LOCAL_TUF_METADATA_MAX_BYTES)
         .await
-        .map_err(|error| StorageError(format!("reading {}: {error}", file.display())))?;
+        .map_err(|error| StorageError::Operation(format!("reading {}: {error}", file.display())))?;
     let payload = bytes.clone();
     match store
         .put_opts(key, PutPayload::from(payload), PutMode::Create.into())
@@ -296,7 +299,7 @@ pub(crate) async fn publish_immutable_metadata(
                 crate::read_object_bounded(store, key, LOCAL_TUF_METADATA_MAX_BYTES as u64)
                     .await
                     .map_err(|error| {
-                        StorageError(format!(
+                        StorageError::Operation(format!(
                             "reading existing immutable metadata {}: {error}",
                             relative.display()
                         ))
@@ -304,13 +307,28 @@ pub(crate) async fn publish_immutable_metadata(
             if existing == bytes {
                 Ok(())
             } else {
-                Err(StorageError(format!(
+                let message = format!(
                     "immutable metadata {} already exists with different bytes",
                     relative.display()
-                )))
+                );
+                // Only online roles can recover by signing a later generation. A root conflict
+                // belongs to trust management and must never trigger automatic re-signing.
+                let online = relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.split_once('.'))
+                    .is_some_and(|(version, role)| {
+                        version.parse::<u64>().is_ok()
+                            && matches!(role, "targets.json" | "snapshot.json")
+                    });
+                Err(if online {
+                    StorageError::OnlineMetadataConflict(message)
+                } else {
+                    StorageError::Operation(message)
+                })
             }
         }
-        Err(error) => Err(StorageError(format!(
+        Err(error) => Err(StorageError::Operation(format!(
             "creating immutable metadata {}: {error}",
             relative.display()
         ))),
@@ -324,7 +342,7 @@ pub(crate) fn content_addressed_target_digest(
         return Ok(None);
     };
     let target = target.to_str().ok_or_else(|| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "publication target path {} is not UTF-8",
             relative.display()
         ))
@@ -333,13 +351,13 @@ pub(crate) fn content_addressed_target_digest(
         .split_once('.')
         .map(|(digest, _)| digest)
         .ok_or_else(|| {
-            StorageError(format!(
+            StorageError::Operation(format!(
                 "publication target {} has no content-address digest",
                 relative.display()
             ))
         })?;
     if !updated_contracts::is_canonical_sha256(digest) {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "publication target {} has a non-canonical SHA-256 object name",
             relative.display()
         )));
@@ -353,22 +371,21 @@ pub(crate) async fn sha256_local_regular(file: &Path) -> Result<(String, u64), S
         foundation::file::open_regular(&path, foundation::file::FinalSymlink::Refuse)
     })
     .await
-    .map_err(|error| StorageError(format!("opening {}: {error}", file.display())))?
-    .map_err(|error| StorageError(format!("opening {}: {error}", file.display())))?;
+    .map_err(|error| StorageError::Operation(format!("opening {}: {error}", file.display())))?
+    .map_err(|error| StorageError::Operation(format!("opening {}: {error}", file.display())))?;
     let mut source = tokio::fs::File::from_std(opened);
     let mut digest = updated_contracts::digest::Sha256Hasher::new();
     let mut length = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
-        let read = source
-            .read(&mut buffer)
-            .await
-            .map_err(|error| StorageError(format!("hashing {}: {error}", file.display())))?;
+        let read = source.read(&mut buffer).await.map_err(|error| {
+            StorageError::Operation(format!("hashing {}: {error}", file.display()))
+        })?;
         if read == 0 {
             break;
         }
         length = length.checked_add(read as u64).ok_or_else(|| {
-            StorageError(format!(
+            StorageError::Operation(format!(
                 "publication target {} is too large",
                 file.display()
             ))
@@ -386,13 +403,13 @@ pub(crate) async fn verify_remote_target(
     expected_length: u64,
 ) -> Result<(), StorageError> {
     let result = store.get(key).await.map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "content-addressed target {} is absent from the publication destination: {error}",
             relative.display()
         ))
     })?;
     if result.meta.size != expected_length {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "target {} is {} bytes at the publication destination, but its signed/local length is {expected_length} bytes",
             relative.display(),
             result.meta.size
@@ -403,16 +420,18 @@ pub(crate) async fn verify_remote_target(
     let mut stream = result.into_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            StorageError(format!(
+            StorageError::Operation(format!(
                 "reading content-addressed target {}: {error}",
                 relative.display()
             ))
         })?;
         actual_length = actual_length
             .checked_add(chunk.len() as u64)
-            .ok_or_else(|| StorageError(format!("target {} is too large", relative.display())))?;
+            .ok_or_else(|| {
+                StorageError::Operation(format!("target {} is too large", relative.display()))
+            })?;
         if actual_length > expected_length {
-            return Err(StorageError(format!(
+            return Err(StorageError::Operation(format!(
                 "target {} streamed more than its {expected_length}-byte signed/local length",
                 relative.display()
             )));
@@ -421,7 +440,7 @@ pub(crate) async fn verify_remote_target(
     }
     let actual_digest = digest.finish_hex();
     if actual_length != expected_length || actual_digest != expected_digest {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "target {} at the publication destination has SHA-256 {actual_digest} and length {actual_length}; expected {expected_digest} and {expected_length}",
             relative.display()
         )));
@@ -444,7 +463,7 @@ pub(crate) async fn publish_content_addressed_target(
         }
         Err(object_store::Error::NotFound { .. }) => {}
         Err(error) => {
-            return Err(StorageError(format!(
+            return Err(StorageError::Operation(format!(
                 "probing content-addressed target {}: {error}",
                 relative.display()
             )));
@@ -470,13 +489,12 @@ pub(crate) async fn upload_repository_file(
         foundation::file::open_regular(&path, foundation::file::FinalSymlink::Refuse)
     })
     .await
-    .map_err(|error| StorageError(format!("opening {}: {error}", file.display())))?
-    .map_err(|error| StorageError(format!("opening {}: {error}", file.display())))?;
+    .map_err(|error| StorageError::Operation(format!("opening {}: {error}", file.display())))?
+    .map_err(|error| StorageError::Operation(format!("opening {}: {error}", file.display())))?;
     let mut source = tokio::fs::File::from_std(opened);
-    let mut upload = store
-        .put_multipart(key)
-        .await
-        .map_err(|error| StorageError(format!("starting upload of {}: {error}", file.display())))?;
+    let mut upload = store.put_multipart(key).await.map_err(|error| {
+        StorageError::Operation(format!("starting upload of {}: {error}", file.display()))
+    })?;
     upload_repository_parts(&mut source, upload.as_mut(), file).await
 }
 
@@ -535,7 +553,7 @@ pub(crate) async fn abort_failed_upload(
     error: &dyn std::fmt::Display,
 ) -> StorageError {
     let cleanup = upload.abort().await.err();
-    StorageError(format!(
+    StorageError::Operation(format!(
         "{operation} for {}: {error}{}",
         file.display(),
         cleanup.map_or_else(String::new, |cleanup| format!(
@@ -545,7 +563,7 @@ pub(crate) async fn abort_failed_upload(
 }
 
 pub(crate) fn from_publish(error: PublishError) -> StorageError {
-    StorageError(error.to_string())
+    StorageError::Operation(error.to_string())
 }
 
 /// The generation the object store is currently serving, read from the `version` of its published
@@ -568,10 +586,16 @@ pub(crate) async fn store_published_version(
     let bytes = match crate::read_object_bounded(store, &key, crate::OBJECT_BYTES_LIMIT).await {
         Ok(bytes) => bytes,
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(e) => return Err(StorageError(format!("probing published metadata: {e}"))),
+        Err(e) => {
+            return Err(StorageError::Operation(format!(
+                "probing published metadata: {e}"
+            )))
+        }
     };
     signed_version(&bytes)
-        .ok_or_else(|| StorageError("published timestamp.json has no signed.version".into()))
+        .ok_or_else(|| {
+            StorageError::Operation("published timestamp.json has no signed.version".into())
+        })
         .map(Some)
 }
 
@@ -599,7 +623,7 @@ pub(crate) async fn refuse_generation_rollback(
         return Ok(()); // nothing is served, so nothing can be rolled back.
     };
     if !foundation::file::path_entry_exists(&repo_dir.join("metadata/root.json"))? {
-        return Err(Box::new(StorageError(
+        return Err(Box::new(StorageError::Operation(
             "local publisher state is empty but the object store already holds a published \
              generation; refusing to re-initialize a v1 TUF repo (restore the state volume)"
                 .into(),
@@ -607,7 +631,7 @@ pub(crate) async fn refuse_generation_rollback(
     }
     let local = updated_tuf::repo::current_version(repo_dir).await?;
     if local < published {
-        return Err(Box::new(StorageError(format!(
+        return Err(Box::new(StorageError::Operation(format!(
             "local publisher state is at TUF generation {local} but the object store already \
              serves {published}; refusing to publish a lower generation every node would reject as \
              a rollback (restore the state volume of the replica that published {published})"
@@ -731,7 +755,7 @@ impl PublicationMarker {
         {
             Ok(())
         } else {
-            Err(StorageError(
+            Err(StorageError::Operation(
                 "publication marker contains a non-canonical SHA-256 identity".into(),
             ))
         }
@@ -739,10 +763,11 @@ impl PublicationMarker {
 
     pub(crate) fn to_bounded_json(&self) -> Result<Vec<u8>, StorageError> {
         self.validate()?;
-        let encoded = serde_json::to_vec(self)
-            .map_err(|error| StorageError(format!("encoding publication marker: {error}")))?;
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            StorageError::Operation(format!("encoding publication marker: {error}"))
+        })?;
         if encoded.len() > PUBLICATION_MARKER_MAX_BYTES {
-            return Err(StorageError(
+            return Err(StorageError::Operation(
                 "publication marker exceeds its fixed bound".into(),
             ));
         }
@@ -756,7 +781,7 @@ pub(crate) async fn optional_marker_file_sha256(
     match read_local_bounded(path, LOCAL_TUF_METADATA_MAX_BYTES).await {
         Ok(bytes) => Ok(Some(updated_contracts::digest::sha256_bytes(&bytes))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(StorageError(format!(
+        Err(error) => Err(StorageError::Operation(format!(
             "cannot read publication metadata {}: {error}",
             path.display()
         ))),
@@ -771,7 +796,7 @@ pub(crate) async fn publication_marker(
     digest: &str,
 ) -> Result<Option<PublicationMarker>, StorageError> {
     if !updated_contracts::is_canonical_sha256(digest) {
-        return Err(StorageError(
+        return Err(StorageError::Operation(
             "publication plan digest is not canonical SHA-256".into(),
         ));
     }
@@ -789,7 +814,7 @@ pub(crate) async fn publication_marker(
             marker.validate()?;
             Ok(Some(marker))
         }
-        _ => Err(StorageError(
+        _ => Err(StorageError::Operation(
             "local signed repository is partial: root.json and timestamp.json must exist together"
                 .into(),
         )),
@@ -803,14 +828,14 @@ pub(crate) async fn read_publication_marker(
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(StorageError(format!(
+            return Err(StorageError::Operation(format!(
                 "cannot read publication marker {}: {error}",
                 path.display()
             )));
         }
     };
     let marker: PublicationMarker = serde_json::from_slice(&bytes).map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "invalid publication marker {}: {error}",
             path.display()
         ))
@@ -915,6 +940,6 @@ mod tests {
         let path = Path::new(OsStr::from_bytes(b"targets/invalid-\xff"));
         let error = repository_object_key("releases", path).unwrap_err();
 
-        assert!(error.0.contains("not UTF-8"));
+        assert!(error.to_string().contains("not UTF-8"));
     }
 }

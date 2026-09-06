@@ -259,8 +259,7 @@ impl Store {
                 "refusing to overwrite corrupt installed state",
             )),
             Installed::Present(current)
-                if self.install_fallback_commit_is_authorized(&current, next)?
-                    || Self::metadata_transition_is_authorized(&current, next)
+                if Self::metadata_transition_is_authorized(&current, next)
                     || self.pending_rollback_is_authorized(&current, next)
                     || self.journal_transition_is_authorized(&current, next)? =>
             {
@@ -283,27 +282,6 @@ impl Store {
         ) && tx.matches_installed(next)
             && next.rollback_guard.is_none()
             && !next.is_proven())
-    }
-
-    /// The one executable replacement first install may perform: descend from a rejected,
-    /// never-confirmed head through another exact install transaction. The old record stays
-    /// authoritative until the fallback is placed and committed, so a crash never creates an
-    /// enrollment-without-installed-state hole.
-    fn install_fallback_commit_is_authorized(
-        &self,
-        current: &InstalledState,
-        next: &InstalledState,
-    ) -> io::Result<bool> {
-        Ok(!current.is_proven()
-            && current.rollback_guard.is_none()
-            && self.journal()?.is_none()
-            && (self.rejection_is_durable(&current.repository_lineage, &current.archive_sha256)
-                || updated_contracts::digest::deployment_rejection_sha256(&current.archive_sha256)
-                    .is_some_and(|digest| {
-                        self.rejection_is_durable(&current.repository_lineage, &digest)
-                    }))
-            && !self.rejects_deployment(&next.repository_lineage, &next.archive_sha256)
-            && self.install_commit_is_authorized(next)?)
     }
 
     /// The only journal-free rewrites of an existing record: exact replay, a lineage-only rebind,
@@ -784,9 +762,8 @@ impl Store {
         self.record_install_journal(tx)
     }
 
-    /// A fresh install starts either on a truly empty node or as cold-install fallback from the one
-    /// installed state that has no rollback predecessor: a rejected provisional head. Both use
-    /// this same journal and commit grammar; no clearing/reseeding side path exists between them.
+    /// First installation starts only on an empty managed installation. Failed provisional
+    /// installs retain their evidence and require recovery; rejection never grants reinstall.
     fn install_start_is_authorized(&self, tx: &InstallTransaction) -> io::Result<bool> {
         if tx.phase != updated::install::InstallPhase::Started
             || self.rejects_deployment(&tx.repository_lineage, &tx.archive_sha256)
@@ -796,14 +773,7 @@ impl Store {
         let active = self.active_release()?;
         Ok(match self.installed()? {
             Installed::Missing => active.is_none(),
-            Installed::Present(current) => {
-                !current.is_proven()
-                    && current.rollback_guard.is_none()
-                    && active.as_ref() == Some(&current.release)
-                    && self.rejects_deployment(&current.repository_lineage, &current.archive_sha256)
-                    && !tx.matches_installed(&current)
-            }
-            Installed::Invalid => false,
+            Installed::Present(_) | Installed::Invalid => false,
         })
     }
 
@@ -1057,60 +1027,38 @@ mod tests {
     }
 
     #[test]
-    fn rejected_provisional_fallback_uses_the_same_install_transaction() {
-        let head_tx = install_transaction('1', InstallPhase::Started);
+    fn rejection_never_authorizes_reinstalling_an_existing_release() {
+        let tx = install_transaction('1', InstallPhase::Started);
         let head = InstalledState::provisional(
-            head_tx.repository_lineage.clone(),
-            head_tx.release,
-            head_tx.archive_sha256,
-            head_tx.reconciler,
+            tx.repository_lineage,
+            tx.release,
+            tx.archive_sha256,
+            tx.reconciler,
         );
-        let mut fallback = install_transaction('2', InstallPhase::Started);
-        fallback.release.version = "0.9.0".into();
-        fallback.release.manifest_sha256 = "e".repeat(64);
-        fallback.archive_sha256 = "f".repeat(64);
+        let mut replacement = install_transaction('2', InstallPhase::Started);
+        replacement.release.version = "0.9.0".into();
+        replacement.archive_sha256 = "f".repeat(64);
         let mut store = Store::memory(MemoryBackend {
             installed: Some(head.clone()),
             active: Some(head.release.clone()),
-            ..MemoryBackend::default()
+            ..Default::default()
         });
-
-        assert!(
-            store.write_install_journal(&fallback).is_err(),
-            "a healthy provisional head is not replaceable through cold fallback"
-        );
+        assert!(store.write_install_journal(&replacement).is_err());
         store
             .reject_deployment(&head.repository_lineage, &head.archive_sha256)
             .unwrap();
-        assert!(
-            !store.is_rejected(&head.repository_lineage, &head.archive_sha256),
-            "a runtime failure must not poison reusable application bytes"
+        assert!(store.write_install_journal(&replacement).is_err());
+        // Even a planted later-phase first-install journal cannot replace committed evidence.
+        replacement.phase = InstallPhase::Placed;
+        store.memory_backend_mut().install_journal = Some(replacement.clone());
+        let next = InstalledState::provisional(
+            replacement.repository_lineage,
+            replacement.release,
+            replacement.archive_sha256,
+            replacement.reconciler,
         );
-        store
-            .write_install_journal(&fallback)
-            .expect("a rejected provisional head enters the ordinary install journal");
-        fallback.advance(InstallPhase::Prepared).unwrap();
-        store.write_install_journal(&fallback).unwrap();
-        store.activate(&fallback.release).unwrap();
-        fallback.advance(InstallPhase::Placed).unwrap();
-        store.write_install_journal(&fallback).unwrap();
-
-        let replacement = InstalledState::provisional(
-            fallback.repository_lineage.clone(),
-            fallback.release.clone(),
-            fallback.archive_sha256.clone(),
-            fallback.reconciler.clone(),
-        );
-        store
-            .commit_installed(&replacement)
-            .expect("the exact fallback transaction replaces only its rejected provisional head");
-        fallback.advance(InstallPhase::Committed).unwrap();
-        store.write_install_journal(&fallback).unwrap();
-        store.clear_install_journal().unwrap();
-        assert!(matches!(
-            store.installed().unwrap(),
-            Installed::Present(installed) if *installed == replacement
-        ));
+        assert!(store.commit_installed(&next).is_err());
+        assert_eq!(store.memory_backend().installed.as_ref(), Some(&head));
     }
 
     #[test]

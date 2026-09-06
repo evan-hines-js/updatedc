@@ -108,7 +108,8 @@ impl Identity {
 /// Redirects are refused and the rustls config has no client certificate, so neither the bearer
 /// token nor the node identity can escape to another host.
 pub fn anonymous_object_client() -> io::Result<reqwest::Client> {
-    anonymous_object_client_with_optional_ca(None)
+    let ca = std::env::var_os("SSL_CERT_FILE").map(std::path::PathBuf::from);
+    anonymous_object_client_with_optional_ca(ca.as_deref())
 }
 
 /// Anonymous HTTPS client for a bearer capability whose object store may use the fleet CA. This

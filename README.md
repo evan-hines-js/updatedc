@@ -13,14 +13,16 @@ payload and choose how to deploy it. Nodes verify the artifacts, execute under d
 and deadlines, check health, and report authenticated outcomes. Recovery follows the integration's
 explicit capabilities; restoring old files alone does not undo a database migration.
 
-Run your existing entrypoint in any language:
+Build and publish your custom software from CI:
 
 ```sh
-updatectl deploy --source ./package --entrypoint install.sh \
-  --product my-app --version 4.0.0 --group production
+updatectl publish --source ./package --entrypoint install.sh \
+  --product my-app --version 4.0.0
 ```
 
-With your repository and fleet configured, this packages, signs, and deploys the code. Add
+With the release repository configured, this packages, signs, and publishes the code, returning its
+immutable target path and digest. Select that reference in your `UpdateGroup` YAML to roll it out.
+CI does not need Kubernetes credentials. Add
 `--interpreter python3` or `--interpreter pwsh` when needed. The platform supplies execution metadata,
 protocol handling, durable receipts, deadlines, and process containment. No wrapper script or
 separate reconciler publication is required. The native runtime upgrades with the agent.
@@ -41,8 +43,9 @@ The system is split into deliberately narrow components:
   capabilities, accepts signed reports, and reconciles rollout state.
 - **`updated-healthproxy`** turns the control plane's pinned inventory and signed node health into
   EndpointSlice or HAProxy membership; it is not in the application data path.
-- **`updatectl`** is the operator CLI for key management, publication, deployment, and reconciler
-  conformance checks.
+- **`updatectl`** is the CI tool for package validation and publication: `check` and `publish`.
+  Operators manage desired deployments and rollout policy through Kubernetes YAML. See the
+  [CI publication workflow](docs/ci-publication.md).
 
 The control plane can never connect to a node. Everything flows through signed artifacts in shared
 storage: `updatec` publishes what each group *should* run, and each `updated` agent pulls,
@@ -51,7 +54,7 @@ and a node that cannot reach the repository keeps running the last verified bund
 
 ## What a deployment is
 
-A deployment names one immutable signed package. `updatectl deploy` places the selected entrypoint,
+A deployment names one immutable signed package. `updatectl publish` places the selected entrypoint,
 arguments, timeout, and optional health, inspection, replay, and recovery procedures inside it.
 
 The agent owns verification, durable ordering, retries, deadlines, containment, cancellation,
@@ -418,13 +421,13 @@ target/release/server publish-assignment --repo ./routing-repo --keys ./routing-
   --deployment deploy-42 \
   --metadata-url https://cdn.example.com/groups/canary/metadata/ \
   --targets-url https://cdn.example.com/groups/canary/targets/ \
-  --application-path products/app/stable/2.0.0/linux-x86_64/app \
-  --application-sha256 '<64 hex characters>' \
+  --application ./release-graph.json \
   --runtime ./signed-runtime.json
 ```
 
-In a real fleet, `updatec` performs this publication for every group automatically; the CLI is for
-development and for control planes built on other orchestrators.
+In a real fleet, `updatec` publishes assignments from the Kubernetes resources automatically.
+`server` is a development fixture. Operators declare the [release graph](docs/install-and-upgrade.md)
+in YAML and apply it with kubectl or GitOps; `updatectl` only checks and publishes CI packages.
 
 ## Scope and limitations
 

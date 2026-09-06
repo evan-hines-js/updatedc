@@ -3474,8 +3474,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "foundation",
- "futures",
- "kube",
  "object_store",
  "serde_json",
  "tempfile",

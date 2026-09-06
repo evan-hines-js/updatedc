@@ -95,6 +95,13 @@ decision signature, and so does a `decisionPublicKey` that is not a well-formed 
 for a newly seen subject fails; the new subject remains held. At 30 seconds, expired decisions hold
 movement until Draupnir responds again.
 
+Release graphs contribute their package identities to this same request. Before publication,
+preflight applies the same verdict to every executable version on a complete eligible route,
+including alternative branches. A noncompliant installed source can still upgrade to compliant
+releases: its pin identifies the starting state and does not authorize executing it again. Fresh
+installation through that package does require approval. Intermediate-package failures block the
+new generation before any node receives it.
+
 The resulting blocked deployment identities are unioned with updatec's evidence-derived regression
 halts. That one movement set controls first admission, in-progress batches, concurrency-slot
 accounting, cordoned nodes, greenfield nodes, and the unmatched default cohort. A block never rolls

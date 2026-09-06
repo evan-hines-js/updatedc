@@ -1,23 +1,61 @@
-use serde_json::json;
 use std::{path::PathBuf, process::Command};
 
 #[test]
 fn customer_payload_fixtures_run_through_the_real_conformance_harness() {
     let root = tempfile::tempdir().unwrap();
-    let procedure = |name| json!({"argv":[std::env::current_exe().unwrap(),"--exact",name,"--nocapture"],"timeoutSeconds":5});
-    for (name, expected) in [("candidate", "v2"), ("predecessor", "v1")] {
-        let payload = root.path().join(name);
+    let (name, interpreter, script) = if cfg!(windows) {
+        (
+            "run.ps1",
+            "powershell",
+            r#"$ErrorActionPreference = 'Stop'
+$actual = Join-Path $env:UPDATED_STATE_DIR 'actual'
+switch ($env:UPDATED_OPERATION) {
+  'converge' { Set-Content -NoNewline -Path $actual -Value 'v2' }
+  'rollback' { Set-Content -NoNewline -Path $actual -Value 'v1' }
+  'healthcheck' { if ((Get-Content -Raw $actual) -ceq (Get-Content -Raw 'expected')) { exit 0 }; exit 1 }
+  default { exit 1 }
+}
+"#,
+        )
+    } else {
+        (
+            "run.sh",
+            "sh",
+            r#"set -eu
+case "$UPDATED_OPERATION" in
+  converge) printf v2 > "$UPDATED_STATE_DIR/actual" ;;
+  rollback) printf v1 > "$UPDATED_STATE_DIR/actual" ;;
+  healthcheck) cmp -s "$UPDATED_STATE_DIR/actual" expected ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+    };
+    for (version, expected) in [("candidate", "v2"), ("predecessor", "v1")] {
+        let payload = root.path().join(version);
         std::fs::create_dir(&payload).unwrap();
         std::fs::write(payload.join("expected"), expected).unwrap();
-        std::fs::write(payload.join(".updated-execution.json"), json!({"schema":1,
-            "deploy":procedure("procedure_deploy"),"health":procedure("procedure_health"),"replay":{"policy":"safe"},
-            "recovery":{"policy":"command","command":procedure("procedure_recover"),"replay":{"policy":"safe"}}}).to_string()).unwrap();
+        std::fs::write(payload.join(name), script).unwrap();
     }
     let output = Command::new(env!("CARGO_BIN_EXE_updatectl"))
         .arg("check")
         .arg(root.path().join("candidate"))
         .arg("--against")
         .arg(root.path().join("predecessor"))
+        .args([
+            "--entrypoint",
+            name,
+            "--interpreter",
+            interpreter,
+            "--healthcheck",
+            name,
+            "--recover",
+            name,
+            "--replay",
+            "safe",
+            "--recovery-replay",
+            "safe",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -31,35 +69,6 @@ fn customer_payload_fixtures_run_through_the_real_conformance_harness() {
 fn state() -> Option<PathBuf> {
     std::env::var_os("UPDATED_STATE_DIR").map(PathBuf::from)
 }
-#[test]
-fn procedure_deploy() {
-    let Some(state) = state() else {
-        return;
-    };
-    std::fs::write(state.join("actual"), "v2").unwrap();
-}
-#[test]
-fn procedure_health() {
-    let Some(state) = state() else {
-        return;
-    };
-    let expected = std::fs::read("expected").unwrap();
-    std::process::exit(
-        if std::fs::read(state.join("actual")).unwrap_or_default() == expected {
-            0
-        } else {
-            1
-        },
-    );
-}
-#[test]
-fn procedure_recover() {
-    let Some(state) = state() else {
-        return;
-    };
-    std::fs::write(state.join("actual"), "v1").unwrap();
-}
-
 #[test]
 fn a_plain_entrypoint_needs_no_manifest_health_wrapper_or_published_runner() {
     let root = tempfile::tempdir().unwrap();

@@ -94,7 +94,7 @@ pub struct RepositorySource {
     /// an already-direct release repository. This is explicit so a client identity can never be
     /// offered to a host merely because it appeared in a signed release assignment.
     pub access: RepositoryAccess,
-    pub mtls: crate::tls::Identity,
+    pub mtls: Option<crate::tls::Identity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

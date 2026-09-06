@@ -1140,7 +1140,7 @@ pub async fn target_sha256_if_present(repo_dir: &Path, name: &str) -> Result<Opt
 /// repository's checked-out signed metadata, refusing at publish time what a node could only
 /// discover mid-rollout: a reference every syntactic check accepts but that resolves to nothing,
 /// or to different bytes than its digest names. The ONE implementation for every publisher-side
-/// reference (the provider-set reconciler above, `updatectl deploy`'s provider set), so the
+/// reference (the provider-set reconciler above, `updatectl publish`'s provider set), so the
 /// resolve-and-compare contract cannot drift between tools. `path_flag`/`sha_flag` name the
 /// operator's actual arguments and `names_differ`/`remedy` carry the call-site-specific operator
 /// text. Digests are compared as given, which is safe because there is only one spelling to

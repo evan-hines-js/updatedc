@@ -18,14 +18,7 @@ pub(crate) enum AppOutcome {
     RestartForRecovery,
 }
 
-fn is_self_version(installed: &updated::state::Installed, candidate: &str) -> bool {
-    matches!(
-        installed,
-        updated::state::Installed::Present(state) if state.release.version == candidate
-    )
-}
-
-/// Select, authorize, download, and apply the newest application target, if any.
+/// Plan the complete route, then authorize, download and apply its next hop.
 pub(crate) async fn check_application(
     opts: &Options,
     repo: &TrustedRepository,
@@ -45,9 +38,16 @@ pub(crate) async fn check_application(
             ));
         }
     };
-    let ordered_current = match &installed {
-        updated::state::Installed::Present(state) => state.version_floor_for(lineage),
-        updated::state::Installed::Missing | updated::state::Installed::Invalid => None,
+    let stance = match &installed {
+        updated::state::Installed::Present(state) => updated_tuf::select::Stance::Installed {
+            version: &state.release.version,
+            sha256: &state.archive_sha256,
+        },
+        _ => {
+            return AppOutcome::Fatal(
+                "upgrade planning requires a valid installed predecessor".into(),
+            )
+        }
     };
     // A persisted rejection applies to one malformed artifact or one exact failed deployment, so
     // it pins the installation neither below a healthy intermediate release nor against a new
@@ -56,9 +56,7 @@ pub(crate) async fn check_application(
         repository: repo,
         application: &opts.application,
         paths: &opts.paths,
-        stance: ordered_current.map_or(updated_tuf::select::Stance::Nothing, |version| {
-            updated_tuf::select::Stance::Installed(version)
-        }),
+        stance,
     };
     let selected =
         match crate::acquire::select_assigned_application(&request, |application_sha256| {
@@ -73,6 +71,18 @@ pub(crate) async fn check_application(
             }
         };
     let Some(selected) = selected else {
+        if let updated::state::Installed::Present(state) = &installed {
+            if let Some(rebound) = state.rebind_if_same_artifact(
+                lineage.clone(),
+                &state.release,
+                &state.archive_sha256,
+                &state.reconciler,
+            ) {
+                if let Err(error) = store.commit_installed(&rebound) {
+                    return AppOutcome::Fatal(format!("committing repository lineage: {error}"));
+                }
+            }
+        }
         return AppOutcome::Unchanged;
     };
     let prepared = match crate::acquire::prepare_assigned_application(&request, selected).await {
@@ -88,45 +98,6 @@ pub(crate) async fn check_application(
         }
     };
     let reconciler = prepared.reconciler.clone();
-    // Crossing repository lineages may legitimately select the exact bytes already
-    // running (notably when a freshly enrolled node joins its first group). That is a
-    // state rebind, not an executable replacement: a full transaction would manufacture
-    // a release as its own rollback predecessor. Commit the authenticated lineage while
-    // leaving the active pointer and process untouched.
-    {
-        if let updated::state::Installed::Present(installed_state) = &installed {
-            if let Some(rebound) = installed_state.rebind_if_same_artifact(
-                lineage.clone(),
-                &prepared.release,
-                &prepared.archive_sha256,
-                &reconciler,
-            ) {
-                if let Err(error) = store.commit_installed(&rebound) {
-                    return AppOutcome::Fatal(format!(
-                        "committing repository lineage for the running release: {error}"
-                    ));
-                }
-                log(&format!(
-                    "adopted repository lineage for already-running {}",
-                    installed_state.release.version
-                ));
-                return AppOutcome::Unchanged;
-            }
-            // A version is an immutable release identity. Across a repository-lineage change the
-            // selector has no old-lineage version floor, so it may encounter differently packed bytes
-            // carrying the running version. Those bytes are neither an upgrade nor a valid rollback
-            // predecessor. Hold the running release rather than entering an application update.
-            if is_self_version(&installed, &prepared.version) {
-                warn(&format!(
-                    "ignoring application target {}: the installed version already has different \
-                     payload bytes or reconciler state",
-                    prepared.version
-                ));
-                return AppOutcome::Unchanged;
-            }
-        }
-    }
-
     let updated::state::Installed::Present(installed_state) = &installed else {
         return AppOutcome::Fatal(
             "an update candidate was selected without a valid installed predecessor".into(),

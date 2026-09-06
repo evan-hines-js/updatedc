@@ -800,7 +800,7 @@ async fn switch_over<T: Reconciler>(
             reconciler: tx.candidate_reconciler.clone(),
             rollback_guard: pending,
             // An update always has a proven predecessor: its failure recovery is this state machine's
-            // rollback, never a cold-install-fallback descent, so the new head commits already confirmed.
+            // rollback to a proven predecessor, so the restored head commits already confirmed.
             maturity: Maturity::Proven,
         })
     );

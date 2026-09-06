@@ -43,6 +43,7 @@ type Scenario = (&'static str, fn(&Ctx) -> R);
 
 fn scenarios() -> Vec<Scenario> {
     let mut s: Vec<Scenario> = vec![
+        ("complex release graph routes and multi-hop rollback survive restart", complex_release_graph_and_multihop_rollback),
         ("an update that becomes unhealthy during confirmation is rolled back", unhealthy_unconfirmed_release_rolls_back),
         ("routine convergence runs health gates even when its cadence is shorter than the grace", routine_convergence_keeps_running_health_gates),
         (
@@ -70,16 +71,16 @@ fn scenarios() -> Vec<Scenario> {
             chaotic_application_health_failures,
         ),
         (
-            "a stateless cold node descends past an assigned head whose converge fails, to the newest healthy release",
-            cold_install_descends_past_broken_head,
+            "a failed first installation never substitutes an older target",
+            cold_install_rejects_broken_target,
         ),
         (
             "a cold node fails closed when every cold-install candidate has been rejected",
             cold_install_fails_closed_when_every_candidate_is_rejected,
         ),
         (
-            "a cold node rejects a malformed (unextractable) assigned bundle at ingest and descends to a healthy release",
-            cold_install_descends_past_corrupt_bundle,
+            "a malformed target blocks installation before activation",
+            cold_install_rejects_corrupt_target,
         ),
         (
             "two nodes receive one group release; only the failing node rolls back",
@@ -130,10 +131,6 @@ fn scenarios() -> Vec<Scenario> {
         s.push((
             "the reconciler healthcheck gates first install and upgrade",
             lifecycle_healthcheck_gates_readiness,
-        ));
-        s.push((
-            "a stateless cold node stops and descends past assigned heads that converge but never become healthy",
-            cold_install_descends_past_unhealthy_head,
         ));
     }
     // Chaos recovery runs last: it replays every transaction boundary, so it is by

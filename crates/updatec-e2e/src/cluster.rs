@@ -918,14 +918,24 @@ pub(crate) fn minio_release_repository(release_root: &str) -> serde_json::Value 
     })
 }
 
-/// A seed group's deployment: a full clone of the fully-valid `edge` deployment (so every
-/// CRD-required field is present) with only its release repository pointed at MinIO. Its selector
-/// matches nothing, so no node adopts it; `updatectl deploy` overwrites its `application` and the
-/// published payload's product comes from the deploy flags, so the runtime here is unused.
-pub(crate) fn seed_deployment(edge: &serde_json::Value, release_root: &str) -> serde_json::Value {
-    let mut deployment = edge["spec"]["deployment"].clone();
-    deployment["releaseRepository"] = minio_release_repository(release_root);
-    deployment
+/// Read the immutable reference printed by the real CI publisher. Fixtures consume that output
+/// directly; they never need temporary Kubernetes groups just to discover a package digest.
+pub(crate) fn published_reference(
+    output: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let document: serde_json::Value = serde_json::from_str(output)?;
+    let path = document["target"]
+        .as_str()
+        .ok_or("publication has no target")?;
+    let sha = document["sha256"]
+        .as_str()
+        .ok_or("publication has no digest")?;
+    if !updated_contracts::path::is_confined_relative(path)
+        || !updated_contracts::is_canonical_sha256(sha)
+    {
+        return Err("invalid publication reference".into());
+    }
+    Ok((path.into(), sha.into()))
 }
 
 /// Mint the release repository's signing keys, seed the baseline release every cohort starts on,
@@ -936,7 +946,6 @@ pub(crate) fn seed_deployment(edge: &serde_json::Value, release_root: &str) -> s
 /// Idempotent: re-running against an already-initialized repo is a no-op for the keys and a
 /// content-addressed republish for the baseline (same bytes → same target).
 fn bootstrap_minio_release_repo(
-    edge: &serde_json::Value,
     platform: &str,
 ) -> Result<ReleaseBootstrap, Box<dyn std::error::Error>> {
     // Every `updatectl` below addresses the one release repository the groups resolve from.
@@ -950,8 +959,7 @@ fn bootstrap_minio_release_repo(
         &format!(
             "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
              if [ ! -f /data/release-keys/root.json ]; then mkdir -p /data/release-keys; \
-             updatectl trust-root --keys-dir /data/release-keys {repository} \
-             --root-out /data/release-keys/root.json; fi"
+             server init --keys /data/release-keys --repo /data/minio-release-origin {repository}; fi"
         ),
     ]))?;
     let release_root = output(kubectl().args(RELEASE_SERVER_EXEC).args([
@@ -960,21 +968,8 @@ fn bootstrap_minio_release_repo(
         "/data/release-keys/root.json",
     ]))?;
 
-    // 2. Seed the baseline. `updatectl deploy` publishes AND patches a group, so deploy to a
-    //    throwaway group whose repo is MinIO, read back the content-addressed path+sha the
-    //    cohorts start on, then delete it. Its selector matches nothing, so no node adopts it.
-    let seed_deployment = seed_deployment(edge, &release_root);
-    apply_json(&serde_json::json!({
-        "apiVersion": "updated.dev/v1alpha1",
-        "kind": "UpdateGroup",
-        "metadata": {"name": "release-seed", "namespace": NAMESPACE},
-        "spec": {
-            "repositoryRef": {"name": fixture::REPOSITORY_NAME},
-            "selector": {"matchLabels": {COHORT_LABEL: "__release-seed-unmatched__"}},
-            "deployment": seed_deployment
-        }
-    }))?;
-    run(kubectl().args(RELEASE_SERVER_EXEC).args([
+    // CI publication returns the reference; selecting a live rollout is a separate YAML operation.
+    let published = output(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
         "-c",
@@ -983,34 +978,13 @@ fn bootstrap_minio_release_repo(
              rm -rf /tmp/seed && mkdir -p /tmp/seed/bin /tmp/seed/config; \
              cp /usr/local/bin/sampleapp /tmp/seed/bin/app; cp /usr/local/bin/demo-lifecycle /tmp/seed/bin/lifecycle; \
              printf 'version = \"{BASELINE_VERSION}\"\\n' >/tmp/seed/config/release.toml; \
-             updatectl deploy --keys-dir /data/release-keys {repository} \
-             --namespace {NAMESPACE} --group release-seed --product app --channel stable \
+             updatectl publish --keys-dir /data/release-keys {repository} \
+             --output json --product app --channel stable \
              --version {BASELINE_VERSION} --platform {platform} --source /tmp/seed {execution}"
         ),
     ]))?;
-    let baseline_path = kubectl_value(
-        "updategroup",
-        "release-seed",
-        "{.spec.deployment.application.path}",
-    )?;
-    let baseline_sha = kubectl_value(
-        "updategroup",
-        "release-seed",
-        "{.spec.deployment.application.sha256}",
-    )?;
-    run(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "delete",
-        "updategroup",
-        "release-seed",
-        "--ignore-not-found",
-    ]))?;
-    Ok((
-        release_root,
-        baseline_path.trim().to_owned(),
-        baseline_sha.trim().to_owned(),
-    ))
+    let (baseline_path, baseline_sha) = published_reference(&published)?;
+    Ok((release_root, baseline_path, baseline_sha))
 }
 
 /// Apply every resource the fleet layout needs and return the published reconciler set's sha —
@@ -1025,43 +999,27 @@ fn apply_resources(jenkins: &JenkinsResources) -> Result<(), Box<dyn std::error:
         "-o",
         "json",
     ]))?)?;
-    // Bootstrap the MinIO release repository the app cohorts roll through `updatectl deploy` —
-    // the real CI release path, not the in-cluster `server publish-app`. Idempotent init of the
-    // repo + signing keys, then seed the baseline the cohorts converge to so its content hash is
-    // authoritative.
-    //
-    // `updatectl deploy` runs inside the release-server pod, which carries no explicit
-    // serviceAccountName and so authenticates as the namespace `default` SA. Grant that SA the
-    // updategroups/updategroupsets access the deploy needs BEFORE the bootstrap runs — otherwise
-    // the very first `updatectl deploy` 403s trying to get the release-seed UpdateGroup.
-    apply_json(&serde_json::json!({
-        "apiVersion": "v1", "kind": "List", "items": [
-            {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role","metadata":{"name":"release-server-deployer","namespace":NAMESPACE},"rules":[
-                {"apiGroups":["updated.dev"],"resources":["updategroups"],"verbs":["get","list","patch"]},
-                {"apiGroups":["updated.dev"],"resources":["updategroupsets"],"verbs":["get","list","create","patch"]}
-            ]},
-            {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":{"name":"release-server-deployer","namespace":NAMESPACE},"subjects":[{"kind":"ServiceAccount","name":"default","namespace":NAMESPACE}],"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"release-server-deployer"}}
-        ]
-    }))?;
+    // The fixture provisions MinIO. CI publication needs object-store access, not Kubernetes RBAC.
     let platform = repository_platform()?;
-    let (release_root, baseline_path, baseline_sha) =
-        bootstrap_minio_release_repo(&edge, &platform)?;
+    let (release_root, baseline_path, baseline_sha) = bootstrap_minio_release_repo(&platform)?;
     let minio_release_repository = minio_release_repository(&release_root);
+    let baseline_graph = fixture::fleet_baseline_graph(
+        serde_json::from_value(edge["spec"]["deployment"]["application"].clone())?,
+        updated_contracts::artifact::TargetReference {
+            path: baseline_path,
+            sha256: baseline_sha,
+        },
+    );
+    let baseline_graph = serde_json::to_value(baseline_graph)?;
     // The sample-app cohorts (and the external slice) start on the MinIO-published baseline the
-    // chaos then rolls with `updatectl deploy`.
+    // chaos then rolls with `updatectl publish`.
     let group = |name: &str, cohort: &str, set: &str| {
         let mut deployment = edge["spec"]["deployment"].clone();
         deployment["name"] = name.into();
-        deployment["application"] =
-            serde_json::json!({"path": baseline_path, "sha256": baseline_sha});
-        // Point the cohort at MinIO: this is the repository `updatectl deploy` publishes to and
-        // patches. The Jenkins groups below keep edge's release-server repo (the default path).
+        deployment["application"] = baseline_graph.clone();
+        // Point the cohort at MinIO, the repository used by `updatectl publish`.
+        // The Jenkins groups below keep edge's release-server repo (the default path).
         deployment["releaseRepository"] = minio_release_repository.clone();
-        // Signed opt-in to first-install cold-install fallback: a killed, stateless agent
-        // pod returns cold and must descend from its assigned version to the newest
-        // healthy release rather than stranding on a broken head. This is what makes
-        // the pod-kill chaos survivable across every cohort under rollout.
-        deployment["coldInstallFallback"] = serde_json::json!(true);
         // Fast test cadence so the fleet reacts within a second or two instead of the
         // production-shaped 5-60s defaults: agents check for new desired state every second,
         // retry and refresh quickly, and don't linger in a long health grace. These are signed
@@ -1113,11 +1071,12 @@ fn apply_resources(jenkins: &JenkinsResources) -> Result<(), Box<dyn std::error:
         let mut deployment = edge["spec"]["deployment"].clone();
         deployment["name"] = name.clone().into();
         deployment["application"] = serde_json::json!({
+            "target": "1.0.0", "releases": {"1.0.0": {"package": {
             "path": jenkins.application_path,
             "sha256": jenkins.application_sha.trim()
+            }, "installable": true}}
         });
 
-        deployment["coldInstallFallback"] = serde_json::json!(false);
         deployment["runtime"]["product"] = "jenkins".into();
         // The Jenkins reconciler backs JENKINS_HOME up before activation and reuses it; the
         // hook owns the process, and rollback restores the backup. Jenkins's first install

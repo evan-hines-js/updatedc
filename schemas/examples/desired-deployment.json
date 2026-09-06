@@ -1,13 +1,21 @@
 {
-  "schema": 5,
+  "schema": 6,
   "deployment": "production-web-2026-07-18.1",
   "metadataUrl": "https://cdn.example.com/tuf/metadata/",
   "targetsUrl": "https://cdn.example.com/tuf/targets/",
   "application": {
-    "path": "products/web/stable/2.7.1/linux-x86_64/app",
-    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    "target": "1.0.0",
+    "releases": {
+      "1.0.0": {
+        "package": {
+          "path": "products/web/stable/2.7.1/linux-x86_64/app",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "installable": true,
+        "upgradeFrom": []
+      }
+    }
   },
-  "coldInstallFallback": false,
   "releaseRoot": {
     "signed": {
       "_type": "root",

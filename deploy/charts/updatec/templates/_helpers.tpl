@@ -176,3 +176,14 @@ and canonicalization rules in every launch environment, including this chart.
 - name: RUST_LOG
   value: {{ .Values.logLevel | quote }}
 {{- end -}}
+
+{{/* Shared public trust roots for gateway identity verification and controller release preflight. */}}
+{{- define "updatec.clientCaVolume" -}}
+- name: client-ca
+  secret:
+    secretName: {{ .Values.gateway.clientCaSecretName | default .Values.gateway.tlsSecretName }}
+    defaultMode: 0440
+    items:
+      - key: {{ .Values.gateway.clientCaSecretKey }}
+        path: ca.crt
+{{- end }}

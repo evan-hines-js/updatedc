@@ -11,10 +11,15 @@ use updated::config::RepositoryAccess;
 use updated::tls::Identity;
 use url::Url;
 
-pub(crate) fn transport(mtls: &Identity, access: RepositoryAccess) -> AgentTransport {
+pub(crate) fn transport(mtls: Option<&Identity>, access: RepositoryAccess) -> AgentTransport {
     let object = match access {
-        RepositoryAccess::Direct => mtls.reqwest_direct_object_client(),
-        RepositoryAccess::GatewayCapability => mtls.reqwest_capability_client(),
+        RepositoryAccess::Direct => mtls.map_or_else(
+            updated::tls::anonymous_object_client,
+            Identity::reqwest_direct_object_client,
+        ),
+        RepositoryAccess::GatewayCapability => mtls
+            .ok_or_else(|| std::io::Error::other("routing repository requires mTLS identity"))
+            .and_then(Identity::reqwest_capability_client),
     };
     let object = match object {
         Ok(client) => client,
@@ -26,7 +31,10 @@ pub(crate) fn transport(mtls: &Identity, access: RepositoryAccess) -> AgentTrans
     };
     let control = match access {
         RepositoryAccess::Direct => None,
-        RepositoryAccess::GatewayCapability => match mtls.reqwest_control_client() {
+        RepositoryAccess::GatewayCapability => match mtls
+            .ok_or_else(|| std::io::Error::other("routing repository requires mTLS identity"))
+            .and_then(Identity::reqwest_control_client)
+        {
             Ok(client) => Some(client),
             Err(error) => {
                 return AgentTransport::Broken {

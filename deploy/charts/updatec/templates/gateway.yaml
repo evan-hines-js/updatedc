@@ -103,13 +103,7 @@ spec:
           secret:
             secretName: {{ .Values.gateway.tlsSecretName }}
             defaultMode: 0440
-        - name: client-ca
-          secret:
-            secretName: {{ .Values.gateway.clientCaSecretName | default .Values.gateway.tlsSecretName }}
-            defaultMode: 0440
-            items:
-              - key: {{ .Values.gateway.clientCaSecretKey }}
-                path: ca.crt
+        {{- include "updatec.clientCaVolume" . | nindent 8 }}
         - name: issuing-ca
           secret:
             secretName: {{ .Values.gateway.issuingCaSecretName }}

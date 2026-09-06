@@ -1,7 +1,7 @@
 # Package execution
 
 Customers publish a package and choose its entrypoint. The entrypoint can run arbitrary code in any
-language. `updatectl deploy --source ./package --entrypoint install.sh` generates the signed
+language. `updatectl publish --source ./package --entrypoint install.sh` generates the signed
 execution metadata. Optional health, inspection, replay-check, and recovery commands extend this
 same path; they do not introduce another deployment mechanism.
 

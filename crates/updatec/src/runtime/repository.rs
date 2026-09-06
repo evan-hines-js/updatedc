@@ -85,7 +85,7 @@ pub(crate) fn repository_storage_ownership_needs_binding(
         if bound == desired {
             return Ok(false);
         }
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "repository storage coordinates differ from the controller-owned deletion scope in status; refusing to publish (bound bucket={:?}, prefix={:?}, region={:?}, endpoint={:?}, credentialsSecretRef={:?})",
             bound.bucket,
             bound.prefix,
@@ -102,7 +102,7 @@ pub(crate) fn repository_storage_ownership_needs_binding(
             status.published_digest.is_some() || status.routing_root_sha256.is_some()
         })
     {
-        return Err(StorageError(
+        return Err(StorageError::Operation(
             "repository has its state finalizer or published state but no controller-owned storage scope; refusing to invent an irreversible deletion target"
                 .into(),
         ));
@@ -234,7 +234,7 @@ pub(crate) async fn clear_admitted_repository_state(
     }
     let remaining = existing_named_configmaps(configmaps, &owned).await?;
     if !remaining.is_empty() {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "waiting for admitted-state ConfigMaps to terminate: {}",
             remaining.join(", ")
         ))
@@ -256,11 +256,11 @@ pub(crate) fn repository_capability_drain_remaining(
         .deletion_timestamp
         .as_ref()
         .ok_or_else(|| {
-            StorageError("repository finalization requires a deletion timestamp".into())
+            StorageError::Operation("repository finalization requires a deletion timestamp".into())
         })?
         .0;
     let drain = chrono::Duration::from_std(updated_contracts::dataflow::OBJECT_CAPABILITY_DRAIN)
-        .map_err(|_| StorageError("repository capability drain is invalid".into()))?;
+        .map_err(|_| StorageError::Operation("repository capability drain is invalid".into()))?;
     Ok((deleted_at + drain - now)
         .to_std()
         .unwrap_or(Duration::ZERO))
@@ -303,7 +303,7 @@ pub(crate) async fn finalize_repository(
         tokio::time::sleep(remaining).await;
     }
     let destination = repository_deletion_destination(repository).ok_or_else(|| {
-        StorageError(
+        StorageError::Operation(
             "repository carries its state finalizer without its controller-owned storage scope; refusing to guess a deletion target"
                 .into(),
         )
@@ -346,7 +346,7 @@ pub(crate) async fn prune_prefix(
 ) -> Result<usize, StorageError> {
     let trimmed = prefix.trim_matches('/');
     if trimmed.is_empty() {
-        return Err(StorageError(
+        return Err(StorageError::Operation(
             "refusing to prune an empty prefix: that is the whole bucket, not this repository"
                 .into(),
         ));
@@ -356,7 +356,8 @@ pub(crate) async fn prune_prefix(
     let prune = async {
         let mut pruned = 0usize;
         while let Some(entry) = listing.next().await {
-            let meta = entry.map_err(|e| StorageError(format!("listing objects to prune: {e}")))?;
+            let meta = entry
+                .map_err(|e| StorageError::Operation(format!("listing objects to prune: {e}")))?;
             if !crate::object_in_namespace(
                 scope.as_ref().expect("scope is present"),
                 &meta.location,
@@ -368,7 +369,10 @@ pub(crate) async fn prune_prefix(
                     pruned = pruned.saturating_add(1);
                 }
                 Err(error) => {
-                    return Err(StorageError(format!("deleting {}: {error}", meta.location)));
+                    return Err(StorageError::Operation(format!(
+                        "deleting {}: {error}",
+                        meta.location
+                    )));
                 }
             }
         }
@@ -376,5 +380,7 @@ pub(crate) async fn prune_prefix(
     };
     tokio::time::timeout(crate::OBJECT_STORE_MAINTENANCE_TIMEOUT, prune)
         .await
-        .map_err(|_| StorageError(format!("pruning object prefix {trimmed} timed out")))?
+        .map_err(|_| {
+            StorageError::Operation(format!("pruning object prefix {trimmed} timed out"))
+        })?
 }

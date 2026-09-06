@@ -172,12 +172,23 @@ publish() {
 target_sha256() { "$BIN/server" target-sha256 --repo "$RELEASE_REPO" --name "$1"; }
 assign() {
   local version="$1" app_path="products/app/stable/$1/$PLATFORM/app"
+  python3 - "$WORK/application.json" "$version" "$app_path" "$(target_sha256 "$app_path")" <<'PYGRAPH'
+import json, pathlib, sys
+file, version, path, sha = sys.argv[1:]
+file = pathlib.Path(file)
+graph = json.loads(file.read_text()) if file.exists() else {"releases": {}}
+# This fixture supports forward upgrades from every previously published sample version.
+predecessors = [v for v in graph["releases"] if tuple(map(int, v.split('.'))) < tuple(map(int, version.split('.')))]
+graph["releases"][version] = {"package": {"path": path, "sha256": sha}, "upgradeFrom": predecessors, "installable": True}
+graph["target"] = version
+file.write_text(json.dumps(graph))
+PYGRAPH
   "$BIN/server" publish-assignment --repo "$ROUTING_REPO" --keys "$ROUTING_KEYS" \
     --release-root "$RELEASE_REPO/metadata/root.json" \
     --name assignments/agents/agent.json --deployment "app-$version" \
     --metadata-url "https://127.0.0.1:$OBJECT_PORT/metadata/" \
     --targets-url "https://127.0.0.1:$OBJECT_PORT/targets/" \
-    --application-path "$app_path" --application-sha256 "$(target_sha256 "$app_path")" \
+    --application "$WORK/application.json" \
     --runtime "$RUNTIME"
 }
 

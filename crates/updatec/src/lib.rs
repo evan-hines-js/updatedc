@@ -74,6 +74,7 @@ pub mod gateway;
 pub(crate) mod input_data;
 pub mod join;
 pub mod metrics;
+pub(crate) mod preflight;
 pub mod publisher;
 pub(crate) mod rollout;
 pub mod runtime;
@@ -207,8 +208,8 @@ pub struct UpdateGroupSpec {
     /// operator saying so.
     ///
     /// It stays in force until it is cleared, and it is loudly visible while it is: the governing
-    /// set lists the group in `status.emergency`, and `updatectl deploy` writes this field
-    /// explicitly on every publish, so the next ordinary deploy of this group clears it.
+    /// set lists the group in `status.emergency`. Operators set and clear this field in the
+    /// group's YAML; publishing a package does not change rollout policy.
     #[serde(default)]
     pub emergency_correction: bool,
 }
@@ -225,12 +226,7 @@ pub struct GroupOutputReference {
 pub struct DeploymentSpec {
     pub name: String,
     pub release_repository: ReleaseRepositorySpec,
-    pub application: TargetSpec,
-    /// Signed opt-in to first-install cold-install fallback (see
-    /// [`updated_contracts::assignment::RepositoryAssignment::cold_install_fallback`]). Defaults
-    /// off so a group only descends versions when the publisher explicitly allows it.
-    #[serde(default)]
-    pub cold_install_fallback: bool,
+    pub application: updated_contracts::releases::ReleaseGraph,
     pub runtime: RuntimeSpec,
 }
 
@@ -275,12 +271,6 @@ pub struct RuntimeSpec {
     pub timeouts: updated_contracts::assignment::ManagedTimeouts,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-pub struct TargetSpec {
-    pub path: String,
-    pub sha256: String,
-}
-
 impl TryFrom<DeploymentSpec> for DesiredDeployment {
     type Error = String;
 
@@ -302,7 +292,6 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                     root_json,
                 },
             application,
-            cold_install_fallback,
             runtime:
                 RuntimeSpec {
                     product,
@@ -320,8 +309,7 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
             deployment: name,
             metadata_url,
             targets_url,
-            application: application.into(),
-            cold_install_fallback,
+            application,
             release_root,
             runtime: updated_contracts::assignment::ManagedRuntime {
                 product,
@@ -339,13 +327,6 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
         };
         desired.validate()?;
         Ok(desired)
-    }
-}
-
-impl From<TargetSpec> for ExactTarget {
-    fn from(value: TargetSpec) -> Self {
-        let TargetSpec { path, sha256 } = value;
-        Self { path, sha256 }
     }
 }
 
@@ -1288,6 +1269,10 @@ pub enum PlanError {
     InvalidNodeName,
     InvalidPrefix,
     InvalidDeployment(String),
+    ReleasePreflight {
+        node: String,
+        message: String,
+    },
     NodeDeploymentMismatch,
     Serialize(String),
 }
@@ -1857,11 +1842,14 @@ mod tests {
             deployment: id.into(),
             metadata_url: "https://cdn.example/tuf/metadata/".into(),
             targets_url: "https://cdn.example/tuf/targets/".into(),
-            application: ExactTarget {
-                path: "app".into(),
-                sha256: "1".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "app".into(),
+                    sha256: "1".repeat(64),
+                },
+            ),
+
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: managed_runtime(),
         }
@@ -1912,11 +1900,14 @@ mod tests {
                 targets_url: "https://cdn.example/tuf/targets/".into(),
                 root_json: serde_json::json!({"signed": {}, "signatures": []}).to_string(),
             },
-            application: TargetSpec {
-                path: "app".into(),
-                sha256: "1".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "app".into(),
+                    sha256: "1".repeat(64),
+                },
+            ),
+
             runtime: runtime_spec(),
         }
     }

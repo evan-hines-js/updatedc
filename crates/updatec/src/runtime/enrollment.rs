@@ -223,7 +223,7 @@ pub(crate) async fn sweep_enrollment_objects(
         let mut removed = 0usize;
         while let Some(next) = objects.next().await {
             let object = next.map_err(|error| {
-                StorageError(format!("listing obsolete enrollment objects: {error}"))
+                StorageError::Operation(format!("listing obsolete enrollment objects: {error}"))
             })?;
             // Object-store prefix implementations are not required to agree about segment
             // boundaries. Never let `enrollments-old/...` become part of this namespace merely
@@ -239,7 +239,7 @@ pub(crate) async fn sweep_enrollment_objects(
                     removed = removed.saturating_add(1);
                 }
                 Err(error) => {
-                    return Err(StorageError(format!(
+                    return Err(StorageError::Operation(format!(
                         "deleting obsolete enrollment object {}: {error}",
                         object.location
                     )));
@@ -250,7 +250,9 @@ pub(crate) async fn sweep_enrollment_objects(
     };
     tokio::time::timeout(crate::OBJECT_STORE_MAINTENANCE_TIMEOUT, sweep)
         .await
-        .map_err(|_| StorageError("sweeping obsolete enrollment objects timed out".into()))?
+        .map_err(|_| {
+            StorageError::Operation("sweeping obsolete enrollment objects timed out".into())
+        })?
 }
 
 /// The trust anchor enrollment publication must use, or the reason there is nothing to do.
@@ -269,7 +271,7 @@ pub(crate) fn enrollment_anchor(
     match (agents, trust_anchor) {
         (0, _) => Ok(None),
         (_, Some(anchor)) => Ok(Some(anchor)),
-        (waiting, None) => Err(StorageError(format!(
+        (waiting, None) => Err(StorageError::Operation(format!(
             "{waiting} agent(s) need an enrollment bundle, but this \
              repository's status carries no routingRootSha256 to pin the published root against; \
              no bundle can be issued until a generation is signed and its anchor recorded"

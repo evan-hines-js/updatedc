@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Fail with the tool's name rather than mid-provision inside a command substitution,
 # where `set -euo pipefail` kills the run with no diagnostic. The digest tool is
 # coreutils `sha256sum` here and in every container job below — one spelling only.
-for command in kind kubectl helm docker curl openssl awk sha256sum cargo; do
+for command in kind kubectl helm docker curl openssl awk sha256sum cargo python3; do
   command -v "$command" >/dev/null || { echo "FAIL: missing required command: $command" >&2; exit 2; }
 done
 # shellcheck source=scripts/lib/publish-fuzz-plan.sh
@@ -418,7 +418,7 @@ ROUTING_PROBE="$WORK/routing-probe"
 mkdir -p "$ROUTING_PROBE"
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
   -out "$ROUTING_PROBE/tls.key" 2>/dev/null
-ROUTING_PROBE_PUBLIC_KEY="$(cargo run -q -p updatectl -- node-public-key \
+ROUTING_PROBE_PUBLIC_KEY="$(cargo run -q -p server -- node-public-key \
   --key "$ROUTING_PROBE/tls.key")"
 sign_node_leaf kind-routing-probe \
   "$ROUTING_PROBE/tls.key" "$ROUTING_PROBE/tls.crt" 1
@@ -804,7 +804,7 @@ MANUAL_IDENTITY="$WORK/manual-offline-identity"
 mkdir -p "$MANUAL_IDENTITY"
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
   -out "$MANUAL_IDENTITY/agent.key" 2>/dev/null
-MANUAL_PUBLIC_KEY="$(cargo run -q -p updatectl -- node-public-key \
+MANUAL_PUBLIC_KEY="$(cargo run -q -p server -- node-public-key \
   --key "$MANUAL_IDENTITY/agent.key")"
 sign_node_leaf manual-offline "$MANUAL_IDENTITY/agent.key" "$MANUAL_IDENTITY/agent.crt" 90
 cat <<YAML | kubectl apply -f -
@@ -1636,8 +1636,25 @@ replace_group_deployment() {
   local name="$1"
   local version="$2"
   local sha="$3"
-  local deployment
-  deployment="{\"name\":\"$name-fuzz-$version\",\"releaseRepository\":{\"metadataUrl\":\"https://release-$name/metadata/\",\"targetsUrl\":\"https://release-$name/targets/\"},\"application\":{\"path\":\"products/app/stable/$version/$PLATFORM/app\",\"sha256\":\"$sha\"}}"
+  local deployment resource field current
+  resource=updategroup
+  field=deployment
+  if [ "$name" = default ]; then resource=updaterepository; field=defaultDeployment; fi
+  current=$(kubectl -n updated-system get "$resource" "$name" -o json)
+  deployment=$(printf '%s' "$current" | python3 -c '
+import json, sys
+name, version, sha, platform, field = sys.argv[1:]
+deployment = json.load(sys.stdin)["spec"][field]
+graph = deployment["application"]
+if version not in graph["releases"]:
+    predecessors = [v for v in graph["releases"] if tuple(map(int, v.split("."))) < tuple(map(int, version.split(".")))]
+    for predecessor in predecessors:
+        graph["releases"][predecessor].setdefault("rollbackFrom", []).append(version)
+    graph["releases"][version] = {"package": {"path": f"products/app/stable/{version}/{platform}/app", "sha256": sha}, "upgradeFrom": predecessors, "installable": True}
+graph["target"] = version
+deployment["name"] = f"{name}-fuzz-{version}"
+print(json.dumps(deployment))
+' "$name" "$version" "$sha" "$PLATFORM" "$field")
   if [ "$name" = default ]; then
     kubectl -n updated-system patch updaterepository default --type=merge \
       -p "{\"spec\":{\"defaultDeployment\":$deployment}}" >/dev/null

@@ -50,6 +50,7 @@ async fn main() {
 
     let result = match cmd {
         "init" => init(rest).await,
+        "node-public-key" => node_public_key(rest),
         "publish-app" => publish(rest).await,
         "publish-assignment" => publish_assignment(rest).await,
         "export-enrollment" => export_enrollment(rest),
@@ -60,7 +61,7 @@ async fn main() {
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|publish-app|publish-assignment|export-enrollment|target-sha256|gen-certs|serve-capability|serve-object> [flags]"
+                "usage: server <init|node-public-key|publish-app|publish-assignment|export-enrollment|target-sha256|gen-certs|serve-capability|serve-object> [flags]"
             );
             exit(2);
         }
@@ -170,8 +171,12 @@ async fn publish_assignment(args: &[String]) -> R {
     let metadata_url = flag(args, "--metadata-url").ok_or("--metadata-url <url> is required")?;
     let targets_url = flag(args, "--targets-url").ok_or("--targets-url <url> is required")?;
     let deployment = flag(args, "--deployment").ok_or("--deployment <id> is required")?;
-    let application = target_reference(args, "application")?;
-    let cold_install_fallback = args.iter().any(|arg| arg == "--cold-install-fallback");
+    let application_path =
+        flag(args, "--application").ok_or("--application <release-graph.json> is required")?;
+    let application = serde_json::from_slice(&read_operator_file(
+        Path::new(&application_path),
+        updated_contracts::assignment::RepositoryAssignment::MAX_DOCUMENT_BYTES,
+    )?)?;
     // Routing and releases are deliberately different repositories: the former is private and
     // capability-gated, while the latter is fetched directly from the object plane. Requiring the
     // release root makes that trust boundary explicit and prevents a fixture or operator tool from
@@ -197,7 +202,6 @@ async fn publish_assignment(args: &[String]) -> R {
         metadata_url,
         targets_url,
         application,
-        cold_install_fallback,
         release_root,
         runtime,
     };
@@ -246,19 +250,6 @@ async fn publish_assignment(args: &[String]) -> R {
     Ok(())
 }
 
-fn target_reference(
-    args: &[String],
-    prefix: &str,
-) -> Result<updated_contracts::artifact::TargetReference, Box<dyn std::error::Error>> {
-    let path = flag(args, &format!("--{prefix}-path"))
-        .ok_or_else(|| format!("--{prefix}-path <target> is required"))?;
-    let sha256 = flag(args, &format!("--{prefix}-sha256"))
-        .ok_or_else(|| format!("--{prefix}-sha256 <hex> is required"))?;
-    let sha256 = updated_contracts::digest::parse_canonical_sha256(&sha256)
-        .map_err(|error| format!("--{prefix}-sha256: {error}"))?;
-    Ok(updated_contracts::artifact::TargetReference { path, sha256 })
-}
-
 // --- init -------------------------------------------------------------------
 
 async fn init(args: &[String]) -> R {
@@ -266,8 +257,41 @@ async fn init(args: &[String]) -> R {
     let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
 
+    // Test-fixture provisioning belongs here, outside the CI package publisher. Reuse the
+    // production object-store publication path when the fixture targets MinIO.
+    let remote = if let Some(bucket) = flag(args, "--bucket") {
+        let destination = updatec::S3Destination {
+            bucket,
+            region: flag(args, "--region").ok_or("--region is required with --bucket")?,
+            prefix: flag(args, "--prefix").unwrap_or_default(),
+            endpoint: flag(args, "--endpoint"),
+            credentials_secret_ref: None,
+            public_endpoint: None,
+        };
+        let access = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let token = std::env::var("AWS_SESSION_TOKEN").ok();
+        let store = updatec::runtime::repository_object_store(
+            &destination,
+            updatec::runtime::S3Credentials {
+                access_key: access.as_deref(),
+                secret_key: secret.as_deref(),
+                session_token: token.as_deref(),
+            },
+        )?;
+        Some((destination, store))
+    } else {
+        None
+    };
     let keys = repo::generate_keys(&keys_dir).await?;
     repo::init(&repo_dir, &keys, expiry_days).await?;
+    if let Some((destination, store)) = remote {
+        updatec::runtime::publish_repository(store.as_ref(), &destination, &repo_dir).await?;
+        std::fs::copy(
+            repo_dir.join("metadata/root.json"),
+            keys_dir.join("root.json"),
+        )?;
+    }
     println!(
         "initialized TUF repository at {} (keys in {})",
         repo_dir.display(),
@@ -277,6 +301,16 @@ async fn init(args: &[String]) -> R {
         "pin this root on clients: {}",
         repo_dir.join("metadata/root.json").display()
     );
+    Ok(())
+}
+
+/// Canonical pin for manually provisioned fixture agents; the production enrollment parser owns
+/// its encoding. This is test setup, not part of the release-author CLI.
+fn node_public_key(args: &[String]) -> R {
+    let path = PathBuf::from(flag(args, "--key").ok_or("--key is required")?);
+    let key = updated::tls::read_private_key_pem(&path, foundation::file::FinalSymlink::Follow)?;
+    let csr = updated::csr::csr_for(&key, "manual fixture identity")?;
+    println!("{}", updatec::join::csr_public_key(&csr)?.to_hex());
     Ok(())
 }
 
@@ -331,7 +365,7 @@ async fn publish(args: &[String]) -> R {
         // `add_release` hashes it, so the published target is signed for its own broken bytes —
         // it passes the client's download sha check and fails only at extract/validate. This is
         // the malformed-but-signed bundle an honest publisher can never emit, used to exercise
-        // the client's ingest-rejection + cold-install-fallback descent. Never used by real releases.
+        // the client's ingest-rejection and blocked-route behavior. Never used by real releases.
         if let Some(kind) = flag(args, "--corrupt") {
             corrupt_archive(&path, &kind, &version)?;
         }
@@ -1286,7 +1320,19 @@ mod tests {
         let keys = runner.block_on(repo::generate_keys(&keys_dir)).unwrap();
         runner.block_on(repo::init(&repo_dir, &keys, 365)).unwrap();
 
-        let digest = "a".repeat(64);
+        let application_path = root.join("application.json");
+        std::fs::write(
+            &application_path,
+            serde_json::to_vec(&updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "products/app".into(),
+                    sha256: "a".repeat(64),
+                },
+            ))
+            .unwrap(),
+        )
+        .unwrap();
         let args: Vec<String> = vec![
             "--repo".into(),
             repo_dir.display().to_string(),
@@ -1302,10 +1348,8 @@ mod tests {
             "https://cdn/targets/".into(),
             "--deployment".into(),
             "deploy-1".into(),
-            "--application-path".into(),
-            "products/app".into(),
-            "--application-sha256".into(),
-            digest.clone(),
+            "--application".into(),
+            application_path.display().to_string(),
             "--runtime".into(),
             runtime_path.display().to_string(),
         ];

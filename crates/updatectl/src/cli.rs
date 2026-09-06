@@ -3,7 +3,7 @@
 
 use crate::*;
 
-/// Mint trust roots and publish signed releases from CI, without kubectl.
+/// Validate and publish custom software from CI. Rollouts are configured in Kubernetes YAML.
 #[derive(Parser, Debug)]
 #[command(name = "updatectl", about, long_about = None, disable_version_flag = true)]
 pub(crate) struct Cli {
@@ -13,38 +13,18 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
-    /// Mint a fresh TUF trust root: generate role keys into a directory, initialize the
-    /// empty release repository in S3, and print root.json. Needs no Kubernetes access.
-    TrustRoot(TrustRootArgs),
-    /// Rotate the trust root: activate the standby key, mint a new successor, and publish a
-    /// co-signed new root version. Existing devices follow the chain automatically.
-    RotateRoot(RotateRootArgs),
-    /// Build, sign, and publish an application bundle, then roll a named UpdateGroup onto it.
-    Deploy(Box<DeployArgs>),
+    /// Build, sign, and publish a package; print its immutable reference for deployment YAML.
+    Publish(Box<PublishArgs>),
     /// Validate a package and entrypoint; optionally run against an isolated predecessor fixture.
-    Check(crate::package::CheckArgs),
-    /// Print the canonical public-key pin for an operator-provisioned node private key.
-    NodePublicKey(NodePublicKeyArgs),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct NodePublicKeyArgs {
-    /// PEM-encoded P-256 node private key. The key is read locally and never written or uploaded.
-    #[arg(long, env = "UPDATECTL_NODE_KEY")]
-    pub(crate) key: PathBuf,
+    Check(Box<crate::package::CheckArgs>),
 }
 
 /// The release repository backend, shared by every subcommand. AWS credentials come from
 /// the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment.
 #[derive(Args, Debug)]
 pub(crate) struct Backend {
-    /// Directory of ed25519 role keys. `deploy` needs only the online keys (`targets.pk8`,
-    /// `snapshot.pk8`, `timestamp.pk8`) — in production a Vault-backed Secret mounted
-    /// read-only. `trust-root`/`rotate-root` also use the root keys (`root.pk8` active plus
-    /// `root.next.pk8` standby). `trust-root` mints freshly generated keys here and refuses a
-    /// directory that already holds any role key — a fresh trust root never reuses one, and no
-    /// key it did not mint itself is ever signed into it. A `trust-root` whose publish does not
-    /// land writes nothing here, so retrying the bootstrap is the identical re-run.
+    /// Mounted online signing keys: targets.pk8, snapshot.pk8, and timestamp.pk8.
+    /// Repository provisioning and root-key management are separate from the release pipeline.
     #[arg(long, env = "UPDATECTL_KEYS_DIR")]
     pub(crate) keys_dir: PathBuf,
 
@@ -66,66 +46,11 @@ pub(crate) struct Backend {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TrustRootArgs {
-    #[command(flatten)]
-    pub(crate) backend: Backend,
-
-    /// Days until the freshly signed root/targets/snapshot/timestamp metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    pub(crate) expiry_days: i64,
-
-    /// Write root.json here instead of stdout. Either way it is the value to paste into a
-    /// group's `release_repository.root_json`.
-    #[arg(long, env = "UPDATECTL_ROOT_OUT")]
-    pub(crate) root_out: Option<PathBuf>,
-
-    /// Re-initialize an already-initialized repository. This invalidates everything signed
-    /// under the old root — used deliberately.
-    #[arg(long)]
-    pub(crate) force: bool,
-
-    #[arg(long, value_enum, env = "UPDATECTL_OUTPUT", default_value_t = OutputFormat::Text)]
-    pub(crate) output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct RotateRootArgs {
-    #[command(flatten)]
-    pub(crate) backend: Backend,
-
-    /// Where the freshly minted successor root key is written (mode 0600), once the rotation has
-    /// published. Load it into Vault as the new standby after rotation. Must not already exist —
-    /// an attempt whose publish does not land writes nothing here, so retrying the ceremony is
-    /// the identical re-run.
-    #[arg(long, env = "UPDATECTL_NEW_KEY_OUT")]
-    pub(crate) new_key_out: PathBuf,
-
-    /// Days until the new root metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    pub(crate) expiry_days: i64,
-
-    /// Write the new root.json here instead of stdout (the anchor for new enrollments).
-    #[arg(long, env = "UPDATECTL_ROOT_OUT")]
-    pub(crate) root_out: Option<PathBuf>,
-
-    #[arg(long, value_enum, env = "UPDATECTL_OUTPUT", default_value_t = OutputFormat::Text)]
-    pub(crate) output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct DeployArgs {
+pub(crate) struct PublishArgs {
     #[command(flatten)]
     pub(crate) procedure: crate::package::ProcedureArgs,
     #[command(flatten)]
     pub(crate) backend: Backend,
-
-    /// Namespace holding the UpdateGroup.
-    #[arg(long, env = "UPDATECTL_NAMESPACE", default_value = "updated-system")]
-    pub(crate) namespace: String,
-
-    /// UpdateGroup to roll onto the new bundle (its `spec.deployment.application`).
-    #[arg(long, env = "UPDATECTL_GROUP")]
-    pub(crate) group: String,
 
     /// Product name; also the bundle target's component segment.
     #[arg(long, env = "UPDATECTL_PRODUCT")]
@@ -151,17 +76,6 @@ pub(crate) struct DeployArgs {
     #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
     pub(crate) expiry_days: i64,
 
-    /// Declare this publish an EMERGENCY CORRECTION: the operator admits it immediately, without
-    /// waiting for the governing `UpdateGroupSet`'s rollout schedule. Nothing else is bypassed —
-    /// concurrency slots, `maxUnavailable` staging, inputs, and prerequisites all still apply.
-    ///
-    /// Use it to escape a release the fleet cannot report on at all (one that bricks the agent),
-    /// which is precisely the case no health signal could ever detect. The flag is written into
-    /// `spec.emergencyCorrection` on every deploy, set or cleared, so an ordinary deploy of this
-    /// group afterwards turns it back off — an override can never be silently permanent.
-    #[arg(long, env = "UPDATECTL_EMERGENCY")]
-    pub(crate) emergency: bool,
-
     /// Result format written to stdout. Diagnostics always go to stderr, so `json` yields a
     /// single clean object a pipeline can capture and parse.
     #[arg(long, value_enum, env = "UPDATECTL_OUTPUT", default_value_t = OutputFormat::Text)]
@@ -172,4 +86,54 @@ pub(crate) struct DeployArgs {
 pub(crate) enum OutputFormat {
     Text,
     Json,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_public_cli_only_validates_and_publishes_packages() {
+        let command = Cli::command();
+        command.clone().debug_assert();
+        let names: Vec<_> = command
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect();
+        assert_eq!(names, ["publish", "check"]);
+        let publish = command.find_subcommand("publish").unwrap();
+        for argument in ["group", "namespace", "emergency"] {
+            assert!(!publish.get_arguments().any(|arg| arg.get_id() == argument));
+        }
+    }
+
+    #[test]
+    fn publication_needs_no_kubernetes_target_or_credentials() {
+        let arguments = [
+            "updatectl",
+            "publish",
+            "--source",
+            ".",
+            "--entrypoint",
+            "install.sh",
+            "--product",
+            "app",
+            "--version",
+            "1.0.0",
+            "--keys-dir",
+            "keys",
+            "--bucket",
+            "releases",
+            "--region",
+            "us-east-1",
+        ];
+        assert!(Cli::try_parse_from(arguments).is_ok());
+        for flag in ["--group", "--namespace", "--emergency"] {
+            let mut rejected = arguments.to_vec();
+            rejected.push(flag);
+            rejected.push("unexpected");
+            assert!(Cli::try_parse_from(rejected).is_err());
+        }
+    }
 }

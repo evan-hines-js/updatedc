@@ -557,8 +557,16 @@ impl<'a> Observations<'a> {
     /// `deployment` have converged. The shared report predicate owns that definition; this wrapper
     /// only supplies the control plane's expected identities.
     fn converged(&self, node: &str, identity: &str, deployment: &DesiredDeployment) -> bool {
-        self.report(node)
-            .is_some_and(|report| report.is_converged_to(identity, &deployment.application.sha256))
+        self.report(node).is_some_and(|report| {
+            report.is_converged_to(
+                identity,
+                &deployment
+                    .application
+                    .target_reference()
+                    .expect("validated release graph")
+                    .sha256,
+            )
+        })
     }
 
     /// How far this group has progressed toward the deployment it is admitted to.
@@ -1530,6 +1538,49 @@ struct RollbackResponse<'a> {
     blocks: &'a BTreeSet<String>,
 }
 
+/// Automatic return movement requires the same unanimous set policy at admission and response.
+pub(crate) fn rollback_groups(
+    sets: &[UpdateGroupSet],
+    desired: &BTreeMap<String, DesiredDeployment>,
+    group_labels: &BTreeMap<String, BTreeMap<String, String>>,
+) -> BTreeSet<String> {
+    let mut policies: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for set in sets {
+        for member in set_members(set, desired, group_labels) {
+            let entry = policies.entry(member).or_default();
+            entry.0 += 1;
+            if set.spec.on_regression == crate::RegressionResponse::Rollback {
+                entry.1 += 1;
+            }
+        }
+    }
+    policies
+        .into_iter()
+        .filter_map(|(group, (governing, rollback))| {
+            (governing > 0 && governing == rollback).then_some(group)
+        })
+        .collect()
+}
+
+/// Select the newest permitted restoration under the same movement verdict for preflight and
+/// the actual regression response. A blocked baseline must never hide an eligible older one.
+pub(crate) fn rollback_target<'a>(
+    current: &DesiredDeployment,
+    previous: impl IntoIterator<Item = &'a DesiredDeployment>,
+    blocks: &BTreeSet<String>,
+) -> Option<(usize, DesiredDeployment)> {
+    previous
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, deployment)| {
+            let previous_identity = crate::deployment_identity(deployment)?;
+            let restored = current.rollback_to(deployment).ok()?;
+            let restored_identity = crate::deployment_identity(&restored)?;
+            (!blocks.contains(&previous_identity) && !blocks.contains(&restored_identity))
+                .then_some((index, restored))
+        })
+}
+
 fn rollback_response(
     response: RollbackResponse<'_>,
     admitted: &mut BTreeMap<String, AdmittedDeployment>,
@@ -1546,25 +1597,11 @@ fn rollback_response(
     if regressions.halts.is_empty() {
         return;
     }
-    // group → (governing sets, governing sets whose response is `rollback`).
-    let mut policies: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for set in sets {
-        for member in set_members(set, desired, group_labels) {
-            let entry = policies.entry(member).or_default();
-            entry.0 += 1;
-            if set.spec.on_regression == crate::RegressionResponse::Rollback {
-                entry.1 += 1;
-            }
-        }
-    }
-    let rebases: Vec<(String, String, usize)> = admitted
+    let policies = rollback_groups(sets, desired, group_labels);
+    let rebases: Vec<(String, String, usize, DesiredDeployment)> = admitted
         .iter()
         .filter(|(name, _)| desired.contains_key(*name))
-        .filter(|(name, _)| {
-            policies
-                .get(*name)
-                .is_some_and(|(governing, rollback)| *governing > 0 && governing == rollback)
-        })
+        .filter(|(name, _)| policies.contains(*name))
         .filter_map(|(name, state)| {
             let identity = crate::deployment_identity(&state.current)?;
             if !regressions.halts.contains_key(&identity) {
@@ -1574,12 +1611,10 @@ fn rollback_response(
             // the same union `assign_nodes` gates on, never the regression halts alone. A body
             // with no identity is skipped for the same reason a blocked one is: it can never be
             // published, so it is no way back.
-            let predecessor = state.previous.iter().position(|deployment| {
-                crate::deployment_identity(deployment).is_some_and(|body| !blocks.contains(&body))
-            })?;
-            Some((name.clone(), identity, predecessor))
+            let (index, restored) = rollback_target(&state.current, &state.previous, blocks)?;
+            Some((name.clone(), identity, index, restored))
         })
-        .filter(|(name, identity, _)| {
+        .filter(|(name, identity, _, _)| {
             // The provers this rebase actually moves: the group's own members. The fleet-wide set
             // is what the halt counts; this gate is about the machines whose `current` is about to
             // change under them.
@@ -1603,12 +1638,17 @@ fn rollback_response(
             })
         })
         .collect();
-    for (name, identity, index) in rebases {
+    for (name, identity, index, restored) in rebases {
         let state = admitted
             .get_mut(&name)
             .expect("rebases were drawn from admitted");
         let predecessor = state.previous.remove(index);
-        let halted = std::mem::replace(&mut state.current, predecessor);
+        let halted = std::mem::replace(&mut state.current, restored);
+        // A richer catalog changes the assignment identity. Retain the historical body while
+        // baseline nodes still carry it, so staging can hold them on their exact prior assignment.
+        if predecessor != state.current {
+            state.previous.insert(0, predecessor);
+        }
         let (deployment, evidence) = regressions.halts[&identity].clone();
         tracing::warn!(
             group = name,
@@ -2297,11 +2337,14 @@ mod tests {
             deployment: id.into(),
             metadata_url: "https://cdn/m/".into(),
             targets_url: "https://cdn/t/".into(),
-            application: crate::ExactTarget {
-                path: "app".into(),
-                sha256: DIGEST.into(),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "app".into(),
+                    sha256: DIGEST.into(),
+                },
+            ),
+
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: runtime(),
         }
@@ -2426,8 +2469,43 @@ mod tests {
     /// application has no distinguishable rollback).
     fn deployment_with_app(id: &str, app_sha: &str) -> DesiredDeployment {
         let mut deployment = deployment_named(id);
-        deployment.application.sha256 = app_sha.into();
         deployment
+            .application
+            .releases
+            .get_mut(&deployment.application.target)
+            .unwrap()
+            .package
+            .sha256 = app_sha.into();
+        deployment
+    }
+
+    /// Model immutable versions with explicitly reversible fixture packages. All deployment
+    /// snapshots share this catalog so policy tests can compare exact restored configurations.
+    fn share_release_catalog(deployments: &mut [&mut DesiredDeployment]) {
+        let versions: Vec<String> = (1..=deployments.len())
+            .map(|v| format!("{v}.0.0"))
+            .collect();
+        let releases = deployments
+            .iter()
+            .enumerate()
+            .map(|(index, deployment)| {
+                (
+                    versions[index].clone(),
+                    updated_contracts::releases::Release {
+                        package: deployment.application.target_reference().unwrap().clone(),
+                        installable: true,
+                        upgrade_from: versions[..index].iter().cloned().collect(),
+                        rollback_from: versions[index + 1..].iter().cloned().collect(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (index, deployment) in deployments.iter_mut().enumerate() {
+            deployment.application = updated_contracts::releases::ReleaseGraph {
+                target: versions[index].clone(),
+                releases: releases.clone(),
+            };
+        }
     }
 
     /// A report of a node acting on EXACTLY `deployment`'s assignment while RUNNING `archive` —
@@ -7934,7 +8012,12 @@ mod tests {
             &deployment.deployment,
             identity,
             "1.0.0",
-            deployment.application.sha256.clone(),
+            deployment
+                .application
+                .target_reference()
+                .expect("validated release graph")
+                .sha256
+                .clone(),
             "9".repeat(64),
             true,
         )
@@ -9414,7 +9497,15 @@ mod tests {
 
         // The fetch succeeds on a later tick and the node commits: ordinary settlement, unchanged.
         let mut reports = settled_v0.clone();
-        let (node, envelope) = report_running("n-a", &a1, &a1.application.sha256, true);
+        let (node, envelope) = report_running(
+            "n-a",
+            &a1,
+            &a1.application
+                .target_reference()
+                .expect("validated release graph")
+                .sha256,
+            true,
+        );
         reports.insert(node, envelope);
         let plan = pass(
             &groups,
@@ -9568,7 +9659,15 @@ mod tests {
         // n1 commits v1. The group is now done — and done FAILED, because a node of it never got
         // the release and never will.
         let mut landed = mixed.clone();
-        let (name, envelope) = report_running("n1", &v1, &v1.application.sha256, true);
+        let (name, envelope) = report_running(
+            "n1",
+            &v1,
+            &v1.application
+                .target_reference()
+                .expect("validated release graph")
+                .sha256,
+            true,
+        );
         landed.insert(name, envelope);
         let plan = pass(
             &groups,
@@ -9624,9 +9723,10 @@ mod tests {
     #[test]
     fn a_rollback_policy_rebases_onto_the_predecessor_and_the_veto_survives_evidence_loss() {
         let hex = |c: char| c.to_string().repeat(64);
-        let v0 = deployment_with_app("v0", &hex('1'));
-        let v1 = deployment_with_app("v1", &hex('2'));
-        let v2 = deployment_with_app("v2", &hex('3'));
+        let mut v0 = deployment_with_app("v0", &hex('1'));
+        let mut v1 = deployment_with_app("v1", &hex('2'));
+        let mut v2 = deployment_with_app("v2", &hex('3'));
+        share_release_catalog(&mut [&mut v0, &mut v1, &mut v2]);
         let arch0 = hex('1');
         let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
 
@@ -9689,7 +9789,15 @@ mod tests {
 
         // 1. n1 rejected v1 and is still unhealthy: halted, not rebased, nothing vetoed.
         let mut reports: HashMap<String, Envelope> = HashMap::from([
-            report_running("n0", &v1, &v1.application.sha256, true),
+            report_running(
+                "n0",
+                &v1,
+                &v1.application
+                    .target_reference()
+                    .expect("validated release graph")
+                    .sha256,
+                true,
+            ),
             report_running("n2", &v0, &arch0, true),
             report_rejected_unrecovered("n1", &v1, &arch0),
         ]);
@@ -9797,8 +9905,9 @@ mod tests {
     #[test]
     fn a_rollback_does_not_wait_on_a_prover_outside_the_group_it_rebases() {
         let hex = |c: char| c.to_string().repeat(64);
-        let v0 = deployment_with_app("v0", &hex('1'));
-        let v1 = deployment_with_app("v1", &hex('2'));
+        let mut v0 = deployment_with_app("v0", &hex('1'));
+        let mut v1 = deployment_with_app("v1", &hex('2'));
+        share_release_catalog(&mut [&mut v0, &mut v1]);
         let arch0 = hex('1');
         let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
 
@@ -9912,8 +10021,9 @@ mod tests {
     #[test]
     fn a_rollback_refuses_a_predecessor_the_same_verdict_halted() {
         let hex = |c: char| c.to_string().repeat(64);
-        let v0 = deployment_with_app("v0", &hex('1'));
-        let v1 = deployment_with_app("v1", &hex('2'));
+        let mut v0 = deployment_with_app("v0", &hex('1'));
+        let mut v1 = deployment_with_app("v1", &hex('2'));
+        share_release_catalog(&mut [&mut v0, &mut v1]);
         let arch_pre = hex('9');
         let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
 
@@ -9952,7 +10062,15 @@ mod tests {
         // the "every prover recovered" shape the response fires on.
         let reports: HashMap<String, Envelope> = HashMap::from([
             report_rejected("n0", &v0, &arch_pre),
-            report_running("n1", &v1, &v1.application.sha256, true),
+            report_running(
+                "n1",
+                &v1,
+                &v1.application
+                    .target_reference()
+                    .expect("validated release graph")
+                    .sha256,
+                true,
+            ),
         ]);
         let plan = plan_rollouts(
             &sets,
@@ -10000,6 +10118,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rollback_skips_an_unreachable_baseline_for_a_supported_older_release() {
+        let mut oldest = deployment_with_app("oldest", &"1".repeat(64));
+        let mut previous = deployment_with_app("previous", &"2".repeat(64));
+        let mut current = deployment_with_app("current", &"3".repeat(64));
+        share_release_catalog(&mut [&mut oldest, &mut previous, &mut current]);
+        current
+            .application
+            .releases
+            .get_mut("2.0.0")
+            .unwrap()
+            .rollback_from
+            .clear();
+        let (index, restored) = rollback_target(&current, [&previous, &oldest], &BTreeSet::new())
+            .expect("the declared direct return to 1.0.0 remains usable");
+        assert_eq!(index, 1);
+        assert_eq!(restored.deployment, oldest.deployment);
+        assert_eq!(restored.application.target, "1.0.0");
+        assert_eq!(
+            restored
+                .application
+                .route(Some("3.0.0"), |_, _| true)
+                .unwrap(),
+            ["1.0.0"]
+        );
+    }
+
     /// The predecessor gate reads the SAME union `assign_nodes` does, so external compliance
     /// blocks it too — and, having refused one predecessor, the walk carries on to the next.
     ///
@@ -10011,9 +10156,10 @@ mod tests {
     #[test]
     fn a_rollback_walks_past_a_predecessor_external_compliance_blocks() {
         let hex = |c: char| c.to_string().repeat(64);
-        let v0 = deployment_with_app("v0", &hex('1'));
-        let v1 = deployment_with_app("v1", &hex('2'));
-        let v2 = deployment_with_app("v2", &hex('3'));
+        let mut v0 = deployment_with_app("v0", &hex('1'));
+        let mut v1 = deployment_with_app("v1", &hex('2'));
+        let mut v2 = deployment_with_app("v2", &hex('3'));
+        share_release_catalog(&mut [&mut v0, &mut v1, &mut v2]);
         let (arch0, arch1) = (hex('1'), hex('2'));
         let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
 
@@ -10109,8 +10255,9 @@ mod tests {
     #[test]
     fn a_late_qualifying_group_rebases_though_its_provers_have_moved_off() {
         let hex = |c: char| c.to_string().repeat(64);
-        let v0 = deployment_with_app("v0", &hex('1'));
-        let v1 = deployment_with_app("v1", &hex('2'));
+        let mut v0 = deployment_with_app("v0", &hex('1'));
+        let mut v1 = deployment_with_app("v1", &hex('2'));
+        share_release_catalog(&mut [&mut v0, &mut v1]);
         let arch0 = hex('1');
         let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
 
@@ -10173,7 +10320,15 @@ mod tests {
         // n0 has been running the predecessor for hours; its claim about v1 stands regardless.
         let reports: HashMap<String, Envelope> = HashMap::from([
             report_running("n0", &v0, &arch0, true),
-            report_running("n1", &v1, &v1.application.sha256, true),
+            report_running(
+                "n1",
+                &v1,
+                &v1.application
+                    .target_reference()
+                    .expect("validated release graph")
+                    .sha256,
+                true,
+            ),
             report_running("n2", &v0, &arch0, true),
         ]);
         let plan = plan_rollouts(
@@ -10227,8 +10382,9 @@ mod tests {
     #[test]
     fn a_split_regression_policy_freezes_without_moving_anyone() {
         let hex = |c: char| c.to_string().repeat(64);
-        let v0 = deployment_with_app("v0", &hex('1'));
-        let v1 = deployment_with_app("v1", &hex('2'));
+        let mut v0 = deployment_with_app("v0", &hex('1'));
+        let mut v1 = deployment_with_app("v1", &hex('2'));
+        share_release_catalog(&mut [&mut v0, &mut v1]);
         let arch0 = hex('1');
         let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
 
@@ -10285,7 +10441,8 @@ mod tests {
     #[test]
     fn a_first_deployment_regression_only_halts_when_there_is_no_predecessor() {
         let hex = |c: char| c.to_string().repeat(64);
-        let v1 = deployment_with_app("v1", &hex('2'));
+        let mut v1 = deployment_with_app("v1", &hex('2'));
+        share_release_catalog(&mut [&mut v1]);
         let arch0 = hex('1');
         let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
 

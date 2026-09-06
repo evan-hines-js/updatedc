@@ -2337,7 +2337,6 @@ mod tests {
     /// convergence.
     #[test]
     fn the_heartbeat_reports_a_rejection_of_exactly_the_assigned_release() {
-        use updated_contracts::artifact::TargetReference;
         use updated_contracts::assignment::RepositoryAssignment;
 
         let assignment = RepositoryAssignment {
@@ -2345,11 +2344,14 @@ mod tests {
             deployment: "deployment".into(),
             metadata_url: "https://repo/metadata/".into(),
             targets_url: "https://repo/targets/".into(),
-            application: TargetReference {
-                path: "releases/app/2/app.bundle".into(),
-                sha256: "a".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "releases/app/2/app.bundle".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+
             release_root: serde_json::json!({}),
             runtime: runtime(),
         };
@@ -2368,17 +2370,38 @@ mod tests {
             "a rejection of OTHER bytes says nothing about the assigned release"
         );
         store
-            .reject_deployment(&lineage, &assignment.application.sha256)
+            .reject_deployment(
+                &lineage,
+                &assignment
+                    .application
+                    .target_reference()
+                    .expect("validated release graph")
+                    .sha256,
+            )
             .unwrap();
         assert!(rejects_release(&store, &lineage, &assignment));
         assert!(
-            !store.is_rejected(&lineage, &assignment.application.sha256),
+            !store.is_rejected(
+                &lineage,
+                &assignment
+                    .application
+                    .target_reference()
+                    .expect("validated release graph")
+                    .sha256
+            ),
             "a failed combination does not poison either reusable artifact"
         );
 
         let mut malformed_artifact_store = Store::default();
         malformed_artifact_store
-            .reject_artifact(&lineage, &assignment.application.sha256)
+            .reject_artifact(
+                &lineage,
+                &assignment
+                    .application
+                    .target_reference()
+                    .expect("validated release graph")
+                    .sha256,
+            )
             .unwrap();
         assert!(rejects_release(
             &malformed_artifact_store,
@@ -2393,6 +2416,65 @@ mod tests {
         let elsewhere_lineage = RepositoryLineage::from_metadata_url(&elsewhere.metadata_url)
             .expect("fixture metadata URL is valid");
         assert!(!rejects_release(&store, &elsewhere_lineage, &elsewhere));
+
+        let package_sha = assignment
+            .application
+            .target_reference()
+            .unwrap()
+            .sha256
+            .clone();
+        let provisional = InstalledState::provisional(
+            lineage.clone(),
+            release("1.0.0", "first-install"),
+            package_sha.clone(),
+            provider(),
+        );
+        let mut first_install = store_holding(&provisional);
+        first_install
+            .reject_deployment(&lineage, &package_sha)
+            .unwrap();
+        assert!(
+            rejects_release(&first_install, &lineage, &assignment),
+            "a rejected provisional target is not a successful empty route"
+        );
+
+        let mut proven = provisional.clone();
+        proven.prove_provisional();
+        let mut settled = store_holding(&proven);
+        settled.reject_deployment(&lineage, &package_sha).unwrap();
+        assert!(
+            !rejects_release(&settled, &lineage, &assignment),
+            "historical rejection cannot undo evidence that the target is proven"
+        );
+
+        let mut next = assignment.clone();
+        next.application.releases.insert(
+            "2.0.0".into(),
+            updated_contracts::releases::Release {
+                package: updated_contracts::artifact::TargetReference {
+                    path: "next".into(),
+                    sha256: "b".repeat(64),
+                },
+                upgrade_from: std::collections::BTreeSet::from(["1.0.0".into()]),
+                rollback_from: Default::default(),
+                installable: false,
+            },
+        );
+        next.application.target = "2.0.0".into();
+        settled
+            .reject_deployment(&lineage, &"b".repeat(64))
+            .unwrap();
+        assert!(rejects_release(&settled, &lineage, &next));
+        next.application
+            .releases
+            .get_mut("1.0.0")
+            .unwrap()
+            .package
+            .sha256 = "d".repeat(64);
+        assert!(
+            !rejects_release(&settled, &lineage, &next),
+            "an incompatible source identity is not a rejection of the assigned route"
+        );
     }
 
     #[test]

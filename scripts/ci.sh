@@ -724,7 +724,7 @@ controller_slice_denied = False
 gateway_agent_boundary = False
 gateway_agent_binding = False
 role_binding_subjects = {}
-credential_projections = 0
+credential_projections = set()
 for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
     if not doc:
       continue
@@ -790,7 +790,8 @@ for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
         # Every explicit Secret volume contains credential material. Its projection must be
         # readable by the workload's one group, never by every process in the container.
         assert volume["secret"].get("defaultMode") == 0o440, volume
-        credential_projections += 1
+        component = doc["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/component"]
+        credential_projections.add((component, volume["name"]))
       continue
     if doc["kind"] != "Role":
       continue
@@ -836,7 +837,10 @@ assert configmap_boundary, "dynamic ConfigMap writes have no fail-closed admissi
 assert controller_slice_denied, "the controller can exercise its delegation-only EndpointSlice verb"
 assert gateway_agent_boundary, "gateway UpdateAgent writes have no fail-closed field boundary"
 assert gateway_agent_binding, "gateway UpdateAgent boundary is not pinned to its repository parameter"
-assert credential_projections == 4, credential_projections
+assert credential_projections == {
+    ("controller", "client-ca"), ("controller", "alert-token"),
+    ("gateway", "gateway-tls"), ("gateway", "client-ca"), ("gateway", "issuing-ca"),
+}, credential_projections
 print("ok: separate identities, one-time volume ownership, owner-group-only credentials, and Secret, UpdateAgent, ConfigMap, and EndpointSlice authority explicitly bounded")
 PY
   helm template updatec deploy/charts/updatec -n updated-system \

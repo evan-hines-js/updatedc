@@ -109,31 +109,13 @@ pub(crate) async fn ensure_installed(
                 .into(),
         ),
         (updated::state::Installed::Present(state), updated::state::InstallHistory::Present) => {
-            // A *provisional* head (`confirmed == false`, never passed a health gate) that has
-            // been rejected must not be relaunched into a crash loop. This is the first-install
-            // case: a fresh node cold-installs its (broken) assigned head, the boot rejects it on
-            // crash/wedge, and it restarts. Re-run the cold install so cold-install fallback descends
-            // past the rejected head to the newest healthy release. (Storage is persistent, so this
-            // only ever happens during a node's initial install, never a mid-life state loss.)
-            //
-            // The `confirmed` gate is load-bearing: a *confirmed* head that a normal update/rollback
-            // later rejects is recovered by the update state machine (its journal restores the
-            // predecessor). Re-installing there would preempt that recovery and strand the node. So
-            // defer whenever the head has proven healthy, or an update transaction is mid-flight.
-            if !state.is_proven()
-                && store.journal()?.is_none()
-                && store.rejects_deployment(&state.repository_lineage, &state.archive_sha256)
-            {
-                warn(&format!(
-                    "provisional head {} is rejected; re-installing so cold-install fallback descends past it",
-                    state.release.version
-                ));
-                apply_install(opts, store).await?;
-                Ok(true)
-            } else {
-                Ok(false)
+            if !state.is_proven() && store.journal()?.is_none()
+                && store.rejects_deployment(&state.repository_lineage, &state.archive_sha256) {
+                return Err(format!("rejected installation {} requires explicit recovery; refusing to reinstall through another graph root", state.release.version).into());
             }
+            Ok(false)
         }
+
         (updated::state::Installed::Present(_), _) => {
             Err("installed state exists without a valid enrollment record".into())
         }
@@ -156,51 +138,32 @@ async fn apply_install(
         .assignment_context()
         .ok_or("the first trusted repository has no desired deployment")?;
     let lineage = assignment.repository_lineage().clone();
-    // Resolve, download and verify the first application, descending past any *malformed* bundle
-    // inline. A malformed head (corrupt archive, bad manifest, bad/missing entrypoint) passes its
-    // signed archive sha but fails to extract/validate — the update path rejects it and moves on
-    // (see `check_application`), and cold install must do the same or a first-install node stalls
-    // forever re-downloading a bundle it can never install. Each iteration rejects one malformed
-    // head and re-selects, so cold-install fallback monotonically descends to the newest *installable*
-    // release; the loop terminates when one installs or nothing selectable remains.
+    // Malformed archives are rejected before any entrypoint runs. Re-plan only complete routes
+    // to the requested target; installing a healthy dead end is never a successful fallback.
     let (prepared, providers) = loop {
         let request = crate::acquire::ApplicationRequest {
             repository: &repo,
             application: &opts.application,
             paths: &opts.paths,
-            // A cold install: nothing is on this node, so there is no floor and a signed
-            // `coldInstallFallback` may descend. The one stance that permits a descent.
+            // Only the missing-state installation boundary can choose an installable root.
             stance: updated_tuf::select::Stance::Nothing,
         };
-        let selected = match crate::acquire::select_assigned_application(
-            &request,
-            |application_sha256| store.rejects_deployment(&lineage, application_sha256),
-        ) {
-            Ok(Some(selected)) => selected,
-            Ok(None) => {
-                // Enumerate exactly what the repository offered and why nothing was selectable, so
-                // an empty cold-install-fallback descent is diagnosable rather than opaque. Rejection
-                // is never-retry evidence: there is no availability exception that may relaunch
-                // already-rejected bytes, even when this node previously committed them.
-                let policy = updated_tuf::DefaultPolicy::current(
-                    &opts.application.product,
-                    &opts.application.channel,
-                );
-                let diagnostics = repo.selection_diagnostics(
-                    &policy,
-                    updated_tuf::select::Stance::Nothing,
-                    |application_sha256| store.rejects_deployment(&lineage, application_sha256),
-                );
-                return Err(format!(
-                    "the first trusted assignment contains no installable application; cold-install \
-                     fallback found nothing selectable at or below the assigned head:\n{diagnostics}"
-                )
-                .into());
-            }
-            // A failure to read the signed metadata at all says nothing about any release, so
-            // nothing is rejected: the boot retries the whole cold install later.
-            Err(error) => return Err(format!("preparing the first application: {error}").into()),
-        };
+        let selected =
+            match crate::acquire::select_assigned_application(&request, |application_sha256| {
+                store.rejects_deployment(&lineage, application_sha256)
+            }) {
+                Ok(Some(selected)) => selected,
+                Ok(None) => {
+                    return Err(
+                        "the assignment has no supported installation route to its target".into(),
+                    )
+                }
+                // A failure to read the signed metadata at all says nothing about any release, so
+                // nothing is rejected: the boot retries the whole cold install later.
+                Err(error) => {
+                    return Err(format!("preparing the first application: {error}").into())
+                }
+            };
         match crate::acquire::prepare_assigned_application(&request, selected).await {
             Ok(prepared) => {
                 let execution = prepared.reconciler.clone();
@@ -276,7 +239,7 @@ async fn place_and_commit(
     }
     // Commit the head *provisional*: it has never launched, let alone proven healthy. If it turns
     // out to be a broken assigned head (crashes or wedges before its first passing gate) the boot
-    // rejects it from this record and cold-install fallback descends past it; the first passing health
+    // rejects it from this record and holds for explicit recovery; the first passing health
     // gate flips it to confirmed.
     store.commit_installed(&updated::state::InstalledState::provisional(
         tx.repository_lineage.clone(),

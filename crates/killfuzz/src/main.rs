@@ -233,7 +233,7 @@ fn run() -> R {
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
-    // Round 1 starts with only a healthy 1.0.0 floor and cold-install fallback signed in. The
+    // Round 1 starts with a single installable 1.0.0 release. The
     // corrupt 2.0.0 and healthy 3.0.0 heads are published live BETWEEN rounds (below), which re-signs
     // the assignment in place, so the running stack rolls forward exactly as a fleet push would.
     ctx.publish(&dir, "app", "1.0.0", &app_v(&ctx, "1.0.0"))?;
@@ -243,7 +243,6 @@ fn run() -> R {
     let cmd = Node::new(&ctx, &dir, srv, "app")
         .cold_install()
         .workload(svc)
-        .cold_install_fallback()
         .check_interval("1s")
         .health_grace("2s")
         // A short confirmation window (default is 120s) so a committed update confirms quickly

@@ -25,7 +25,7 @@ pub(crate) struct AdmittedShardLimit(u8);
 impl AdmittedShardLimit {
     pub(crate) fn new(configured: u8) -> Result<Self, StorageError> {
         if !(1..=MAX_ADMITTED_STATE_SHARDS).contains(&usize::from(configured)) {
-            return Err(StorageError(format!(
+            return Err(StorageError::Operation(format!(
                 "stateMaxShards must be between 1 and {MAX_ADMITTED_STATE_SHARDS}"
             )));
         }
@@ -200,11 +200,11 @@ pub(crate) fn prepare_admitted_state(
     state: &DurableRolloutState,
     max_shards: AdmittedShardLimit,
 ) -> Result<PreparedAdmittedState, Box<dyn std::error::Error>> {
-    state.validate().map_err(StorageError)?;
+    state.validate().map_err(StorageError::Operation)?;
     let encoded = serde_json::to_vec(&StoredDurableRolloutState::from(state))?;
     let capacity = max_shards.count() * ADMITTED_STATE_SHARD_MAX_BYTES;
     if encoded.len() > capacity {
-        return Err(Box::new(StorageError(format!(
+        return Err(Box::new(StorageError::Operation(format!(
             "StateCapacityExceeded: durable rollout state is {} bytes but stateMaxShards={} \
              permits exactly {} bytes; raise spec.stateMaxShards before publishing this fleet",
             encoded.len(),
@@ -257,7 +257,7 @@ pub(crate) async fn load_admitted_state(
         return Ok((DurableRolloutState::default(), None));
     };
     let resource_version = configmap.metadata.resource_version.clone().ok_or_else(|| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "admitted-state index {name} has no resourceVersion"
         ))
     })?;
@@ -266,17 +266,17 @@ pub(crate) async fn load_admitted_state(
         .as_ref()
         .and_then(|data| data.get("index.json"))
         .ok_or_else(|| {
-            StorageError(format!(
+            StorageError::Operation(format!(
                 "admitted-state index {name} has no index.json; {ADMITTED_STATE_REMEDY}"
             ))
         })?;
     let index: AdmittedStateIndex = serde_json::from_str(encoded).map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "invalid admitted-state index {name}: {error}; {ADMITTED_STATE_REMEDY}"
         ))
     })?;
     index.validate().map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "invalid admitted-state index {name}: {error}; {ADMITTED_STATE_REMEDY}"
         ))
     })?;
@@ -299,10 +299,9 @@ pub(crate) async fn load_admitted_state(
         cleaned = true;
     }
     if cleaned {
-        let namespace =
-            configmap.metadata.namespace.as_deref().ok_or_else(|| {
-                StorageError(format!("admitted-state index {name} has no namespace"))
-            })?;
+        let namespace = configmap.metadata.namespace.as_deref().ok_or_else(|| {
+            StorageError::Operation(format!("admitted-state index {name} has no namespace"))
+        })?;
         let owner = configmap
             .metadata
             .owner_references
@@ -332,13 +331,13 @@ pub(crate) async fn load_admitted_state(
     for shard_index in 0..total {
         let shard_name = admitted_state_shard_name(name, active, shard_index);
         let shard = configmaps.get(&shard_name).await.map_err(|error| {
-            StorageError(format!(
+            StorageError::Operation(format!(
                 "cannot read admitted-state shard {shard_name}: {error}; {ADMITTED_STATE_REMEDY}"
             ))
         })?;
         validate_admitted_state_shard(&shard, revision, active, shard_index, total).map_err(
             |error| {
-                StorageError(format!(
+                StorageError::Operation(format!(
                     "invalid admitted-state shard {shard_name}: {error}; {ADMITTED_STATE_REMEDY}"
                 ))
             },
@@ -355,18 +354,18 @@ pub(crate) async fn load_admitted_state(
         &updated_contracts::digest::sha256_bytes(&encoded),
         revision,
     ) {
-        return Err(Box::new(StorageError(format!(
+        return Err(Box::new(StorageError::Operation(format!(
             "admitted-state shards for {name} do not match index revision {revision}; \
              {ADMITTED_STATE_REMEDY}"
         ))));
     }
     let stored: StoredDurableRolloutState = serde_json::from_slice(&encoded).map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "invalid admitted-state document for {name}: {error}; {ADMITTED_STATE_REMEDY}"
         ))
     })?;
     let state = DurableRolloutState::try_from(stored).map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "invalid admitted-state document for {name}: {error}; {ADMITTED_STATE_REMEDY}"
         ))
     })?;
@@ -404,7 +403,7 @@ pub(crate) async fn remove_pending_publication_journal(path: &Path) -> Result<()
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(StorageError(format!(
+        Err(error) => Err(StorageError::Operation(format!(
             "cannot remove pending publication journal {}: {error}; refusing to continue with replayable rollout state",
             path.display()
         ))),
@@ -456,26 +455,26 @@ pub(crate) async fn recover_pending_publication(
             return Ok((durable, resource_version));
         }
         Err(error) => {
-            return Err(Box::new(StorageError(format!(
+            return Err(Box::new(StorageError::Operation(format!(
                 "cannot read pending publication journal {}: {error}; refusing to plan from a possibly stale rollout baseline",
                 path.display()
             ))));
         }
     };
     let pending: PendingPublication = serde_json::from_slice(&bytes).map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "invalid pending publication journal {}: {error}; refusing to plan from a possibly stale rollout baseline",
             path.display()
         ))
     })?;
     if pending.version == 0 || pending.marker.validate().is_err() {
-        return Err(Box::new(StorageError(format!(
+        return Err(Box::new(StorageError::Operation(format!(
             "invalid pending publication identity in {}; refusing to plan from a possibly stale rollout baseline",
             path.display()
         ))));
     }
     let pending_state = DurableRolloutState::try_from(pending.state).map_err(|error| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "invalid pending rollout state in {}: {error}; refusing to plan from a possibly stale rollout baseline",
             path.display()
         ))
@@ -766,9 +765,9 @@ pub(crate) async fn write_admitted_state_index(
     resource_version: Option<String>,
     owner: Option<OwnerReference>,
 ) -> Result<AdmittedStateVersion, Box<dyn std::error::Error>> {
-    index
-        .validate()
-        .map_err(|error| StorageError(format!("refusing to write invalid state index: {error}")))?;
+    index.validate().map_err(|error| {
+        StorageError::Operation(format!("refusing to write invalid state index: {error}"))
+    })?;
     let configmap = ConfigMap {
         metadata: kube::api::ObjectMeta {
             name: Some(name.to_string()),
@@ -794,7 +793,7 @@ pub(crate) async fn write_admitted_state_index(
             .await?
     };
     let resource_version = written.metadata.resource_version.ok_or_else(|| {
-        StorageError(format!(
+        StorageError::Operation(format!(
             "apiserver returned state index {name} without resourceVersion"
         ))
     })?;
@@ -821,7 +820,7 @@ impl AdmittedStateProjection<'_> {
         bytes: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
         if bytes.len() > ADMITTED_STATE_SHARD_MAX_BYTES {
-            return Err(Box::new(StorageError(format!(
+            return Err(Box::new(StorageError::Operation(format!(
                 "state shard {index} is {} bytes, over the {}-byte ceiling",
                 bytes.len(),
                 ADMITTED_STATE_SHARD_MAX_BYTES

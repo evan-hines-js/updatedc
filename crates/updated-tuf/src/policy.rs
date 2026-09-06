@@ -1,6 +1,6 @@
 //! Product policy applied *after* TUF authentication and *before* any target
-//! bytes are installed. TUF proves a target is authentic; policy decides whether
-//! this installation should accept it (right product/platform, upgrade-only).
+//! bytes are installed. TUF proves a target is authentic; policy checks its product and platform.
+//! The shared release graph exclusively owns installation roots and permitted version transitions.
 
 use crate::VerifiedTarget;
 
@@ -17,8 +17,7 @@ impl std::fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-/// Requires the candidate's signed custom metadata to match the configured
-/// product/channel/os/arch, and refuses versions below the installed one.
+/// Requires the candidate's signed custom metadata to match the configured product/channel/os/arch.
 ///
 /// Deployed code builds this with [`DefaultPolicy::current`], which fills `os`/`arch`
 /// from the running host — the only values a runnable target can carry. The fields
@@ -104,25 +103,6 @@ impl DefaultPolicy {
             }
         }
         parse_semver(version)
-    }
-
-    /// Authorize an authenticated candidate for this installation, including
-    /// identity/platform matching and upgrade-only version policy.
-    pub fn authorize(
-        &self,
-        installed_version: Option<&str>,
-        candidate: &VerifiedTarget,
-    ) -> Result<(), PolicyError> {
-        let candidate_sv = self.candidate_version(candidate)?;
-        if let Some(installed_version) = installed_version {
-            let installed_sv = parse_semver(installed_version)?;
-            if candidate_sv < installed_sv {
-                return Err(PolicyError(format!(
-                    "refusing downgrade {installed_version} -> {candidate_sv}"
-                )));
-            }
-        }
-        Ok(())
     }
 }
 

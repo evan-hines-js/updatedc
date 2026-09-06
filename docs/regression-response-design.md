@@ -187,3 +187,18 @@ SAME generation, that every affected set publishes the halt with its evidence co
 group's `DeploymentHalted` condition is True, and that the alert webhook actually received a
 transition document for EACH halted cohort — matched by the resource it names and the
 `group@version` identity in its evidence, so one delivered document cannot stand in for the rest.
+
+## Release graph return paths
+
+Restoring a deployment retains the current release catalog and retargets it to the prior package;
+it does not replay a historical assignment whose catalog predates the intervening releases.
+The prior target must retain its exact package identity. `rollbackFrom` edges declare supported
+return steps, and every step uses the same package verification, transaction, and confirmation
+path as an upgrade. Before a changed rollback-enabled rollout is admitted, the controller checks
+complete return paths from every possible completed hop and verifies their signed metadata and
+object availability. Missing return topology blocks the whole cohort before its first assignment.
+
+The live fleet regression test submits a missing return edge and proves no assignment changes,
+then repairs the graph and exercises rollback across multiple completed intermediate versions.
+The portable four-agent graph scenario also covers branching routes, installable dead ends,
+a stranded source, and a three-hop return with an agent restart between hops.

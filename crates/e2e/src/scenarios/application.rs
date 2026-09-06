@@ -391,67 +391,41 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
     Ok(())
 }
 
-/// A stateless node whose *first* (cold) assignment is a broken head must not strand crash-looping
-/// it. This is the pod-kill-onto-a-broken-rollout case: an emptyDir node returns cold with no
-/// rejection history, cold-installs its assigned head, the release's own `converge` cannot start it —
-/// and, because cold-install fallback is signed in — rejects it and descends to the newest
-/// healthy release below it. Two broken heads are stacked above the good 1.0.0, so recovery must
-/// descend past BOTH. Run under the init model so the reject → descend cycle plays out exactly as it
-/// would in a container whose state dir survives container restarts.
-pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
+/// A failed first installation never silently substitutes a healthy older target.
+pub(crate) fn cold_install_rejects_broken_target(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21230", "127.0.0.1:21231");
-    let dir = ctx.work.join("cold-install-fallback");
+    let dir = ctx.work.join("cold-install-broken-target");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
-    // The good release below the broken heads.
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
-    // Two heads whose converge hook fails: bytes that verify and stage but whose entrypoint cannot
-    // exec, exactly like the fleet e2e's broken rollout versions. The assigned head is the newest
-    // (3.0.0), so recovery must descend past both 3.0.0 and 2.0.0 to reach the healthy 1.0.0.
     let broken = dir.join("broken-app");
     std::fs::write(&broken, b"not-a-runnable-application-entrypoint\n").map_err(str_err)?;
     ctx.publish(&dir, "app", "2.0.0", &broken)?;
-    ctx.publish(&dir, "app", "3.0.0", &broken)?;
     let _server = ctx.serve(&dir, srv)?;
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
-        .cold_install_fallback()
-        // v3 exercises health failure; v2 explicitly exits nonzero from converge on every
-        // platform, rather than relying on how the OS launches a malformed executable.
-        .mode(&format!("workload={svc},fail=converge"))
+        .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
         .command()?;
-    let node = Service::spawn("cold-install-fallback", &command);
-    // Recovery is proven when the descended-to 1.0.0 actually serves — the node recovered rather
-    // than crash-looping the broken head forever. A working descent takes a few boots (~30s); cap
-    // the wait so a failure surfaces its rich per-attempt diagnostics quickly instead of hanging.
-    if !wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT) {
-        let log = node.captured_log();
+    let node = Service::spawn("cold-install-broken-target", &command);
+    if !node.wait_for_log("rejected", CONVERGE_TIMEOUT) {
         return fail(format!(
-            "cold node stranded on a broken assigned head instead of descending to the healthy \
-             1.0.0. Agent log (the 'no installable application' lines enumerate every \
-             candidate and why each was skipped):\n{log}"
+            "failed target was not rejected: {}",
+            node.captured_log()
         ));
     }
-    // Durability: the committed install record names the descended-to 1.0.0, so a further restart
-    // converges 1.0.0 and never climbs back onto a rejected broken head.
-    let settled = wait_for_installed_version(&dir, "1.0.0", CONVERGE_TIMEOUT);
-    if !node.captured_log().contains("injected converge failure") {
-        return fail("cold-install fallback never exercised a nonzero converge result");
+    if !stays_true(READINESS_SETTLE, || {
+        http_text(&format!("http://{svc}/version")).is_none()
+    }) {
+        return fail("a rejected target silently installed an older release");
     }
-    drop(node);
-    if !settled {
-        return fail(
-            "descended app served 1.0.0 but the committed install record never settled on it",
-        );
-    }
-    ok("a cold node rejected two assigned heads whose converge hook failed and descended to the healthy 1.0.0");
+    ok("first-install failure requires recovery instead of substituting an older target");
     Ok(())
 }
 
-/// Rejection is a fail-closed invariant even when cold-install fallback has no lower release left.
+/// Rejection is a fail-closed invariant when the sole installable release fails.
 /// Once the only signed deployment has failed its first health gate, later boots must stop with
 /// diagnostics; they may never relaunch the rejected provisional head as an availability escape.
 pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &Ctx) -> R {
@@ -466,16 +440,12 @@ pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &C
     let _server = ctx.serve(&dir, srv)?;
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
-        .cold_install_fallback()
         .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
         .command()?;
     let node = Service::spawn("cold-install-exhausted", &command);
-    let failed_closed = node.wait_for_log(
-        "the first trusted assignment contains no installable application",
-        CONVERGE_TIMEOUT,
-    );
+    let failed_closed = node.wait_for_log("rejected", CONVERGE_TIMEOUT);
     let remained_down = stays_true(READINESS_SETTLE, || {
         http_text(&format!("http://{svc}/version")).is_none()
     });
@@ -484,69 +454,43 @@ pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &C
     drop(node);
     if !failed_closed || !remained_down || rejected.trim().is_empty() {
         return fail(format!(
-            "an exhausted cold-install fallback did not fail closed (diagnostic={failed_closed}, \
+            "a rejected installation did not fail closed (diagnostic={failed_closed}, \
              stayed_down={remained_down}, rejection_recorded={}):\n{log}",
             !rejected.trim().is_empty()
         ));
     }
-    ok("a cold node with no healthy fallback kept the rejected deployment down and emitted complete selection diagnostics");
+    ok("a cold node kept the rejected deployment down and emitted recovery diagnostics");
     Ok(())
 }
 
-/// A cold node whose assigned head is a *malformed* bundle — one that verifies its signed archive
-/// hash but cannot be extracted or validated (a corrupt or truncated tar.zst, not merely a bad
-/// entrypoint) — must reject it at ingest and descend, exactly like a head whose converge fails. Two
-/// distinct corruption kinds are stacked above the healthy 1.0.0, so cold-install fallback must reject
-/// two independent malformed hashes *before any hook runs* and land on 1.0.0. This guards the
-/// cold-install analogue of the update path's malformed-bundle rejection, which previously did not
-/// exist — a cold node re-downloaded a malformed head forever instead of descending past it.
-pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
+/// A malformed target is rejected before activation, even if older releases are installable.
+pub(crate) fn cold_install_rejects_corrupt_target(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21530", "127.0.0.1:21531");
     let dir = ctx.work.join("cold-install-corrupt");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
-    // Malformed-but-signed heads: 2.0.0 truncated, 3.0.0 pure garbage. Each verifies its signed
-    // archive hash yet fails to extract, so it is rejected at ingest by content hash — before any
-    // hook runs — and the descent must step past both.
-    // The sample binary is version-agnostic (version is stamped into the bundle by the publisher)
-    // and the archive is corrupted anyway, so any built source works; only 1.0.0/2.0.0 are built.
-    ctx.publish_corrupt(&dir, "app", "2.0.0", &app_v(ctx, "1.0.0"), "truncate")?;
-    ctx.publish_corrupt(&dir, "app", "3.0.0", &app_v(ctx, "1.0.0"), "garbage")?;
+    ctx.publish_corrupt(&dir, "app", "2.0.0", &app_v(ctx, "1.0.0"), "garbage")?;
     let _server = ctx.serve(&dir, srv)?;
     let command = Node::new(ctx, &dir, srv, "app")
         .cold_install()
-        .cold_install_fallback()
         .workload(svc)
         .check_interval("1s")
         .health_grace("2s")
         .command()?;
     let node = Service::spawn("cold-install-corrupt", &command);
-    // The malformed heads are rejected at ingest (no hook), so the descent is fast; keep a
-    // generous cap so a regression surfaces its diagnostics instead of hanging.
-    if !wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT) {
-        let log = node.captured_log();
+    if !node.wait_for_log("no supported route", CONVERGE_TIMEOUT) {
         return fail(format!(
-            "cold node stranded on a malformed assigned bundle instead of rejecting it at ingest \
-             and descending to the healthy 1.0.0:\n{log}"
+            "malformed target did not block installation: {}",
+            node.captured_log()
         ));
     }
-    let settled = wait_for_installed_version(&dir, "1.0.0", CONVERGE_TIMEOUT);
-    let rejected = std::fs::read_to_string(node_paths(&dir).rejected).unwrap_or_default();
-    let rejected_count = rejected.lines().filter(|l| !l.trim().is_empty()).count();
-    drop(node);
-    if !settled {
-        return fail(
-            "descended app served 1.0.0 but the committed install record never settled on it",
-        );
+    if node_paths(&dir).installed.exists() || http_text(&format!("http://{svc}/version")).is_some()
+    {
+        return fail("a malformed target caused a partial installation");
     }
-    if rejected_count < 2 {
-        return fail(format!(
-            "expected both malformed heads recorded rejected; saw {rejected_count}:\n{rejected}"
-        ));
-    }
-    ok("cold node rejected two malformed-but-signed assigned bundles at ingest and cold-install fallback descended to the healthy 1.0.0");
+    ok("malformed target blocks installation before any release is activated");
     Ok(())
 }
 

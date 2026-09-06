@@ -6,7 +6,7 @@ The agent automatically supplies a native, language-independent [reconciler help
 for invocation context, structured results, file convergence, verified migration progress, and
 boot identity. It ships with the agent; customers do not install a separate SDK or helper package.
 
-Customers use `updatectl deploy --entrypoint` with arbitrary scripts or executables. The
+Customers use `updatectl publish --entrypoint` with arbitrary scripts or executables. The
 [native runtime](command-adapter.md) implements this protocol for them, generates results, and
 handles replay policies; the entrypoint receives only its own arguments, never the protocol flags.
 

@@ -86,11 +86,14 @@ async fn preplaced_enrollment_resolves_offline_through_the_live_repository() {
         deployment: "offline".into(),
         metadata_url: "https://127.0.0.1:9/release/metadata/".into(),
         targets_url: "https://127.0.0.1:9/release/targets/".into(),
-        application: updated_contracts::artifact::TargetReference {
-            path: "products/offline-app/stable/1/linux-x86_64/app".into(),
-            sha256: "a".repeat(64),
-        },
-        cold_install_fallback: false,
+        application: updated_contracts::releases::testing::install(
+            "1.0.0",
+            updated_contracts::artifact::TargetReference {
+                path: "products/offline-app/stable/1/linux-x86_64/app".into(),
+                sha256: "a".repeat(64),
+            },
+        ),
+
         release_root: root.clone(),
         runtime,
     };
@@ -191,11 +194,14 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
             deployment: "commit".into(),
             metadata_url: metadata_url.into(),
             targets_url: "https://127.0.0.1:9/release/targets/".into(),
-            application: updated_contracts::artifact::TargetReference {
-                path: "products/app/stable/1/linux-x86_64/app".into(),
-                sha256: "a".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "products/app/stable/1/linux-x86_64/app".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+
             release_root: root.clone(),
             runtime: small_runtime("app", install.to_path_buf()),
         }
@@ -344,41 +350,19 @@ async fn publish_then_verify_and_download() {
         Some("1.0.0")
     );
 
-    // Policy: the right platform is authorized, an equal version is *not* a downgrade,
-    // and an older installed version is refused with a descriptive message.
+    // The same pinned-package verifier protects preflight, upgrades, and exact repair.
     let policy = policy();
-    policy.authorize(None, &found).unwrap();
-    policy
-        .authorize(Some("1.0.0"), &found)
-        .expect("same version is not a downgrade");
-    let downgrade = policy.authorize(Some("2.0.0"), &found).unwrap_err();
-    assert!(
-        downgrade.to_string().contains("policy rejected candidate"),
-        "{downgrade}"
-    );
-    assert!(
-        downgrade.to_string().contains("refusing downgrade"),
-        "{downgrade}"
-    );
-
-    // Selection picks the sole eligible release, and staging downloads exactly its
-    // verified bytes to the destination.
-    let selected = repo
-        .select_release(
-            &policy,
-            updated_tuf::select::Stance::Nothing,
-            |_| {},
-            |_, _| false,
-        )
-        .expect("selects the sole release");
-    assert_eq!(selected.version, "1.0.0");
-
-    let staged_path = tmp.join("staged");
-    let mut staged = repo
-        .download_target(&selected.target, &staged_path)
-        .await
-        .unwrap();
-    assert_eq!(staged.read_bounded(1024).unwrap(), b"hello-app-1.0.0");
+    let package = updated_contracts::artifact::TargetReference {
+        path: found.path.clone(),
+        sha256: updated_tuf::select::target_sha(&found),
+    };
+    repo.verify_release(&policy, "1.0.0", &package).unwrap();
+    assert!(repo.verify_release(&policy, "2.0.0", &package).is_err());
+    let mut wrong_platform = policy;
+    wrong_platform.arch = "wrong-architecture".into();
+    assert!(repo
+        .verify_release(&wrong_platform, "1.0.0", &package)
+        .is_err());
 
     let out = tmp.join("downloaded");
     let mut downloaded = repo.download_target(&found, &out).await.unwrap();

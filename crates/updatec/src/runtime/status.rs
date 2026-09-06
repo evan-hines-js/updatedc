@@ -845,8 +845,15 @@ pub(crate) async fn publish_resource_statuses(
 /// infrastructure detail (bucket, endpoint, object key), so it must NEVER be serialized into status
 /// — the caller logs the full `error` at error-level for operators and writes only this category
 /// here. Downcast is best-effort; anything unrecognized maps to the fully generic bucket.
-pub fn generic_failure_status(error: &(dyn std::error::Error + 'static)) -> &'static str {
-    if error.is::<kube::Error>() {
+pub fn generic_failure_status(
+    error: &(dyn std::error::Error + 'static),
+) -> std::borrow::Cow<'static, str> {
+    if let Some(crate::PlanError::ReleasePreflight { node, message }) =
+        error.downcast_ref::<crate::PlanError>()
+    {
+        return format!("rollout preflight blocked for {node}: {message}").into();
+    }
+    let message = if error.is::<kube::Error>() {
         "reconciliation failed: kubernetes API error (see controller logs)"
     } else if error.is::<StorageError>() {
         "reconciliation failed: repository storage error (see controller logs)"
@@ -856,7 +863,8 @@ pub fn generic_failure_status(error: &(dyn std::error::Error + 'static)) -> &'st
         "reconciliation failed: serialization error (see controller logs)"
     } else {
         "reconciliation failed (see controller logs)"
-    }
+    };
+    message.into()
 }
 
 /// Write a failure to the `UpdateRepository` `.status`. `message` MUST be a generic, non-sensitive

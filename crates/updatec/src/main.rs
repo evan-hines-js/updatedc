@@ -312,7 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     client.clone(),
                     &namespace,
                     &repository,
-                    status_message,
+                    &status_message,
                 )
                 .await
                 {

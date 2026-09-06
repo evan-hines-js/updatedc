@@ -3,12 +3,16 @@
 Give updatedc a directory and the program to run. Your entrypoint can be arbitrary code in any
 language, using your existing installers, service managers, or infrastructure tools.
 
-With your release repository, signing keys, and fleet group configured:
+In CI, with your release repository and online signing keys configured:
 
 ```sh
-updatectl deploy --source ./package --entrypoint install.sh \
-  --product my-app --version 4.0.0 --group production
+updatectl publish --source ./package --entrypoint install.sh \
+  --product my-app --version 4.0.0
 ```
+
+This publishes a package and prints its immutable reference. Operators select that reference in
+`UpdateGroup` YAML; the CLI does not patch groups or start rollouts. See the
+[CI publication workflow](ci-publication.md).
 
 For an interpreted program, add `--interpreter python3` or `--interpreter pwsh` and name the
 appropriate package file as the entrypoint. Interpreters must exist on the target machine.
@@ -73,10 +77,11 @@ Choose a replay policy for deploy and, separately, for any recovery command:
 | `check` | Run the supplied observation command: exit 0 proves completion; 10 proves repetition is safe; any other result, timeout, or spawn failure requires attention |
 | `manual` | Require an operator decision before repeating |
 
-For a `check` policy or commands using different interpreters, place an explicit
-`.updated-execution.json` in the package and omit `--entrypoint`. Its shape is defined by
-[the execution metadata schema](../schemas/deployment-command.schema.json). Both forms produce
-the same signed package and use the same runtime.
+For a destination-aware replay check, add `--replay-check check.sh`. For recovery, use
+`--recover recover.sh --recovery-check check-recovery.sh`. Each check returns 0 for completed work,
+10 for safe repetition, or another exit code to require attention. These options use the selected
+interpreter and command timeout. Do not combine a check with an explicit replay policy.
+
 The check must inspect the destination. A local “ran once” marker cannot disambiguate a database
 commit followed by process death. Use destination transactions, stable migration identities,
 destination-supported idempotency keys, or a reliable completion query. Platform attempt IDs are
@@ -90,16 +95,9 @@ runs deploy again. Changed input contents also trigger deploy after a completed 
 health still passes. A changed input snapshot during uncertain work requires attention. Input digests
 stay in private receipts and are never published in fleet reports.
 
-Recovery is explicit. `manual` stops for an operator. `--recover recover.py --recovery-replay safe`
-generates the following policy (using the selected interpreter):
-
-```json
-{
-  "policy": "command",
-  "command": { "argv": ["python3", "recover.py"], "timeoutSeconds": 120 },
-  "replay": { "policy": "safe" }
-}
-```
+Recovery is explicit. Without `--recover`, recovery stops for an operator.
+`--recover recover.py --recovery-replay safe` selects a recovery script and permits repetition,
+using the same interpreter as the entrypoint.
 
 The failed candidate's recovery procedure must restore the predecessor's required application and
 data state, including any necessary file or service changes. The adapter then lets the platform
@@ -181,23 +179,6 @@ The adapter's `inspect` reports requested payload identity and observed readines
 resource diff. A meaningful plan for a generic script requires that script's own read-only planning
 interface; the platform does not fabricate one from command text.
 
-## Advanced execution configuration
-
-When commands need different interpreters, per-command deadlines, or destination-specific replay
-checks, optionally put `.updated-execution.json` in the package and omit `--entrypoint`:
-
-```json
-{
-  "schema": 1,
-  "deploy": { "argv": ["python3", "deploy.py"], "timeoutSeconds": 120 },
-  "health": { "argv": ["python3", "health.py"], "timeoutSeconds": 5 },
-  "replay": { "policy": "manual" },
-  "recovery": { "policy": "manual" }
-}
-```
-
-The [execution metadata schema](../schemas/deployment-command.schema.json) describes this optional
-interface. `health` is optional. For a `check` replay policy, add a `command` with `argv` and
-`timeoutSeconds` beside `policy`. Command deadlines are 1–3,600 seconds; health is capped at 20
-seconds. Unknown fields and invalid deadlines fail validation before execution. Argument arrays
-are passed literally; shell syntax requires an explicit shell invocation.
+Execution metadata is generated and signed by `updatectl`; do not author `.updated-execution.json`
+in a package. Use one entrypoint and the small set of health, inspection, replay, and recovery
+options. Language-specific orchestration and version transitions belong inside the package code.

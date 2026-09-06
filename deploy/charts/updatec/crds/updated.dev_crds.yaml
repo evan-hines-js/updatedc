@@ -276,18 +276,45 @@ spec:
                 properties:
                   application:
                     properties:
-                      path:
-                        type: string
-                      sha256:
+                      releases:
+                        additionalProperties:
+                          properties:
+                            installable:
+                              default: false
+                              description: This release can establish a new installation. Absence must still be checked by its code.
+                              type: boolean
+                            package:
+                              properties:
+                                path:
+                                  type: string
+                                sha256:
+                                  type: string
+                              required:
+                              - path
+                              - sha256
+                              type: object
+                            rollbackFrom:
+                              default: []
+                              description: Exact higher versions this release can restore from. Upgrade edges never imply rollback.
+                              items:
+                                type: string
+                              type: array
+                            upgradeFrom:
+                              default: []
+                              description: Exact predecessor versions accepted by this release. No ranges or inferred edges.
+                              items:
+                                type: string
+                              type: array
+                          required:
+                          - package
+                          type: object
+                        type: object
+                      target:
                         type: string
                     required:
-                    - path
-                    - sha256
+                    - releases
+                    - target
                     type: object
-                  coldInstallFallback:
-                    default: false
-                    description: Signed opt-in to first-install cold-install fallback (see [`updated_contracts::assignment::RepositoryAssignment::cold_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
-                    type: boolean
                   name:
                     type: string
                   releaseRepository:
@@ -415,7 +442,7 @@ spec:
 
                   Intent is STATED here rather than inferred from telemetry, and that is the whole point. The control plane cannot tell an emergency rollback from an ordinary forward change by looking at node health: a group carrying one chronically unhealthy node (a failing downstream dependency, an expired licence) would be permanently window-exempt, while the failure an operator most needs to escape a window for — a release that bricks the agent itself — emits no telemetry at all and so looks like nothing is wrong. Both cases are answered by the operator saying so.
 
-                  It stays in force until it is cleared, and it is loudly visible while it is: the governing set lists the group in `status.emergency`, and `updatectl deploy` writes this field explicitly on every publish, so the next ordinary deploy of this group clears it.
+                  It stays in force until it is cleared, and it is loudly visible while it is: the governing set lists the group in `status.emergency`. Operators set and clear this field in the group's YAML; publishing a package does not change rollout policy.
                 type: boolean
               inputs:
                 additionalProperties:
@@ -1074,18 +1101,45 @@ spec:
                 properties:
                   application:
                     properties:
-                      path:
-                        type: string
-                      sha256:
+                      releases:
+                        additionalProperties:
+                          properties:
+                            installable:
+                              default: false
+                              description: This release can establish a new installation. Absence must still be checked by its code.
+                              type: boolean
+                            package:
+                              properties:
+                                path:
+                                  type: string
+                                sha256:
+                                  type: string
+                              required:
+                              - path
+                              - sha256
+                              type: object
+                            rollbackFrom:
+                              default: []
+                              description: Exact higher versions this release can restore from. Upgrade edges never imply rollback.
+                              items:
+                                type: string
+                              type: array
+                            upgradeFrom:
+                              default: []
+                              description: Exact predecessor versions accepted by this release. No ranges or inferred edges.
+                              items:
+                                type: string
+                              type: array
+                          required:
+                          - package
+                          type: object
+                        type: object
+                      target:
                         type: string
                     required:
-                    - path
-                    - sha256
+                    - releases
+                    - target
                     type: object
-                  coldInstallFallback:
-                    default: false
-                    description: Signed opt-in to first-install cold-install fallback (see [`updated_contracts::assignment::RepositoryAssignment::cold_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
-                    type: boolean
                   name:
                     type: string
                   releaseRepository:

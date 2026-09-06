@@ -25,6 +25,7 @@ pub mod identity;
 pub mod key;
 pub mod path;
 pub mod reconciler;
+pub mod releases;
 pub mod telemetry;
 
 /// Deserialize a nullable value while still requiring the field to be present. Serialized

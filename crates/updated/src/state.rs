@@ -106,15 +106,10 @@ pub struct InstalledState {
     /// record means commit and rollback authority land together; there is no separate arm step.
     #[serde(deserialize_with = "updated_contracts::required_option")]
     pub rollback_guard: Option<RollbackGuard>,
-    /// Whether this head has proven itself healthy at least once. `false` marks a *provisional*
-    /// cold install: a head placed from the first trusted assignment that has never passed a
-    /// health gate and has no predecessor to revert to. If a provisional head fails — crashes or
-    /// wedges before its first passing gate — the boot rejects its bytes so the next cold install
-    /// descends via cold-install fallback past it; passing the gate flips this to `true` and it is then
-    /// a normal steady-state head. Every non-cold-install commit (update, rollback, rebind) writes
-    /// `true`: their failure recovery is the update state machine's rollback to a proven
-    /// predecessor, not a cold-install-fallback descent. This is the whole "first boot / clean
-    /// environment" signal, kept atomic with the install record rather than in a side file.
+    /// Whether this head has passed an authoritative health gate. A first install is provisional
+    /// until its first successful gate. Failure rejects it and requires explicit recovery; it
+    /// never grants permission to reinstall through a different root. Updates carry their proven
+    /// predecessor in the rollback guard and recover through the update transaction.
     pub maturity: Maturity,
 }
 

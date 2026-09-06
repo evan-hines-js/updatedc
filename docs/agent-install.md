@@ -206,15 +206,16 @@ operator-pinned.
 ### Fully offline provisioning
 
 `identity.kind: manual` is never completable over a bootstrap certificate — `/enroll` refuses it
-outright. Generate the node's P-256 key first and derive the exact canonical inventory pin with the
-operator CLI:
+outright. Your provisioning system must generate the node's P-256 key and record its corresponding
+public key as lowercase hexadecimal uncompressed SEC1 bytes (65 bytes, beginning with `04`).
+Use that public key as `identity.publicKey` in the node's YAML. The CI publisher does not manage
+node identities. For example, generate the private key with:
 
 ```sh
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out agent.key
-updatectl node-public-key --key agent.key
 ```
 
-Create the `UpdateAgent` with that output as `identity.publicKey`:
+Create the `UpdateAgent` with the corresponding public key:
 
 ```yaml
 identity:

@@ -5,7 +5,7 @@
 use crate::*;
 
 /// Reject the exact deployed unit of a *provisional* (never-health-proven) cold-installed head so
-/// the next boot's cold install descends via cold-install fallback past that exact signed package.
+/// later boots cannot relaunch or silently reinstall that failed installation.
 ///
 /// Called only for a head [`boot::plan_gate_failure`] has already classified provisional: a head
 /// with a predecessor to revert to takes the revert path instead, and a confirmed head is never
@@ -17,7 +17,7 @@ pub(crate) fn reject_provisional_head(
     store.reject_deployment(&state.repository_lineage, &state.archive_sha256)?;
     warn(&format!(
         "provisional head {} never passed a health gate; rejected its exact deployment so the \
-         next cold install descends via cold-install fallback",
+         explicit recovery is required before it can run again",
         state.release.version
     ));
     Ok(())

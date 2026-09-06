@@ -4,11 +4,20 @@
 use super::*;
 
 #[derive(Debug)]
-pub struct StorageError(pub(crate) String);
+pub enum StorageError {
+    Operation(String),
+    /// A prior upload occupies an online metadata version. A signer can advance its local
+    /// generation and retry; the immutable bytes must never be replaced.
+    OnlineMetadataConflict(String),
+}
 
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Operation(message) | Self::OnlineMetadataConflict(message) => {
+                f.write_str(message)
+            }
+        }
     }
 }
 
@@ -72,7 +81,7 @@ impl UploadSigner for S3UploadSigner {
         expires_in: Duration,
     ) -> Result<updated_contracts::dataflow::UploadCapability, StorageError> {
         if max_bytes == 0 || expires_in.is_zero() {
-            return Err(StorageError(
+            return Err(StorageError::Operation(
                 "S3 upload capability bounds must be positive".into(),
             ));
         }
@@ -88,7 +97,9 @@ impl UploadSigner for S3UploadSigner {
                 expires_in,
             )
             .await
-            .map_err(|error| StorageError(format!("resolving S3 upload action: {error}")))?;
+            .map_err(|error| {
+                StorageError::Operation(format!("resolving S3 upload action: {error}"))
+            })?;
         action.set_query(None);
         action.set_fragment(None);
 
@@ -97,7 +108,9 @@ impl UploadSigner for S3UploadSigner {
             .credentials()
             .get_credential()
             .await
-            .map_err(|error| StorageError(format!("resolving S3 upload credentials: {error}")))?;
+            .map_err(|error| {
+                StorageError::Operation(format!("resolving S3 upload credentials: {error}"))
+            })?;
         let now = chrono::Utc::now();
         let fields = s3_post_fields(
             &credential,
@@ -113,7 +126,7 @@ impl UploadSigner for S3UploadSigner {
             url: action.into(),
             fields,
         };
-        capability.validate().map_err(StorageError)?;
+        capability.validate().map_err(StorageError::Operation)?;
         Ok(capability)
     }
 }
@@ -128,11 +141,10 @@ pub(crate) fn s3_post_fields(
     expires_in: Duration,
 ) -> Result<BTreeMap<String, String>, StorageError> {
     let expires = now
-        .checked_add_signed(
-            chrono::Duration::from_std(expires_in)
-                .map_err(|_| StorageError("S3 upload capability lifetime is invalid".into()))?,
-        )
-        .ok_or_else(|| StorageError("S3 upload capability expiry overflowed".into()))?;
+        .checked_add_signed(chrono::Duration::from_std(expires_in).map_err(|_| {
+            StorageError::Operation("S3 upload capability lifetime is invalid".into())
+        })?)
+        .ok_or_else(|| StorageError::Operation("S3 upload capability expiry overflowed".into()))?;
     let short_date = now.format("%Y%m%d").to_string();
     let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
     let scope = format!("{short_date}/{region}/s3/aws4_request");
@@ -153,7 +165,7 @@ pub(crate) fn s3_post_fields(
         "expiration": expires.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         "conditions": conditions,
     }))
-    .map_err(|error| StorageError(format!("encoding S3 upload policy: {error}")))?;
+    .map_err(|error| StorageError::Operation(format!("encoding S3 upload policy: {error}")))?;
     let encoded_policy = base64::engine::general_purpose::STANDARD.encode(policy);
     let signature =
         sigv4_policy_signature(&credential.secret_key, &short_date, region, &encoded_policy);
@@ -208,7 +220,7 @@ pub(crate) fn s3_store(
     let public_store = match destination.public_endpoint.as_deref() {
         None => {
             if internal.uses_http {
-                return Err(StorageError(
+                return Err(StorageError::Operation(
                     "an internal non-HTTPS S3 endpoint requires a publicEndpoint for object capabilities"
                         .into(),
                 ));
@@ -254,22 +266,25 @@ fn s3_client_options(
     };
     let path = Path::new(path);
     let pem = std::fs::read(path).map_err(|error| {
-        StorageError(format!("reading SSL_CERT_FILE {}: {error}", path.display()))
+        StorageError::Operation(format!("reading SSL_CERT_FILE {}: {error}", path.display()))
     })?;
     let mut found = false;
     for certificate in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
         let certificate = certificate.map_err(|error| {
-            StorageError(format!("parsing SSL_CERT_FILE {}: {error}", path.display()))
+            StorageError::Operation(format!("parsing SSL_CERT_FILE {}: {error}", path.display()))
         })?;
         let certificate =
             object_store::Certificate::from_der(certificate.as_ref()).map_err(|error| {
-                StorageError(format!("parsing SSL_CERT_FILE {}: {error}", path.display()))
+                StorageError::Operation(format!(
+                    "parsing SSL_CERT_FILE {}: {error}",
+                    path.display()
+                ))
             })?;
         options = options.with_root_certificate(certificate);
         found = true;
     }
     if !found {
-        return Err(StorageError(format!(
+        return Err(StorageError::Operation(format!(
             "SSL_CERT_FILE {} contains no certificates",
             path.display()
         )));
@@ -292,7 +307,7 @@ pub(crate) fn s3_client(
             Some((access, secret))
         }
         _ => {
-            return Err(StorageError(
+            return Err(StorageError::Operation(
                 "S3 credentials must be either absent or a non-empty access-key/secret-key pair; a session token is valid only with that pair"
                     .into(),
             ));
@@ -300,7 +315,7 @@ pub(crate) fn s3_client(
     };
     validate_object_prefix(&destination.prefix)?;
     if destination.bucket.trim().is_empty() || destination.region.trim().is_empty() {
-        return Err(StorageError(
+        return Err(StorageError::Operation(
             "S3 bucket and region must not be empty".into(),
         ));
     }
@@ -329,7 +344,7 @@ pub(crate) fn s3_client(
     }
     let store = builder
         .build()
-        .map_err(|error| StorageError(format!("configuring S3 store: {error}")))?;
+        .map_err(|error| StorageError::Operation(format!("configuring S3 store: {error}")))?;
     Ok(S3Client { store, uses_http })
 }
 
@@ -357,7 +372,7 @@ pub(crate) fn validate_s3_endpoint(
         ),
     };
     let parsed = updated::http::network_endpoint(value, transport, what)
-        .map_err(|error| StorageError(error.to_string()))?;
+        .map_err(|error| StorageError::Operation(error.to_string()))?;
     Ok(parsed.scheme() == "http")
 }
 
@@ -387,7 +402,7 @@ pub(crate) fn validate_object_prefix(prefix: &str) -> Result<(), StorageError> {
     if prefix != trimmed
         || (!trimmed.is_empty() && !updated_contracts::path::is_confined_relative(trimmed))
     {
-        return Err(StorageError(
+        return Err(StorageError::Operation(
             "S3 prefix must be a relative, normalized object-key prefix".into(),
         ));
     }
@@ -405,7 +420,7 @@ pub(crate) fn managed_repository_destination(
     repository: &UpdateRepository,
 ) -> Result<S3Destination, StorageError> {
     let namespace = repository.namespace().ok_or_else(|| {
-        StorageError("a managed repository must have a Kubernetes namespace".into())
+        StorageError::Operation("a managed repository must have a Kubernetes namespace".into())
     })?;
     Ok(S3Destination {
         bucket: repository.spec.s3.bucket.clone(),
@@ -511,7 +526,10 @@ pub(crate) mod store_tests {
         let error = commit_conditional_publication_file(&store, &key, "timestamp", stale_write)
             .await
             .unwrap_err();
-        assert!(error.0.contains("another writer won the fence"), "{error}");
+        assert!(
+            error.to_string().contains("another writer won the fence"),
+            "{error}"
+        );
         let served = store.get(&key).await.unwrap().bytes().await.unwrap();
         assert_eq!(
             served.as_ref(),
@@ -523,26 +541,32 @@ pub(crate) mod store_tests {
     #[tokio::test]
     async fn a_publisher_cannot_reuse_a_versioned_metadata_name_for_different_bytes() {
         let store = InMemory::new();
-        let key = object_store::path::Path::from("routing/metadata/7.snapshot.json");
         let first = tempfile::NamedTempFile::new().unwrap();
         let second = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(first.path(), b"first signed snapshot").unwrap();
-        std::fs::write(second.path(), b"different signed snapshot").unwrap();
-        let relative = Path::new("metadata/7.snapshot.json");
-
-        publish_immutable_metadata(&store, &key, relative, first.path())
-            .await
-            .unwrap();
-        // Crash recovery with the same durable signed bytes is idempotent.
-        publish_immutable_metadata(&store, &key, relative, first.path())
-            .await
-            .unwrap();
-        let error = publish_immutable_metadata(&store, &key, relative, second.path())
-            .await
-            .unwrap_err();
-        assert!(error.0.contains("different bytes"), "{error}");
-        let served = store.get(&key).await.unwrap().bytes().await.unwrap();
-        assert_eq!(served.as_ref(), b"first signed snapshot");
+        std::fs::write(first.path(), b"first signed metadata").unwrap();
+        std::fs::write(second.path(), b"different signed metadata").unwrap();
+        for (role, can_advance) in [("targets", true), ("snapshot", true), ("root", false)] {
+            let relative = std::path::PathBuf::from(format!("metadata/7.{role}.json"));
+            let key = object_store::path::Path::from(format!("routing/metadata/7.{role}.json"));
+            publish_immutable_metadata(&store, &key, &relative, first.path())
+                .await
+                .unwrap();
+            // Crash recovery with the same durable signed bytes is idempotent.
+            publish_immutable_metadata(&store, &key, &relative, first.path())
+                .await
+                .unwrap();
+            let error = publish_immutable_metadata(&store, &key, &relative, second.path())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                matches!(error, StorageError::OnlineMetadataConflict(_)),
+                can_advance,
+                "{role}: {error}"
+            );
+            assert!(error.to_string().contains("different bytes"), "{error}");
+            let served = store.get(&key).await.unwrap().bytes().await.unwrap();
+            assert_eq!(served.as_ref(), b"first signed metadata");
+        }
     }
 
     #[tokio::test]
@@ -563,7 +587,10 @@ pub(crate) mod store_tests {
             .await
             .unwrap();
         let error = validate_timestamp_transition(&key, &write).unwrap_err();
-        assert!(error.0.contains("older local generation 8"), "{error}");
+        assert!(
+            error.to_string().contains("older local generation 8"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -589,7 +616,10 @@ pub(crate) mod store_tests {
         )
         .await
         .unwrap_err();
-        assert!(error.0.contains("publication destination"), "{error}");
+        assert!(
+            error.to_string().contains("publication destination"),
+            "{error}"
+        );
         let served = store.get(&key).await.unwrap().bytes().await.unwrap();
         assert_eq!(served.as_ref(), b"wrong contents");
     }

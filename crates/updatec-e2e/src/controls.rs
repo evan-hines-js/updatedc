@@ -2,34 +2,13 @@ use crate::*;
 use kube::api::{Patch, PatchParams};
 use std::time::Duration;
 
-/// The ONE path a release reaches this fleet by, shared with every scenario that publishes.
-/// Publish one release major — a valid sample app, or an intentionally corrupt entrypoint
-/// every agent rejects at activation — and roll `groups` to it through the real **`updatectl
-/// deploy`**: the CI release tool builds the deterministic bundle, signs it, publishes it to
-/// the release repository (MinIO), and merge-patches each group's `application`. It runs
-/// inside the release-server pod, the one place that holds the repository's signing keys,
-/// reaches MinIO, and carries `updatectl` — the same executor that seeded the baseline.
-///
-/// `updatectl deploy` patches the application ref but not the deployment *identity*, so that
-/// is bumped through [`versioned_deployment_name`] here — the throttle counts a member settled only once every
-/// one of its agents reports exactly that identity, healthy. Returns the published bundle's
-/// content digest, the identity every node's rejection record names it by.
-///
-/// Those are two writes, so between them the control plane can publish the new bytes under the
-/// OLD deployment name. That interim identity is harmless and deliberately not worked around: an
-/// agent reports rejection against the assignment it currently HOLDS (keyed by the application
-/// digest, not by the name it was first offered under), and the planner recomputes the regression
-/// verdict from live evidence every pass — so once the rename lands, the same nodes re-prove the
-/// same bytes bad and the halt records that canonical identity, which is what the halt assertions poll
-/// for. Closing the window would mean teaching `updatectl deploy` to own the identity too, which
-/// is a change to the shipped publisher and not to this harness.
-pub(crate) async fn deploy_release(
+/// Publish immutable test packages without changing fleet intent; topology tests stage all signed
+/// metadata before applying one graph, exactly as an operator's CI pipeline would.
+async fn publish_release(
     layout: &FleetLayout,
-    fleet: &Fleet,
-    groups: &[String],
     version: &str,
     broken: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<updated_contracts::artifact::TargetReference, Box<dyn std::error::Error>> {
     let entrypoint = if broken {
         "printf 'intentionally corrupt entrypoint\\n' >/tmp/gen/bin/app"
     } else {
@@ -38,51 +17,98 @@ pub(crate) async fn deploy_release(
     let repository = release_repository_flags();
     let FleetLayout { platform } = layout;
     let execution = crate::cluster::demo_execution_flags();
-    let deploys = groups
-        .iter()
-        .map(|group| {
-            format!(
-                "updatectl deploy --keys-dir /data/release-keys {repository} \
-                 --namespace {NAMESPACE} --group {group} --product app --channel stable \
-                 --version {version} --platform {platform} \
-                 --source /tmp/gen {execution}"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
+    let publication = format!(
+        "updatectl publish --keys-dir /data/release-keys {repository} \
+         --product app --channel stable --version {version} --platform {platform} \
+         --source /tmp/gen {execution} --output json"
+    );
     let script = format!(
         "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
          rm -rf /tmp/gen && mkdir -p /tmp/gen/bin /tmp/gen/config; {entrypoint}; \
          chmod 0755 /tmp/gen/bin/app; cp /usr/local/bin/demo-lifecycle /tmp/gen/bin/lifecycle; \
-         printf 'version = \"{version}\"\\n' >/tmp/gen/config/release.toml; {deploys}"
+         printf 'version = \"{version}\"\\n' >/tmp/gen/config/release.toml; {publication}"
     );
-    let status = tokio::process::Command::new("kubectl")
+    let published = tokio::process::Command::new("kubectl")
         .args(kubectl_context_args())
         .args(RELEASE_SERVER_EXEC)
         .args(["--", "sh", "-c", &script])
-        .status()
+        .output()
         .await?;
-    if !status.success() {
-        return Err(format!("updatectl deploy failed for {version}").into());
+    if !published.status.success() {
+        return Err(format!(
+            "updatectl publish failed for {version}: {}",
+            String::from_utf8_lossy(&published.stderr)
+        )
+        .into());
     }
+    let (path, sha256) = published_reference(std::str::from_utf8(&published.stdout)?)?;
+    Ok(updated_contracts::artifact::TargetReference { path, sha256 })
+}
+
+/// Publish once through the CI CLI, then express the desired deployment through Kubernetes.
+/// The application reference and deployment identity change in one declarative patch per group.
+pub(crate) async fn deploy_release(
+    layout: &FleetLayout,
+    fleet: &Fleet,
+    groups: &[String],
+    version: &str,
+    broken: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if groups.is_empty() {
+        return Err("a deploy needs at least one group".into());
+    }
+    let package = publish_release(layout, version, broken).await?;
+    let (path, sha) = (package.path, package.sha256);
     for group in groups {
+        let current = fleet.groups().get(group).await?;
+        let mut graph = current.spec.deployment.application;
+        let predecessors = graph
+            .releases
+            .keys()
+            .filter(|from| {
+                updated_contracts::identity::parse_release_version(from)
+                    < updated_contracts::identity::parse_release_version(version)
+            })
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        // The stateless sample explicitly supports return to each earlier published version.
+        for predecessor in &predecessors {
+            graph
+                .releases
+                .get_mut(predecessor)
+                .unwrap()
+                .rollback_from
+                .insert(version.into());
+        }
+        graph.releases.insert(
+            version.into(),
+            updated_contracts::releases::Release {
+                package: updated_contracts::artifact::TargetReference {
+                    path: path.clone(),
+                    sha256: sha.clone(),
+                },
+                upgrade_from: predecessors,
+                rollback_from: Default::default(),
+                installable: true,
+            },
+        );
+        graph.target = version.into();
+        graph.validate()?;
         fleet
             .groups()
             .patch(
                 group,
                 &PatchParams::default(),
-                &Patch::Merge(serde_json::json!({"spec":{"deployment":{
-                    "name": versioned_deployment_name(group, version)
-                }}})),
+                &Patch::Merge(
+                    serde_json::json!({"spec":{"emergencyCorrection":false,"deployment":{
+                        "name": versioned_deployment_name(group, version),
+                        "application":graph
+                    }}}),
+                ),
             )
             .await?;
     }
-    let first = groups.first().ok_or("a deploy needs at least one group")?;
-    kubectl_value(
-        "updategroup",
-        first,
-        "{.spec.deployment.application.sha256}",
-    )
+    Ok(sha)
 }
 
 /// Scenario: the per-node operational controls, against the live control plane.
@@ -433,14 +459,98 @@ pub(crate) async fn assert_regression_rollback(
     };
     set_response("rollback").await?;
 
-    let bad_sha = deploy_release(
-        layout,
-        fleet,
-        std::slice::from_ref(&group),
-        bad_version,
-        true,
+    let major = version_major(&held_version).ok_or("invalid held version")?;
+    let intermediate1 = format!("{major}.1.0");
+    let intermediate2 = format!("{major}.2.0");
+    let package1 = publish_release(layout, &intermediate1, false).await?;
+    let package2 = publish_release(layout, &intermediate2, false).await?;
+    let broken = publish_release(layout, bad_version, true).await?;
+    let bad_sha = broken.sha256.clone();
+    let mut graph = fleet
+        .groups()
+        .get(&group)
+        .await?
+        .spec
+        .deployment
+        .application;
+    for (version, package, from, rollback_from) in [
+        (&intermediate1, package1, held_version.as_str(), None),
+        (
+            &intermediate2,
+            package2,
+            intermediate1.as_str(),
+            Some(bad_version),
+        ),
+        (
+            &bad_version.to_string(),
+            broken,
+            intermediate2.as_str(),
+            None,
+        ),
+    ] {
+        graph.releases.insert(
+            version.clone(),
+            updated_contracts::releases::Release {
+                package,
+                upgrade_from: std::collections::BTreeSet::from([from.to_string()]),
+                rollback_from: rollback_from.into_iter().map(str::to_string).collect(),
+                installable: false,
+            },
+        );
+    }
+    graph
+        .releases
+        .get_mut(&held_version)
+        .unwrap()
+        .rollback_from
+        .insert(intermediate1.clone());
+    graph.target = bad_version.into();
+    let before: Vec<String> = members
+        .iter()
+        .map(|(_, resource)| kubectl_value("updateagent", resource, "{.status.assignmentSha256}"))
+        .collect::<Result<_, _>>()?;
+    let apply_graph = |graph: &updated_contracts::releases::ReleaseGraph| {
+        let patch =
+            serde_json::json!({"spec":{"deployment":{"name":bad_deployment,"application":graph}}});
+        let groups = fleet.groups();
+        let group = group.clone();
+        async move {
+            groups
+                .patch(&group, &PatchParams::default(), &Patch::Merge(patch))
+                .await
+        }
+    };
+    apply_graph(&graph).await?;
+    await_for(
+        60,
+        "whole-cohort rejection of a missing intermediate rollback edge",
+        || {
+            Ok(kubectl_value(
+                "updaterepository",
+                "default",
+                "{.status.conditions[?(@.type==\"Ready\")].message}",
+            )?
+            .contains("automatic rollback"))
+        },
     )
     .await?;
+    for (index, (_, resource)) in members.iter().enumerate() {
+        if !reports_version(resource, &held_version)
+            || kubectl_value("updateagent", resource, "{.status.assignmentSha256}")?
+                != before[index]
+        {
+            return Err(
+                "unsafe rollback topology partially rolled out before preflight failed".into(),
+            );
+        }
+    }
+    graph
+        .releases
+        .get_mut(&intermediate1)
+        .unwrap()
+        .rollback_from
+        .insert(intermediate2.clone());
+    apply_graph(&graph).await?;
 
     // The node-level containment the response's gate waits for: every member healthy on the
     // predecessor again, and the attempting node carrying the durable rejection of these bytes.
@@ -457,6 +567,57 @@ pub(crate) async fn assert_regression_rollback(
         },
     )
     .await?;
+
+    // Final health alone could pass if the controller never admitted the attempted route. The
+    // rejecting agent must have executed both completed forward hops and their explicit returns.
+    let (rejecting_pod, _) = members
+        .iter()
+        .find(|(pod, _)| rejected_release(pod, &bad_sha))
+        .ok_or("missing rejecting agent after rollback")?;
+    // Failed activation deliberately restarts the agent for boot recovery. Kubernetes separates
+    // that container's forward-hop log from the new container's return-hop log.
+    let restarts: u32 = kubectl_value(
+        "pod",
+        rejecting_pod,
+        "{.status.containerStatuses[?(@.name==\"agent\")].restartCount}",
+    )?
+    .trim()
+    .parse()?;
+    let mut log = String::new();
+    for previous in [true, false] {
+        if previous && restarts == 0 {
+            continue;
+        }
+        let mut command = kubectl();
+        command.args([
+            "-n",
+            NAMESPACE,
+            "logs",
+            rejecting_pod,
+            "-c",
+            "agent",
+            "--request-timeout=15s",
+        ]);
+        if previous {
+            command.arg("--previous");
+        }
+        log.push_str(&output(&mut command)?);
+        log.push('\n');
+    }
+    let mut remaining = log.as_str();
+    for (from, to) in [
+        (held_version.as_str(), intermediate1.as_str()),
+        (intermediate1.as_str(), intermediate2.as_str()),
+        (intermediate2.as_str(), bad_version),
+        (intermediate2.as_str(), intermediate1.as_str()),
+        (intermediate1.as_str(), held_version.as_str()),
+    ] {
+        let marker = format!("applying update {from} -> {to}");
+        let at = remaining
+            .find(&marker)
+            .ok_or_else(|| format!("missing or out-of-order rollout hop {marker}:\n{log}"))?;
+        remaining = &remaining[at + marker.len()..];
+    }
 
     // The response itself: the halt record on the set says the groups were rolled back.
     await_for(
@@ -772,13 +933,15 @@ pub(crate) async fn assert_quarantine_fails_closed(
     let held_version = kubectl_value("updateagent", &members[0], "{.status.reportedVersion}")?
         .trim()
         .to_string();
-    let valid_sha = kubectl_value(
-        "updategroup",
-        &group,
-        "{.spec.deployment.application.sha256}",
-    )?
-    .trim()
-    .to_string();
+    let current = fleet.groups().get(&group).await?;
+    let target = current.spec.deployment.application.target.clone();
+    let valid_sha = current
+        .spec
+        .deployment
+        .application
+        .target_reference()?
+        .sha256
+        .clone();
     println!(
         "[e2e] quarantine: corrupting {group}'s deployment digest while it serves {held_version}"
     );
@@ -788,7 +951,7 @@ pub(crate) async fn assert_quarantine_fails_closed(
             &group,
             &PatchParams::default(),
             &Patch::Merge(serde_json::json!({"spec": {"deployment": {"application": {
-                "sha256": "z".repeat(64)
+                "releases": {&target: {"package": {"sha256": "z".repeat(64)}}}
             }}}})),
         )
         .await?;
@@ -820,7 +983,7 @@ pub(crate) async fn assert_quarantine_fails_closed(
             &group,
             &PatchParams::default(),
             &Patch::Merge(serde_json::json!({"spec": {"deployment": {"application": {
-                "sha256": valid_sha
+                "releases": {&target: {"package": {"sha256": valid_sha}}}
             }}}})),
         )
         .await?;

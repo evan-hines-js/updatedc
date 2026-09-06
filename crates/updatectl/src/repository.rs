@@ -31,9 +31,7 @@ pub(crate) fn build_store(
     Ok((destination, store))
 }
 
-/// Resolve the signing keys from a mounted directory. `deploy` signs only the online roles
-/// (targets/snapshot/timestamp), so the root keys are deliberately **not** required here —
-/// a release pipeline never needs the root private keys, only `trust-root`/`rotate-root` do.
+/// Resolve mounted online signing keys. A release pipeline never needs root private keys.
 pub(crate) fn open_keys(dir: &Path) -> Result<repo::Keys, Error> {
     let keys = repo::Keys::in_dir(dir)?;
     for path in [&keys.targets, &keys.snapshot, &keys.timestamp] {
@@ -49,134 +47,40 @@ pub(crate) fn open_keys(dir: &Path) -> Result<repo::Keys, Error> {
     Ok(keys)
 }
 
-/// The four top-level TUF roles, the documents whose versions a publish bumps.
-pub(crate) const TOP_LEVEL_METADATA: [&str; 4] = [
-    "root.json",
-    "timestamp.json",
-    "snapshot.json",
-    "targets.json",
-];
+/// The two mutable documents that select the active repository. Their exact bytes identify the
+/// checkout; signed version numbers alone do not detect replacement within the same version.
+/// Historical and unrelated objects are never inputs to this bounded preflight. The shared
+/// repository publisher owns immutable-object checks and conditional commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MetadataGeneration {
+    root: String,
+    timestamp: String,
+}
 
-/// The version each top-level TUF role currently declares, held per role rather than collapsed
-/// into one number.
-///
-/// A single maximum cannot serve as the concurrent-publish measure: the roles advance
-/// independently. `repo::publish_release` bumps targets/snapshot/timestamp and leaves root alone,
-/// while `repo::rotate_root` and `repo::renew_root` bump only root, so one root rotation would
-/// park a single maximum above the timestamp and mask the next publisher's commit entirely.
-/// Comparing role by role means every publish path advances a role the guard is watching.
-///
-/// Every role is read from BOTH its unversioned document and its versioned copies. Under
-/// `consistent_snapshot` (what `repo::init_from_version` writes) the snapshot and targets roles
-/// exist ONLY at `<N>.<role>.json`, so reading unversioned names alone left those two slots empty
-/// forever and collapsed the floor below to `max(root, timestamp)` — losing `metadata/timestamp.json`
-/// while fifty versioned targets stood then re-initialized the repository at version 2, which every
-/// node that had accepted targets v51 refuses as a rollback, permanently and with no publisher error.
-///
-/// A role is `None` when its document is absent, distinct from a document that declares version
-/// 0: this one reading is also the answer to "is anything published here", and a repository is
-/// live if ANY top-level role stands, not only if `root.json` does. Deriving liveness from a
-/// single object and the version floor from all four is how a half-deleted prefix — root.json
-/// gone, timestamp still at 47 — gets re-initialized at version 1 and wedges every node.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RoleVersions(pub(crate) [Option<u64>; TOP_LEVEL_METADATA.len()]);
-
-impl RoleVersions {
-    /// Read the live repository's role versions from S3. An absent document is `None`; an
-    /// unreadable one is present at version 0 — the guard only cares that a role's document is
-    /// byte-for-byte the generation this process saw.
+impl MetadataGeneration {
     pub(crate) async fn live(
         store: &dyn ObjectStore,
         destination: &S3Destination,
     ) -> Result<Self, Error> {
-        let mut versions = Self::default();
-        for (slot, name) in TOP_LEVEL_METADATA.iter().enumerate() {
+        let mut digests = [String::new(), String::new()];
+        for (digest, name) in digests.iter_mut().zip(["root.json", "timestamp.json"]) {
             let key = updatec::object_key(&destination.prefix, &format!("metadata/{name}"));
-            let bytes = match updatec::read_object_bounded(store, &key, updatec::OBJECT_BYTES_LIMIT)
-                .await
-            {
-                Ok(bytes) => bytes,
-                Err(object_store::Error::NotFound { .. }) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            versions.0[slot] = Some(updatec::runtime::signed_version(&bytes).unwrap_or(0));
+            let bytes =
+                updatec::read_object_bounded(store, &key, updatec::OBJECT_BYTES_LIMIT).await?;
+            *digest = updated_contracts::digest::sha256_bytes(&bytes);
         }
-        // The versioned copies carry their version in the object name, so the floor is read from
-        // the listing without fetching any of them.
-        let prefix = updatec::object_key(&destination.prefix, "metadata");
-        let mut listing = store.list(Some(&prefix));
-        while let Some(entry) = listing.next().await {
-            if let Some(filename) = entry?.location.filename() {
-                versions.note_versioned(filename);
-            }
+        let [root, timestamp] = digests;
+        Ok(Self { root, timestamp })
+    }
+
+    pub(crate) fn changed_document(&self, base: &Self) -> Option<&'static str> {
+        if self.root != base.root {
+            Some("root.json")
+        } else if self.timestamp != base.timestamp {
+            Some("timestamp.json")
+        } else {
+            None
         }
-        Ok(versions)
-    }
-
-    /// Raise a role's version from a versioned metadata name, `<N>.<role>.json`. Anything else —
-    /// a delegated role, a stray object — names no top-level role and is ignored.
-    pub(crate) fn note_versioned(&mut self, filename: &str) {
-        let Some((version, role)) = filename.split_once('.') else {
-            return;
-        };
-        let Ok(version) = version.parse::<u64>() else {
-            return;
-        };
-        let Some(slot) = TOP_LEVEL_METADATA.iter().position(|name| *name == role) else {
-            return;
-        };
-        self.0[slot] = Some(self.0[slot].unwrap_or(0).max(version));
-    }
-
-    /// Whether the repository is live: any top-level role document is present. Nodes pin
-    /// versioned roots and follow `timestamp.json`, so a prefix that still serves a timestamp is
-    /// serving a fleet whether or not the unversioned `root.json` survived.
-    pub(crate) fn is_initialized(&self) -> bool {
-        self.0.iter().any(Option::is_some)
-    }
-
-    /// The highest version any role has published — the floor a replacement repository must
-    /// start above, because a TUF client refuses any role document below the version it last
-    /// accepted for that role. Zero when nothing is published.
-    pub(crate) fn highest(&self) -> u64 {
-        self.0.iter().flatten().copied().max().unwrap_or(0)
-    }
-
-    /// The roles that are actually present, named with their versions, for a diagnostic that has
-    /// to tell an operator what is standing at a prefix they are about to replace.
-    pub(crate) fn describe_present(&self) -> String {
-        let present: Vec<String> = TOP_LEVEL_METADATA
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, name)| {
-                self.0[slot].map(|version| format!("{name} at version {version}"))
-            })
-            .collect();
-        present.join(", ")
-    }
-
-    /// The first role whose version differs from `base`, described for an operator, or `None`
-    /// when every role still stands where `base` saw it.
-    pub(crate) fn moved_since(&self, base: &Self) -> Option<String> {
-        TOP_LEVEL_METADATA
-            .iter()
-            .enumerate()
-            .find(|(slot, _)| self.0[*slot] != base.0[*slot])
-            .map(|(slot, name)| {
-                format!(
-                    "{name} from {} to {}",
-                    describe_version(base.0[slot]),
-                    describe_version(self.0[slot])
-                )
-            })
-    }
-}
-
-/// One role's standing, for operator-facing text: a version, or the absence of the document.
-pub(crate) fn describe_version(version: Option<u64>) -> String {
-    match version {
-        Some(version) => format!("version {version}"),
-        None => "absent".to_string(),
     }
 }
 

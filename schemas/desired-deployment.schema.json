@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://updated.dev/schemas/desired-deployment.schema.json",
   "title": "Updated Desired Deployment",
-  "description": "A signed config document selecting release endpoints, exact application/provider targets, the pinned release-repository root, and the node's managed runtime policy. Mirrors `RepositoryAssignment` in updated-contracts, which is deny_unknown_fields.",
+  "description": "Signed desired target and release graph, pinned repository trust, and managed runtime policy.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,13 +11,12 @@
     "metadataUrl",
     "targetsUrl",
     "application",
-    "coldInstallFallback",
     "releaseRoot",
     "runtime"
   ],
   "properties": {
     "schema": {
-      "const": 5
+      "const": 6
     },
     "deployment": {
       "description": "Bounded deployment identity copied into status and telemetry: 1-128 characters of lowercase ASCII letters, digits, dot, underscore, or dash, beginning and ending with a letter or digit. Uppercase is refused so one identity cannot become two on a case-folding filesystem, and reserved Windows device stems (con, prn, aux, nul, com1-9, lpt1-9), alone or with an extension, are excluded.",
@@ -37,11 +36,7 @@
       "minLength": 1
     },
     "application": {
-      "$ref": "https://updated.dev/schemas/target-reference.schema.json"
-    },
-    "coldInstallFallback": {
-      "description": "Only when no release has ever been installed, allow descent through signed repository history if the exact assigned head is unusable. This is never an update or rollback policy.",
-      "type": "boolean"
+      "$ref": "#/$defs/releaseGraph"
     },
     "releaseRoot": {
       "description": "The pinned TUF root metadata of the release repository, embedded verbatim as a signed `{signed, signatures}` envelope. Validation requires a JSON object.",
@@ -225,6 +220,56 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000
+        }
+      }
+    },
+    "releaseGraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "releases"
+      ],
+      "properties": {
+        "target": {
+          "type": "string"
+        },
+        "releases": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 128,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "package"
+            ],
+            "properties": {
+              "package": {
+                "$ref": "https://updated.dev/schemas/target-reference.schema.json"
+              },
+              "installable": {
+                "type": "boolean",
+                "default": false
+              },
+              "upgradeFrom": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "rollbackFrom": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              }
+            }
+          }
         }
       }
     }

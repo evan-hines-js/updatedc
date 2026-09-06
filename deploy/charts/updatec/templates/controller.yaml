@@ -76,6 +76,9 @@ spec:
           {{- end }}
           env:
             {{- include "updatec.commonEnv" . | nindent 12 }}
+            # Release preflight and object-store publication share this public trust bundle.
+            - name: SSL_CERT_FILE
+              value: /etc/client-ca/ca.crt
             # The immutable executable the operator runs for UpdateBackend workloads, under the
             # same digest/tag policy as the images this chart runs itself.
             - name: UPDATED_HEALTHPROXY_IMAGE
@@ -100,6 +103,9 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
+            - name: client-ca
+              mountPath: /etc/client-ca
+              readOnly: true
             - name: state
               mountPath: /var/lib/updatec
             - name: tmp
@@ -110,6 +116,7 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- include "updatec.clientCaVolume" . | nindent 8 }}
         # The signed TUF repository and its materialized signing keys. The controller numbers the
         # next generation from the metadata found HERE, so this is durable state, not a cache: an
         # empty or stale copy makes it fail closed rather than publish a generation every node

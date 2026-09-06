@@ -122,11 +122,14 @@ mod tests {
             deployment: "consumer".into(),
             metadata_url: "https://releases.example/metadata/".into(),
             targets_url: "https://releases.example/targets/".into(),
-            application: updated_contracts::artifact::TargetReference {
-                path: "application".into(),
-                sha256: "a".repeat(64),
-            },
-            cold_install_fallback: false,
+            application: updated_contracts::releases::testing::install(
+                "1.0.0",
+                updated_contracts::artifact::TargetReference {
+                    path: "application".into(),
+                    sha256: "a".repeat(64),
+                },
+            ),
+
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: updated_contracts::assignment::ManagedRuntime {
                 inputs,
