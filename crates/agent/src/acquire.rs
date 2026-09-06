@@ -147,13 +147,13 @@ pub(crate) async fn prepare_assigned_application(
 ) -> Result<PreparedApplication, PrepareError> {
     // Check every required object before activating anything, without downloading future hops.
     // TUF owns target URL resolution (including consistent snapshots) and authentication.
-    for selected in &route {
-        request
-            .repository
-            .check_target_available(&selected.target)
-            .await
-            .map_err(PrepareError::Repository)?;
-    }
+    updated_tuf::check_targets_available(
+        route
+            .iter()
+            .map(|selected| (request.repository, &selected.target)),
+    )
+    .await
+    .map_err(PrepareError::Repository)?;
     let first = route.into_iter().next().ok_or_else(|| {
         PrepareError::Storage(io::Error::new(
             io::ErrorKind::InvalidInput,

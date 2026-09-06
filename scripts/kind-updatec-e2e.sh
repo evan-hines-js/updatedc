@@ -681,6 +681,11 @@ if ! poll_until "$READY_TIMEOUT" routing_probe_has_assignment; then
   kubectl -n updated-system get updateagent kind-routing-probe -o yaml >&2 || true
   exit 1
 fi
+# This identity exercises transport, not package execution, so no agent will report its installed
+# state. Retain its initial assignment using the normal hold policy before any fleet rollout;
+# leaving it eligible would correctly block preflight on its missing authenticated observation.
+kubectl -n updated-system patch updateagent kind-routing-probe --type=merge \
+  -p '{"spec":{"hold":true}}'
 
 # Prove direct download as a transport contract, not merely as a successful agent fetch. The root
 # is present in every complete generation. Require a real, live, key-pinned inventory identity to

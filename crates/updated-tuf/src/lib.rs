@@ -15,7 +15,7 @@
 use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Duration};
 use tough::schema::{Role, Root, Signed, Snapshot, Target, Targets, Timestamp};
@@ -32,6 +32,40 @@ pub use policy::{DefaultPolicy, PolicyError};
 /// Re-exported so a consumer of a selection result names the reference type through the crate that
 /// produced it, without depending on the wire-contract crate directly.
 pub use updated_contracts::artifact::TargetReference;
+
+/// Bound read-only release preflight well inside the health-report freshness window. The
+/// controller includes metadata refresh in this budget; agents use it for future-hop probes.
+pub const RELEASE_PREFLIGHT_BUDGET: Duration = updated_contracts::telemetry::REPORT_FRESHNESS
+    .checked_div(6)
+    .expect("nonzero divisor");
+
+const MAX_AVAILABILITY_REQUESTS: usize = 8;
+
+/// Probe authenticated objects through one bounded path, without reading or retaining bodies.
+/// Independent requests progress concurrently; failure, cancellation, or the shared deadline
+/// drops every in-flight request. No detached tasks or process-wide locks outlive the caller.
+pub fn check_targets_available<'a>(
+    targets: impl IntoIterator<Item = (&'a TrustedRepository, &'a VerifiedTarget)>,
+) -> impl std::future::Future<Output = Result<(), Error>> + Send + 'a {
+    let probes: Vec<_> = targets
+        .into_iter()
+        .map(|(repository, target)| repository.check_target_available(target))
+        .collect();
+    async move {
+        timeout(
+            RELEASE_PREFLIGHT_BUDGET,
+            futures::stream::iter(probes)
+                .buffer_unordered(MAX_AVAILABILITY_REQUESTS)
+                .try_for_each(|()| async { Ok(()) }),
+        )
+        .await
+        .map_err(|_| {
+            Error::Transport(
+                "release availability checks exceeded the health-report freshness budget".into(),
+            )
+        })?
+    }
+}
 
 /// Read node-owned TUF trust material through the repository's one local-file policy.
 ///
@@ -1280,7 +1314,7 @@ impl TrustedRepository {
     }
 
     /// Check that a target in authenticated metadata can be opened, without reading its body.
-    pub async fn check_target_available(&self, target: &VerifiedTarget) -> Result<(), Error> {
+    async fn check_target_available(&self, target: &VerifiedTarget) -> Result<(), Error> {
         if target.length > self.config.target_limit {
             return Err(Error::Trust(format!(
                 "target {} exceeds the signed target size limit",
@@ -1519,6 +1553,173 @@ fn to_verified(path: &str, target: &Target) -> VerifiedTarget {
         length: target.length,
         sha256: target.hashes.sha256.to_vec(),
         custom: serde_json::to_value(&target.custom).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod availability_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Semaphore;
+
+    #[derive(Debug)]
+    struct Probes {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        started: Semaphore,
+        release: Semaphore,
+    }
+
+    struct ActiveProbe(Arc<Probes>);
+
+    impl Drop for ActiveProbe {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProbeTransport {
+        targets_base: String,
+        probes: Arc<Probes>,
+    }
+
+    #[async_trait::async_trait]
+    impl tough::Transport for ProbeTransport {
+        async fn fetch(&self, url: Url) -> Result<tough::TransportStream, tough::TransportError> {
+            if !url.as_str().starts_with(&self.targets_base) {
+                return tough::Transport::fetch(&tough::FilesystemTransport, url).await;
+            }
+            let active = self.probes.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _active = ActiveProbe(self.probes.clone());
+            self.probes.peak.fetch_max(active, Ordering::SeqCst);
+            self.probes.started.add_permits(1);
+            self.probes.release.acquire().await.unwrap().forget();
+            Ok(Box::pin(futures::stream::poll_fn(|_| {
+                panic!("availability checks must not read the object body")
+            })))
+        }
+    }
+
+    async fn fixture() -> (tempfile::TempDir, Arc<TrustedRepository>, Arc<Probes>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("repo");
+        let keys = repo::generate_keys(&tmp.path().join("keys")).await.unwrap();
+        repo::init(&directory, &keys, 365).await.unwrap();
+        let payload = tmp.path().join("payload");
+        std::fs::write(&payload, "payload").unwrap();
+        let targets = (0..MAX_AVAILABILITY_REQUESTS + 2)
+            .map(|v| {
+                repo::PublishTarget::application(
+                    "app",
+                    "stable",
+                    &format!("{v}.0.0"),
+                    "linux",
+                    "x86_64",
+                    "app",
+                    payload.clone(),
+                )
+            })
+            .collect();
+        repo::add_release(&directory, &keys, targets, 365)
+            .await
+            .unwrap();
+        let mut config = crate::testing::offline_source(&directory);
+        config.transport_timeout = Duration::from_secs(300);
+        let probes = Arc::new(Probes {
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        let root = std::fs::read(&config.root).unwrap();
+        let repo = RepositoryLoader::new(
+            &root,
+            repository_base("metadata base", &config.metadata_url).unwrap(),
+            repository_base("targets base", &config.targets_url).unwrap(),
+        )
+        .transport(ProbeTransport {
+            targets_base: config.targets_url.clone(),
+            probes: probes.clone(),
+        })
+        .load()
+        .await
+        .unwrap();
+        (
+            tmp,
+            Arc::new(TrustedRepository {
+                config,
+                repo,
+                assignment: None,
+            }),
+            probes,
+        )
+    }
+
+    async fn start_batch(
+        repository: Arc<TrustedRepository>,
+        probes: &Probes,
+    ) -> tokio::task::JoinHandle<Result<(), Error>> {
+        tokio::time::pause();
+        let task = tokio::spawn(async move {
+            let targets = repository.all_targets();
+            check_targets_available(targets.iter().map(|target| (&*repository, target))).await
+        });
+        timeout(
+            Duration::from_secs(1),
+            probes
+                .started
+                .acquire_many(MAX_AVAILABILITY_REQUESTS as u32),
+        )
+        .await
+        .expect("independent probes must progress concurrently")
+        .unwrap()
+        .forget();
+        assert_eq!(
+            probes.active.load(Ordering::SeqCst),
+            MAX_AVAILABILITY_REQUESTS
+        );
+        task
+    }
+
+    #[tokio::test]
+    async fn probes_are_concurrent_and_bounded_without_reading_bodies() {
+        let (_tmp, repository, probes) = fixture().await;
+        let task = start_batch(repository, &probes).await;
+        probes.release.add_permits(MAX_AVAILABILITY_REQUESTS + 2);
+        task.await.unwrap().unwrap();
+        assert_eq!(probes.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            probes.peak.load(Ordering::SeqCst),
+            MAX_AVAILABILITY_REQUESTS
+        );
+        assert_eq!(probes.started.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn one_deadline_cancels_the_entire_batch_as_a_retryable_failure() {
+        let (_tmp, repository, probes) = fixture().await;
+        let task = start_batch(repository, &probes).await;
+        tokio::time::advance(RELEASE_PREFLIGHT_BUDGET).await;
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("freshness budget"), "{error}");
+        assert_eq!(probes.active.load(Ordering::SeqCst), 0);
+        assert_eq!(probes.started.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_caller_drops_every_in_flight_probe() {
+        let (_tmp, repository, probes) = fixture().await;
+        let task = start_batch(repository, &probes).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(probes.active.load(Ordering::SeqCst), 0);
+        assert_eq!(probes.started.available_permits(), 0);
     }
 }
 

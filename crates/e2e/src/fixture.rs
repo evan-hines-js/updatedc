@@ -924,6 +924,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn detached_workload_stop_is_repeatable() {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -934,7 +937,10 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        detach(&mut command);
+        // Exercise the console-less process that stop_pid must terminate, while retaining the
+        // CI runner's cleanup job. This unit test is not running inside an agent-owned hook job
+        // and must not assume the host grants CREATE_BREAKAWAY_FROM_JOB permission.
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
         let mut child = command.spawn().unwrap();
         stop_pid(child.id());
         let stopped = child.try_wait().unwrap().is_some();

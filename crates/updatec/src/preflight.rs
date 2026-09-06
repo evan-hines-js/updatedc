@@ -4,13 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::domain::{DesiredState, ObservedState};
 use crate::{DesiredDeployment, PlanError};
 
-// Preflight is read-only with respect to assignments. Its network work must yield the controller
-// back to report projection well inside the shared health window, regardless of package count or
-// the transport timeout chosen for an individual repository request.
-const PREFLIGHT_BUDGET: std::time::Duration = updated_contracts::telemetry::REPORT_FRESHNESS
-    .checked_div(6)
-    .expect("nonzero divisor");
-
 pub(crate) struct PreparedRollout {
     pub deployment: DesiredDeployment,
     pub versions: BTreeSet<String>,
@@ -253,11 +246,11 @@ pub(crate) async fn packages(
     datastore: &std::path::Path,
     admission: &crate::admission::AdmissionEvaluation,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tokio::time::timeout(PREFLIGHT_BUDGET, async {
+    tokio::time::timeout(updated_tuf::RELEASE_PREFLIGHT_BUDGET, async {
     // One metadata refresh and one availability request per repository/object in this pass,
     // even when many cohorts share releases. Nothing here retains bundle bytes or cross-pass trust.
     let mut repositories = BTreeMap::new();
-    let mut available = BTreeSet::new();
+    let mut targets = BTreeMap::new();
     for plan in plans {
         let deployment = &plan.deployment;
         let repository_key = updated_contracts::digest::sha256_bytes(&serde_json::to_vec(&(
@@ -309,15 +302,16 @@ pub(crate) async fn packages(
                 .into());
             }
             let selected = repository.verify_release(&policy, version, &release.package)?;
-            if available.insert((
+            targets.entry((
                 repository_key.clone(),
                 selected.target.path.clone(),
                 selected.sha256,
-            )) {
-                repository.check_target_available(&selected.target).await?;
-            }
+            )).or_insert(selected.target);
         }
     }
+    updated_tuf::check_targets_available(targets.iter().map(|((repository_key, _, _), target)| {
+        (&repositories[repository_key], target)
+    })).await?;
     Ok(())
     })
     .await

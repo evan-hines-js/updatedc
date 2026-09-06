@@ -39,6 +39,7 @@ $bundle = Join-Path $work 'bundle-1.0.0'
 $fixtureState = Join-Path $work 'lifecycle-fixture'
 $config = Join-Path $work 'config.toml'
 $runtime = Join-Path $work 'runtime.json'
+$application = Join-Path $work 'application.json'
 $repoPort = 21980
 $objectPort = 21981
 $gatewayProcess = $null
@@ -280,6 +281,13 @@ try {
     $appTarget = 'products/app/stable/1.0.0/windows-x86_64/app'
     $appSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $appTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published application hash failed' }
+    $applicationJson = @{
+        target = '1.0.0'
+        releases = @{
+            '1.0.0' = @{package=@{path=$appTarget; sha256=$appSha}; installable=$true}
+        }
+    } | ConvertTo-Json -Depth 6 -Compress
+    [IO.File]::WriteAllText($application, $applicationJson, [Text.UTF8Encoding]::new($false))
     $runtimeJson = @{
         product = 'app'; channel = 'stable'; installRoot = $install
         repository = @{metadataLimit=1048576; targetLimit=536870912; transportTimeoutSeconds=30}
@@ -296,7 +304,7 @@ try {
         --release-root (Join-Path $releaseRepo 'metadata\root.json') `
         --name assignments/agents/agent.json --metadata-url "https://127.0.0.1:$objectPort/metadata/" `
         --targets-url "https://127.0.0.1:$objectPort/targets/" --deployment initial `
-        --application-path $appTarget --application-sha256 $appSha `
+        --application $application `
         --runtime $runtime
     if ($LASTEXITCODE) { throw 'publishing routing assignment failed' }
 
