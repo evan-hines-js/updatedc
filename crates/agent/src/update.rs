@@ -1307,7 +1307,8 @@ const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// ceiling must stay well inside `updated_contracts::telemetry::REPORT_FRESHNESS`. It is also what
 /// makes [`became_healthy`]'s `health_grace` a real bound rather than an advisory one, since a
 /// single probe could otherwise outlast the whole grace.
-pub(crate) const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const HEALTHCHECK_TIMEOUT: Duration =
+    Duration::from_secs(updated::command_adapter::MAX_HEALTH_SECONDS);
 
 /// A non-transactional `converge` runs inline on the report loop. Boot and update transactions keep
 /// the publisher's full signed timeout; only this recurring steady-state invocation is bounded so

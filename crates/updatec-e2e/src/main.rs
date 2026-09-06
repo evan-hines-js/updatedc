@@ -73,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // assignment, fault injection, exact assertions, recovery, state, and metrics.
         Some("soak") => soak::run().await,
         Some("resources") => fixture::print_kind_resources(env::args().skip(2)),
+        Some("fuzz-resources") => fixture::print_fuzz_resources(env::args().skip(2)),
         None => run_e2e().await,
         Some(command) => {
             Err(format!("unknown command {command:?}; use `agent-name <hostname>`, `alert-sink`, `load-probe <url> <interval_ms>`, `resources ...`, `soak`, or no argument to run the e2e").into())

@@ -41,4 +41,19 @@ for pod in pods:
 infra get pods,jobs -o wide >&2 || true
 infra logs deployment/ingress-nginx-controller --all-containers=true --tail=200 >&2 || true
 infra logs deployment/ingress-nginx-controller --all-containers=true --previous --tail=200 >&2 || true
+# The local-path volumes outlive container restarts, including the one with the original
+# activation failure. Read them from the Kind node even if the workload is in CrashLoopBackOff.
+while IFS= read -r node; do
+  python3 - "$node" <<'PY' >&2
+import subprocess, sys
+try:
+    subprocess.run([
+        "docker", "exec", sys.argv[1], "find", "/var/local-path-provisioner",
+        "-maxdepth", "2", "-type", "f", "(", "-name", "agent.log", "-o",
+        "-name", "jenkins.log", ")", "-exec", "tail", "-n", "200", "-v", "{}", "+",
+    ], timeout=20, check=False)
+except (OSError, subprocess.TimeoutExpired) as error:
+    print(f"persistent fixture logs unavailable: {error}", file=sys.stderr)
+PY
+done < <(cluster get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')
 cluster get events -A --sort-by=.metadata.creationTimestamp >&2 || true

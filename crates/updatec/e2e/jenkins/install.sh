@@ -152,6 +152,18 @@ start_controller() {
     exec "$2/bin/app"
   ' bash "$PIDFILE" "$release" </dev/null >>"$DATA/jenkins.log" 2>&1 &
   printf '%s\n' "$release" > "$DATA/payload-path"
+  # The hook must not finish while the child is still waiting to run setsid: hook cleanup
+  # would kill that undetached child. Prove the recorded process reached the expected JVM;
+  # the agent's health gate separately waits for Jenkins itself to finish initializing.
+  local deadline=$((SECONDS + 10))
+  until live_controller; do
+    if (( SECONDS >= deadline )); then
+      echo "jenkins-install: controller did not reach the JVM before the startup deadline" >&2
+      tail -n 20 "$DATA/jenkins.log" >&2 || true
+      return 1
+    fi
+    sleep 0.1
+  done
 }
 
 case "$PHASE" in

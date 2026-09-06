@@ -6,7 +6,9 @@ fn customer_payload_fixtures_run_through_the_real_conformance_harness() {
     let (name, interpreter, script) = if cfg!(windows) {
         (
             "run.ps1",
-            "powershell",
+            // Use the runner's current PowerShell runtime. Legacy Windows PowerShell startup
+            // can exceed the agent's entire health budget before this script gets control.
+            "pwsh",
             r#"$ErrorActionPreference = 'Stop'
 $actual = Join-Path $env:UPDATED_STATE_DIR 'actual'
 switch ($env:UPDATED_OPERATION) {

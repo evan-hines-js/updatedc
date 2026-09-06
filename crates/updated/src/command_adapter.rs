@@ -110,9 +110,9 @@ impl Config {
                 .validate()
                 .map_err(|e| invalid(format!("health: {e}")))?;
             if health.timeout_seconds > MAX_HEALTH_SECONDS {
-                return Err(invalid(
-                    "health.timeoutSeconds must be at most 20 to preserve report cadence",
-                ));
+                return Err(invalid(format!(
+                    "health.timeoutSeconds must be at most {MAX_HEALTH_SECONDS} to preserve report cadence",
+                )));
             }
         }
         if let Some(inspect) = &self.inspect {

@@ -1645,32 +1645,12 @@ replace_group_deployment() {
   local name="$1"
   local version="$2"
   local sha="$3"
-  local deployment resource field current
-  resource=updategroup
-  field=deployment
-  if [ "$name" = default ]; then resource=updaterepository; field=defaultDeployment; fi
-  current=$(kubectl -n updated-system get "$resource" "$name" -o json)
-  deployment=$(printf '%s' "$current" | python3 -c '
-import json, sys
-name, version, sha, platform, field = sys.argv[1:]
-deployment = json.load(sys.stdin)["spec"][field]
-graph = deployment["application"]
-if version not in graph["releases"]:
-    predecessors = [v for v in graph["releases"] if tuple(map(int, v.split("."))) < tuple(map(int, version.split(".")))]
-    for predecessor in predecessors:
-        graph["releases"][predecessor].setdefault("rollbackFrom", []).append(version)
-    graph["releases"][version] = {"package": {"path": f"products/app/stable/{version}/{platform}/app", "sha256": sha}, "upgradeFrom": predecessors, "installable": True}
-graph["target"] = version
-deployment["name"] = f"{name}-fuzz-{version}"
-print(json.dumps(deployment))
-' "$name" "$version" "$sha" "$PLATFORM" "$field")
-  if [ "$name" = default ]; then
-    kubectl -n updated-system patch updaterepository default --type=merge \
-      -p "{\"spec\":{\"defaultDeployment\":$deployment}}" >/dev/null
-  else
-    kubectl -n updated-system patch updategroup "$name" --type=merge \
-      -p "{\"spec\":{\"deployment\":$deployment}}" >/dev/null
-  fi
+  local resources
+  # Nodes move between cohorts. Publish one complete fixture catalog to every cohort
+  # before relabeling, including explicit support for returning from another cohort's head.
+  resources=$(kubectl -n updated-system get updategroup/edge updategroup/batch updaterepository/default -o json \
+    | cargo run -q -p updatec-e2e -- fuzz-resources "$name" "$version" "$sha" "$PLATFORM")
+  printf '%s\n' "$resources" | kubectl -n updated-system apply -f - >/dev/null
 }
 
 fuzz_state=${UPDATEC_FUZZ_SEED:-20260718}

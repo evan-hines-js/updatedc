@@ -12,6 +12,18 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$JENKINS_DATA/jre/bin" "$JENKINS_DATA/home" "$WORK/old/bin" "$WORK/new/bin"
+# Delay detachment so returning immediately after background spawn deterministically exposes
+# the cleanup race. The hook must return only once its recorded JVM process is running.
+export JENKINS_TEST_REAL_SETSID
+JENKINS_TEST_REAL_SETSID=$(command -v setsid)
+mkdir -p "$WORK/bin"
+cat >"$WORK/bin/setsid" <<'SETSID'
+#!/bin/sh
+sleep 1
+exec "$JENKINS_TEST_REAL_SETSID" "$@"
+SETSID
+chmod +x "$WORK/bin/setsid"
+export PATH="$WORK/bin:$PATH"
 # A real native process at the runtime path exercises the installer's /proc identity checks.
 # Avoid network installation: this test isolates snapshot and compensation ordering.
 cp /bin/sleep "$JENKINS_DATA/jre/bin/java"
@@ -32,11 +44,14 @@ original_pid=$!
 printf '%s\n' "$original_pid" >"$JENKINS_DATA/jenkins.pid"
 printf '%s\n' "$WORK/old" >"$JENKINS_DATA/payload-path"
 printf '1.0.0\n' >"$JENKINS_DATA/installed-version"
+controller_is_live() {
+  local pid
+  pid=$(cat "$JENKINS_DATA/jenkins.pid" 2>/dev/null || true)
+  [[ -n $pid && $(readlink "/proc/$pid/exe" 2>/dev/null || true) == "$JENKINS_DATA/jre/bin/java" ]]
+}
 wait_controller() {
   for _ in {1..100}; do
-    local pid
-    pid=$(cat "$JENKINS_DATA/jenkins.pid" 2>/dev/null || true)
-    if [[ -n $pid && $(readlink "/proc/$pid/exe" 2>/dev/null || true) == "$JENKINS_DATA/jre/bin/java" ]]; then
+    if controller_is_live; then
       return 0
     fi
     sleep 0.05
@@ -51,17 +66,17 @@ invoke() {
     bash "$ROOT/crates/updatec/e2e/jenkins/install.sh"
 }
 invoke converge transaction
+controller_is_live || { echo "FAIL: converge returned before the JVM detached" >&2; exit 1; }
 wait "$original_pid" 2>/dev/null || true
-wait_controller
 [[ $(cat "$JENKINS_DATA/home/value") == migrated ]]
 [[ $(tar xOf "$JENKINS_BACKUPS/before-transaction/home.tar.gz" home/value) == original ]]
 invoke rollback transactionr
-wait_controller
+controller_is_live || { echo "FAIL: rollback returned before the JVM detached" >&2; exit 1; }
 [[ $(cat "$JENKINS_DATA/home/value") == original ]]
 [[ $(cat "$JENKINS_DATA/payload-path") == "$WORK/old" ]]
 [[ $(cat "$JENKINS_DATA/installed-version") == 1.0.0 ]]
 # Repeated compensation must preserve the original backup and restored data.
 invoke rollback transactionr
-wait_controller
+controller_is_live || { echo "FAIL: repeated rollback returned before the JVM detached" >&2; exit 1; }
 [[ $(cat "$JENKINS_DATA/home/value") == original ]]
 echo "PASS: Jenkins snapshot, explicit predecessor restoration, and repeated compensation"

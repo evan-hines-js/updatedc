@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -eu
 
 # Model a machine's init: reap detached workload children and keep the agent signalable.
@@ -32,4 +32,6 @@ client_key = "/etc/agent-tls/tls.key"
 EOF
 
 export UPDATED_STATE_DIR="$state"
-exec /usr/local/bin/updated-agent --config /tmp/config.toml
+# Kubernetes keeps only the most recent terminated container's logs. Preserve the first
+# activation failure across restarts on this fixture's volume, while keeping the agent's PID.
+exec /usr/local/bin/updated-agent --config /tmp/config.toml 2> >(tee -a "$install/agent.log" >&2)

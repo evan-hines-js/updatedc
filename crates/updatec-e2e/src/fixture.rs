@@ -269,10 +269,197 @@ pub(crate) fn print_kind_resources(
     }
 }
 
+/// The relabeling campaign deliberately uses mutually compatible sampleapp releases.
+/// Every cohort must carry the same catalog: a node can arrive from any other cohort.
+fn fuzz_resources(
+    mut resources: serde_json::Value,
+    cohort: &str,
+    version: &str,
+    sha: &str,
+    platform: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use updated_contracts::releases::{Release, ReleaseGraph};
+
+    let items = resources["items"]
+        .as_array_mut()
+        .ok_or("expected a resource List")?;
+    let mut releases = BTreeMap::<String, Release>::new();
+    let mut fields = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    for item in items.iter() {
+        let name = item["metadata"]["name"]
+            .as_str()
+            .ok_or("missing resource name")?;
+        let field = match (item["kind"].as_str(), name) {
+            (Some("UpdateGroup"), "edge" | "batch") => "deployment",
+            (Some("UpdateRepository"), "default") => "defaultDeployment",
+            _ => return Err("unexpected fuzz resource".into()),
+        };
+        if !names.insert(name.to_owned()) {
+            return Err("duplicate fuzz resource".into());
+        }
+        fields.push(field);
+        let graph: ReleaseGraph =
+            serde_json::from_value(item["spec"][field]["application"].clone())?;
+        graph.validate()?;
+        for (version, release) in graph.releases {
+            if releases
+                .get(&version)
+                .is_some_and(|known| known.package != release.package)
+            {
+                return Err(format!("conflicting fixture package for {version}").into());
+            }
+            releases.insert(version, release);
+        }
+    }
+    if names.len() != 3 || !names.contains(cohort) {
+        return Err("fuzz resources requires edge, batch, and default".into());
+    }
+    let package = updated_contracts::artifact::TargetReference {
+        path: format!("products/app/stable/{version}/{platform}/app"),
+        sha256: sha.into(),
+    };
+    if releases
+        .get(version)
+        .is_some_and(|known| known.package != package)
+    {
+        return Err(format!("conflicting fixture package for {version}").into());
+    }
+    releases.entry(version.into()).or_insert(Release {
+        package,
+        upgrade_from: Default::default(),
+        rollback_from: Default::default(),
+        installable: true,
+    });
+    let versions = releases
+        .keys()
+        .map(|v| Ok((v.clone(), semver::Version::parse(v)?)))
+        .collect::<Result<Vec<_>, semver::Error>>()?;
+    // This is an explicit policy for these test payloads, never a production inference.
+    for (target, parsed) in &versions {
+        let release = releases.get_mut(target).expect("catalog version exists");
+        release.upgrade_from = versions
+            .iter()
+            .filter(|(_, v)| v.cmp_precedence(parsed).is_lt())
+            .map(|(v, _)| v.clone())
+            .collect();
+        release.rollback_from = versions
+            .iter()
+            .filter(|(_, v)| v.cmp_precedence(parsed).is_gt())
+            .map(|(v, _)| v.clone())
+            .collect();
+    }
+    for (item, field) in items.iter_mut().zip(fields) {
+        let name = item["metadata"]["name"]
+            .as_str()
+            .expect("validated name")
+            .to_owned();
+        let deployment = &mut item["spec"][field];
+        if name == cohort {
+            deployment["name"] = format!("{cohort}-fuzz-{version}").into();
+            deployment["application"]["target"] = version.into();
+        }
+        let graph = ReleaseGraph {
+            target: deployment["application"]["target"]
+                .as_str()
+                .ok_or("missing target")?
+                .into(),
+            releases: releases.clone(),
+        };
+        graph.validate()?;
+        deployment["application"] = serde_json::to_value(graph)?;
+        // kubectl owns resource application; emit only the desired fields.
+        *item = serde_json::json!({
+            "apiVersion": item["apiVersion"], "kind": item["kind"],
+            "metadata": {"name": name, "namespace": item["metadata"]["namespace"]},
+            "spec": item["spec"],
+        });
+    }
+    Ok(resources)
+}
+
+pub(crate) fn print_fuzz_resources(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = args.into_iter().collect();
+    let [cohort, version, sha, platform] = args.as_slice() else {
+        return Err("fuzz-resources needs cohort, version, sha256, and platform".into());
+    };
+    let resources = serde_json::from_reader(std::io::stdin().lock())?;
+    emit(&fuzz_resources(resources, cohort, version, sha, platform)?)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    fn fuzz_fixture() -> serde_json::Value {
+        let digests = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        serde_json::json!({"apiVersion": "v1", "kind": "List", "items":
+            (["edge", "batch", "default"].map(|name| {
+                let field = if name == "default" { "defaultDeployment" } else { "deployment" };
+                serde_json::json!({
+                    "apiVersion": "updated.dev/v1alpha1",
+                    "kind": if name == "default" { "UpdateRepository" } else { "UpdateGroup" },
+                    "metadata": {"name": name, "namespace": NAMESPACE},
+                    "spec": {field: {"name": name, "application": kind_release_graph(
+                        "linux-x86_64", "1.0.0", digests.each_ref().map(String::as_str))}},
+                })
+            }))
+        })
+    }
+
+    #[test]
+    fn relabeling_keeps_every_cohort_source_in_one_explicit_catalog() {
+        let mut resources = fuzz_fixture();
+        for (cohort, version, sha) in [
+            ("edge", "4.0.0", "d".repeat(64)),
+            ("batch", "5.0.0", "e".repeat(64)),
+            ("default", "6.0.0", "f".repeat(64)),
+        ] {
+            resources = fuzz_resources(resources, cohort, version, &sha, "linux-x86_64").unwrap();
+        }
+        let mut catalog = None;
+        for item in resources["items"].as_array().unwrap() {
+            let field = if item["kind"] == "UpdateRepository" {
+                "defaultDeployment"
+            } else {
+                "deployment"
+            };
+            let graph: updated_contracts::releases::ReleaseGraph =
+                serde_json::from_value(item["spec"][field]["application"].clone()).unwrap();
+            if let Some(ref catalog) = catalog {
+                assert_eq!(&graph.releases, catalog);
+            }
+            for source in graph.releases.keys() {
+                assert!(
+                    graph.route(Some(source), |_, _| true).is_ok(),
+                    "{source} -> {}",
+                    graph.target
+                );
+            }
+            catalog = Some(graph.releases);
+        }
+    }
+
+    #[test]
+    fn fuzz_catalog_rejects_replaced_package_identities() {
+        let mut resources = fuzz_fixture();
+        assert!(fuzz_resources(
+            resources.clone(),
+            "edge",
+            "1.0.0",
+            &"d".repeat(64),
+            "linux-x86_64"
+        )
+        .is_err());
+        resources["items"][0]["spec"]["deployment"]["application"]["releases"]["1.0.0"]
+            ["package"]["sha256"] = "d".repeat(64).into();
+        assert!(
+            fuzz_resources(resources, "edge", "4.0.0", &"e".repeat(64), "linux-x86_64").is_err()
+        );
+    }
 
     #[test]
     fn kind_cohorts_upgrade_from_bootstrap_without_inventing_reverse_support() {
