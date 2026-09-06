@@ -138,6 +138,8 @@ mod tests {
                 // Model deliberate local corruption, bypassing the installed file's write
                 // protection. Windows refuses atomic replacement of a read-only destination.
                 #[cfg(windows)]
+                // Only clears the Windows read-only attribute; Unix permission bits are untouched.
+                #[allow(clippy::permissions_set_readonly_false)]
                 {
                     let mut permissions = std::fs::metadata(&config).unwrap().permissions();
                     permissions.set_readonly(false);
