@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+// These tests run subprocesses concurrently, including helpers inside command fixtures.
+// Startup time is not the behavior under test; timeout-specific cases set their own short bound.
+const FIXTURE_COMMAND_SECONDS: u64 = 10;
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -96,7 +99,7 @@ impl Fixture {
     }
 }
 fn procedure(name: &str) -> Value {
-    json!({"argv":[std::env::current_exe().unwrap(),"--exact",name,"--nocapture"],"timeoutSeconds":1})
+    json!({"argv":[std::env::current_exe().unwrap(),"--exact",name,"--nocapture"],"timeoutSeconds":FIXTURE_COMMAND_SECONDS})
 }
 fn recovery() -> Value {
     json!({"policy":"command","command":procedure("fixture_recover"),"replay":{"policy":"safe"}})
@@ -208,10 +211,11 @@ fn replay_check_proves_completion_or_safe_repetition_and_refuses_uncertainty() {
         ("20", "needs-attention", 0),
         ("stall", "needs-attention", 0),
     ] {
-        let f = Fixture::new(
-            json!({"policy":"check","command":procedure("fixture_check")}),
-            recovery(),
-        );
+        let mut command = procedure("fixture_check");
+        if check == "stall" {
+            command["timeoutSeconds"] = 1.into();
+        }
+        let f = Fixture::new(json!({"policy":"check","command":command}), recovery());
         f.seed("running");
         std::fs::write(f.state.join("check"), check).unwrap();
         let start = Instant::now();
@@ -318,6 +322,10 @@ fn contention_returns_retry_without_blocking_health_or_other_applications() {
 #[test]
 fn deadlines_release_locks_and_invalid_policy_cannot_start_commands() {
     let f = Fixture::new(json!({"policy":"safe"}), recovery());
+    let path = f.payload.join(updated::command_adapter::CONFIG);
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["deploy"]["timeoutSeconds"] = 1.into();
+    std::fs::write(path, config.to_string()).unwrap();
     std::fs::write(f.state.join("stall"), "yes").unwrap();
     let start = Instant::now();
     assert!(!f.call("converge", TOKEN).0);
@@ -441,7 +449,7 @@ fn fixture_deploy() {
             "--nocapture".into(),
         ];
         assert!(helper(
-            json!({"api":1,"command":"sequence","resource":"db","timeoutSeconds":1,"steps":[{"id":"migration","definitionSha256":"a".repeat(64),"check":command,"apply":command,"timeoutSeconds":1}]})
+            json!({"api":1,"command":"sequence","resource":"db","timeoutSeconds":FIXTURE_COMMAND_SECONDS,"steps":[{"id":"migration","definitionSha256":"a".repeat(64),"check":command,"apply":command,"timeoutSeconds":FIXTURE_COMMAND_SECONDS}]})
         ));
     }
     if state.join("rich-result").exists() {
