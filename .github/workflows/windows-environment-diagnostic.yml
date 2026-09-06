@@ -1,0 +1,59 @@
+name: Windows environment diagnostic
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  environment:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $profileVars = @('USERPROFILE', 'APPDATA', 'HOMEDRIVE', 'HOMEPATH')
+          $programVars = @('ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432', 'ComSpec')
+          $identityVars = @('USERNAME', 'USERDOMAIN', 'COMPUTERNAME')
+          $cases = @(
+            @{Name='ambient'; Extra=@()},
+            @{Name='baseline'; Extra=@()},
+            @{Name='baseline-engine'; Extra=@()},
+            @{Name='profile'; Extra=$profileVars},
+            @{Name='profile-minimal'; Extra=@('USERPROFILE','APPDATA')},
+            @{Name='program'; Extra=$programVars},
+            @{Name='identity'; Extra=$identityVars},
+            @{Name='standard'; Extra=($profileVars + $programVars + $identityVars)}
+          )
+          foreach ($case in $cases) {
+            $start = New-Object System.Diagnostics.ProcessStartInfo
+            $start.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $start.UseShellExecute = $false
+            $start.RedirectStandardInput = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            if ($case.Name -ne 'ambient') {
+              $start.EnvironmentVariables.Clear()
+              foreach ($name in (@('SystemRoot','WINDIR','TEMP','TMP','SystemDrive','LOCALAPPDATA') + $case.Extra)) {
+                $value = [Environment]::GetEnvironmentVariable($name)
+                if ($null -ne $value) { $start.EnvironmentVariables[$name] = $value }
+              }
+              $start.EnvironmentVariables['PATH'] = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+              $start.EnvironmentVariables['PSModulePath'] = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
+            }
+            $script = '$p=[IO.Path]::GetTempFileName(); Set-Content -NoNewline -Path $p -Value ready; Get-Content -Raw $p; Remove-Item $p'
+            if ($case.Name -eq 'baseline-engine') { $script = '[Console]::Write("ready")' }
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+            $start.Arguments = "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $process = [Diagnostics.Process]::Start($start)
+            $process.StandardInput.Close()
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(15000)) {
+              $process.Kill()
+              $process.WaitForExit()
+              Write-Host "$($case.Name): TIMEOUT after 15s"
+            } else {
+              Write-Host "$($case.Name): $($watch.Elapsed.TotalSeconds)s exit=$($process.ExitCode) stdout=$($stdout.Result.Trim()) stderr=$($stderr.Result.Trim())"
+            }
+            $process.Dispose()
+          }
