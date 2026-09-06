@@ -742,8 +742,10 @@ fn run_check(args: CheckSetup, manual_recovery: bool, budgets: [Duration; 2]) ->
         })
         .collect::<io::Result<_>>()?;
     report.check(
-        "healthcheck answers consistently across a repeated probe",
-        health[0].code == health[1].code && health.iter().all(Invocation::published_no_result),
+        "healthcheck succeeds across repeated probes after convergence",
+        health
+            .iter()
+            .all(|probe| probe.code == Some(0) && probe.published_no_result()),
         format!(
             "{} then {}{}{}",
             health[0].status(),
@@ -765,7 +767,9 @@ fn run_check(args: CheckSetup, manual_recovery: bool, budgets: [Duration; 2]) ->
         .collect::<io::Result<_>>()?;
     report.check(
         "inspect answers consistently across a repeated probe",
-        inspect[0].code == inspect[1].code && inspect.iter().all(Invocation::published_no_result),
+        inspect
+            .iter()
+            .all(|probe| probe.code == Some(0) && probe.published_no_result()),
         format!(
             "{} then {}{}{}",
             inspect[0].status(),
@@ -1119,6 +1123,29 @@ esac
         let hook = fixture(scratch.path(), "broken.sh", BREAKS_IDEMPOTENCE);
         let error = check(scratch.path(), hook).expect_err("a non-idempotent reconciler fails");
         assert_eq!(error.to_string(), "5 of 14 conformance checks failed");
+    }
+
+    #[test]
+    fn consistently_failing_observations_do_not_pass_conformance() {
+        for (operation, command) in [
+            ("healthcheck", "exit 7"),
+            ("inspect", "printf stable; exit 7"),
+        ] {
+            let scratch = tempfile::tempdir().unwrap();
+            let body = CONFORMANT.replace(
+                if operation == "healthcheck" {
+                    "healthcheck) ;;"
+                } else {
+                    "inspect) printf 'state=ready\\n' ;;"
+                },
+                &format!("{operation}) {command} ;;"),
+            );
+            assert_ne!(body, CONFORMANT);
+            let hook = fixture(scratch.path(), "broken-observation.sh", &body);
+            let error =
+                check(scratch.path(), hook).expect_err("failed observations must fail validation");
+            assert_eq!(error.to_string(), "1 of 14 conformance checks failed");
+        }
     }
 
     /// The obligation no amount of argv checking can reach: `docs/node-reconciler-protocol.md`

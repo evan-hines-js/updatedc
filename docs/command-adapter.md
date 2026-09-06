@@ -28,7 +28,9 @@ names the required execution API, and an older agent refuses an unsupported API 
 There is no separate runtime installation or upgrade workflow.
 
 Exit zero means deployment completed. An optional `--healthcheck health.sh` adds an ongoing
-application health check, using the same interpreter and a five-second deadline. Without it,
+application health check, using the same interpreter. Its deadline defaults to five seconds;
+`--health-timeout-seconds` accepts 1–20 seconds, including interpreter startup, within the agent's
+report-cadence limit. Without a health check,
 readiness means recorded successful execution; it does not assert that services or data remain
 healthy or detect arbitrary drift. `--timeout-seconds` sets the deploy/recovery deadline, defaulting
 to 300 seconds. The platform derives its outer invocation budget automatically.

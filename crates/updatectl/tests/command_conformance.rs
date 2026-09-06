@@ -49,6 +49,8 @@ esac
             interpreter,
             "--healthcheck",
             name,
+            "--health-timeout-seconds",
+            "20",
             "--recover",
             name,
             "--replay",

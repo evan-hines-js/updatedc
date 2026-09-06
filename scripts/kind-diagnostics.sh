@@ -19,6 +19,25 @@ kube logs deployment/updatec-controller --all-containers=true --tail=200 >&2 || 
 kube logs deployment/updatec-gateway --all-containers=true --tail=200 >&2 || true
 # CrashLoopBackOff's useful error is in the terminated container, not the newly started one.
 kube logs deployment/updatec-gateway --all-containers=true --previous --tail=200 >&2 || true
+# Readiness failures belong to the workload pod. Preserve both its termination reason and the
+# preceding container's logs; controller/gateway logs cannot explain an agent or JVM crash.
+while IFS= read -r pod; do
+  kube describe pod "$pod" >&2 || true
+  kube logs "$pod" --all-containers=true --tail=200 >&2 || true
+  kube logs "$pod" --all-containers=true --previous --tail=200 >&2 || true
+done < <(kube get pods -o json | python3 -c '
+import json, sys
+try:
+    pods = json.load(sys.stdin).get("items", [])
+except (ValueError, OSError):
+    pods = []
+for pod in pods:
+    status = pod.get("status", {})
+    if status.get("phase") == "Succeeded":
+        continue
+    if not any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", [])):
+        print(pod["metadata"]["name"])
+')
 infra get pods,jobs -o wide >&2 || true
 infra logs deployment/ingress-nginx-controller --all-containers=true --tail=200 >&2 || true
 infra logs deployment/ingress-nginx-controller --all-containers=true --previous --tail=200 >&2 || true

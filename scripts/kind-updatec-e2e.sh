@@ -958,6 +958,10 @@ if [[ "$MANUAL_REPORTED_VERSION" != 1.0.0 || "$MANUAL_REPORTED_READY" != true ]]
   exit 1
 fi
 echo "manual CRD export cold-installed offline, started 1.0.0, and reported healthy"
+# This one-shot enrollment fixture is outside the five-node rollout campaign. Keep its proven
+# baseline held, including when later tests deliberately publish a broken default release.
+kubectl -n updated-system patch updateagent manual-offline --type=merge \
+  -p '{"spec":{"hold":true}}'
 
 # A malformed enrollment artifact is terminal: it must never fall back to the URL/key or install
 # an application. `timeout` bounds the direct agent invocation so Kubernetes records an observable

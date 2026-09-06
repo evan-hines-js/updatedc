@@ -29,6 +29,9 @@ pub(crate) struct ProcedureArgs {
     /// Optional package script for ongoing health checks, using the same interpreter.
     #[arg(long, requires = "entrypoint")]
     healthcheck: Option<String>,
+    /// Health-check deadline, including interpreter startup, in seconds.
+    #[arg(long, default_value_t = 5, requires = "healthcheck", value_parser = clap::value_parser!(u64).range(1..=updated::command_adapter::MAX_HEALTH_SECONDS))]
+    health_timeout_seconds: u64,
     /// Optional package program that emits measured state for fleet fingerprints.
     #[arg(long, requires = "entrypoint")]
     inspect: Option<String>,
@@ -105,7 +108,7 @@ pub(crate) fn prepare(source: &Path, procedure: &ProcedureArgs) -> Result<Prepar
         "replay":{"policy":procedure.replay.name()},
         "recovery":{"policy":"manual"}});
     if let Some(health) = &procedure.healthcheck {
-        config["health"] = command(health, &[], 5)?;
+        config["health"] = command(health, &[], procedure.health_timeout_seconds)?;
     }
     if let Some(inspect) = &procedure.inspect {
         config["inspect"] = command(inspect, &[], procedure.timeout_seconds)?;
@@ -219,6 +222,34 @@ mod tests {
         use clap::CommandFactory;
         Cli::command().debug_assert();
         assert!(Cli::try_parse_from(["updatectl", "check", "."]).is_err());
+    }
+
+    #[test]
+    fn health_deadlines_remain_inside_the_runtime_report_budget() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run"), b"code").unwrap();
+        let mut arguments = procedure("run");
+        arguments.healthcheck = Some("run".into());
+        arguments.health_timeout_seconds = updated::command_adapter::MAX_HEALTH_SECONDS;
+        let package = prepare(root.path(), &arguments).unwrap();
+        assert_eq!(
+            package.info.timeout_millis,
+            (300 + arguments.health_timeout_seconds + 5) * 1000
+        );
+        arguments.health_timeout_seconds += 1;
+        assert!(prepare(root.path(), &arguments).is_err());
+        assert!(Cli::try_parse_from([
+            "updatectl",
+            "check",
+            ".",
+            "--entrypoint",
+            "run",
+            "--healthcheck",
+            "run",
+            "--health-timeout-seconds",
+            &arguments.health_timeout_seconds.to_string(),
+        ])
+        .is_err());
     }
 
     #[test]
