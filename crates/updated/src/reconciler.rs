@@ -164,20 +164,24 @@ pub fn configure_environment(command: &mut Command) {
         command
             .env("SystemRoot", &system_root)
             .env("WINDIR", &system_root)
-            // `env_clear` leaves PSModulePath absent. Windows PowerShell then synthesizes its
-            // normal user and machine module search path during startup, which can block a
-            // service-hosted reconciler before the script executes its first line. Pin module
-            // discovery and PATH to the built-in Windows runtime; other helpers must be addressed
-            // explicitly by the reconciler bundle.
+            // Pin module discovery and executable lookup to the built-in Windows runtime;
+            // other helpers must be addressed explicitly by the reconciler bundle.
             .env("PSModulePath", builtin_modules)
             .env(
                 "PATH",
                 std::env::join_paths([system32, powershell]).unwrap_or_default(),
             );
         // These are interpreter/runtime locations supplied by the service account, not application
-        // configuration. LOCALAPPDATA is where Windows PowerShell 5.1 keeps its module-analysis
-        // cache; the remaining profile and program directories are deliberately absent.
-        for name in ["TEMP", "TMP", "SystemDrive", "LOCALAPPDATA"] {
+        // configuration. Preserve an explicitly configured PowerShell discovery cache as well as
+        // its default LOCALAPPDATA location: silently discarding a host's prepared cache can make
+        // even Get-Content spend 20+ seconds rediscovering modules on every short invocation.
+        for name in [
+            "TEMP",
+            "TMP",
+            "SystemDrive",
+            "LOCALAPPDATA",
+            "PSModuleAnalysisCachePath",
+        ] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
@@ -367,6 +371,7 @@ mod tests {
             .env("AMBIENT", "leaked")
             .env("PATH", "/opt/ambient")
             .env("PSModulePath", "/opt/ambient/modules")
+            .env("PSModuleAnalysisCachePath", "/opt/ambient/cache")
             .env("LLVM_PROFILE_FILE", "default.profraw")
             .env("TOKEN", "ambient");
         configure_environment(&mut command);
@@ -400,9 +405,17 @@ mod tests {
             "the baseline replaces an ambient PATH"
         );
         #[cfg(unix)]
-        assert_eq!(path, "/usr/sbin:/usr/bin:/sbin:/bin");
+        {
+            assert_eq!(path, "/usr/sbin:/usr/bin:/sbin:/bin");
+            assert!(!environment.contains_key("PSModuleAnalysisCachePath"));
+        }
         #[cfg(windows)]
         {
+            assert_eq!(
+                environment.get("PSModuleAnalysisCachePath"),
+                std::env::var("PSModuleAnalysisCachePath").ok().as_ref(),
+                "preserve the service account's runtime cache location, not an invocation override"
+            );
             let system_root = std::env::var_os("SystemRoot")
                 .or_else(|| std::env::var_os("WINDIR"))
                 .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
