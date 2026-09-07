@@ -10,28 +10,19 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
 
-    let first_cmd = Node::new(ctx, &dir, srv, "app")
+    // Prepare the node once so testing lock contention cannot also reconfigure the owner.
+    let command = Node::new(ctx, &dir, srv, "app")
         .health_grace("2s")
         .workload(svc)
         .command()?;
-    let first = Proc::spawn("agent-1", first_cmd)?;
+    let first = Service::spawn("agent-1", &command);
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("the first agent never converged its release");
     }
     let workload = fixture::workload_pid(&dir).ok_or("the reconciler recorded no workload PID")?;
     let operations = fixture::operations(&fixture::root(&dir)).len();
 
-    // The second instance uses the SAME configuration as the first. Building a Node command
-    // republishes the node's signed assignment (harness setup), so a *different* configuration here
-    // would republish an assignment whose runtime changed — which the live first agent correctly
-    // picks up and re-converges on, disturbing the owner via legitimate reassignment rather than the
-    // lock we are testing. Identical settings make that republish a no-op, isolating the instance
-    // lock, which is asserted directly below.
-    let second_cmd = Node::new(ctx, &dir, srv, "app")
-        .health_grace("2s")
-        .workload(svc)
-        .command()?;
-    let second = Service::spawn("agent-2", &second_cmd);
+    let second = Service::spawn("agent-2", &command);
     if !second.wait_for_log("already owns this install", EVENT_TIMEOUT) {
         return fail("the second agent was not refused with the expected lock message");
     }

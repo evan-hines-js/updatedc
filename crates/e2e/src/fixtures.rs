@@ -158,7 +158,12 @@ impl Node {
     fn write_config(&self) -> R<PathBuf> {
         let root = crate::fixture::root(&self.dir);
         std::fs::create_dir_all(&root).map_err(str_err)?;
-        std::fs::write(root.join("mode"), &self.lifecycle_mode).map_err(str_err)?;
+        foundation::durable::atomic_write(
+            &root.join("mode"),
+            ".mode-",
+            self.lifecycle_mode.as_bytes(),
+        )
+        .map_err(str_err)?;
         if self.seed_application {
             self.seed_install()?;
         }
@@ -220,8 +225,13 @@ impl Node {
         // Steady-state identity is the per-node cert a node mints at enrollment. In this offline,
         // pre-placed scenario the installer supplies the fixture's client leaf directly because the
         // node never reaches `/enroll`.
-        std::fs::copy(certs.join("client.crt"), state_dir.join("agent.crt")).map_err(str_err)?;
-        std::fs::copy(certs.join("client.key"), state_dir.join("agent.key")).map_err(str_err)?;
+        // Some scenarios reconfigure a live node. Never expose a truncated credential while
+        // it builds a transport; republishing the same fixture identity must leave it usable.
+        for (source, destination) in [("client.crt", "agent.crt"), ("client.key", "agent.key")] {
+            let bytes = std::fs::read(certs.join(source)).map_err(str_err)?;
+            foundation::durable::atomic_write(&state_dir.join(destination), ".credential-", &bytes)
+                .map_err(str_err)?;
+        }
         let config = self.dir.join(format!(
             "config-{}.toml",
             SEQ.fetch_add(1, Ordering::Relaxed)
